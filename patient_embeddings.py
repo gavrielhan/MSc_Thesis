@@ -1,9 +1,11 @@
 import pandas as pd
 import umap
+from sklearn.metrics import classification_report
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+import shap
 import torch
 import seaborn as sns
 from sklearn.linear_model import LogisticRegression
@@ -11,6 +13,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
 from collections import Counter
 from transformers import AutoTokenizer, AutoModel
 from LabData.DataLoaders.SubjectLoader import SubjectLoader
@@ -40,6 +43,34 @@ from LabData.DataLoaders.TimelineLoader import TimelineLoader
 from LabData.DataLoaders.SubjectRelationsLoader import SubjectRelationsLoader
 from LabData.DataLoaders.RetinaScanLoader import RetinaScanLoader
 from LabData.DataLoaders.PAStepsLoader import PAStepsLoader
+def get_primary_condition(cond_str):
+    if pd.isna(cond_str) or cond_str == "":
+        return "None"
+    else:
+        return cond_str.split("; ")[0]
+
+def filter_classes(X, y):
+    counts = Counter(y)
+    valid_classes = {cls for cls, count in counts.items() if count > 1}
+    valid_idx = [idx for idx in y.index if y.loc[idx] in valid_classes]
+    return X.loc[valid_idx], y.loc[valid_idx]
+
+def evaluate_classification(X, y, representation_name=""):
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2,
+                                                        random_state=42, stratify=y)
+    clf = LogisticRegression(max_iter=1000, solver="lbfgs")
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, average="weighted")
+    print(f"{representation_name} - Accuracy: {acc:.3f}, F1-score: {f1:.3f}")
+    return acc, f1
+
+def evaluate_clustering(X, n_clusters=5):
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    cluster_labels = kmeans.fit_predict(X)
+    return silhouette_score(X, cluster_labels)
+
 
 # get general medical info fo reach patient
 study_ids = [10, 1001, 1002]
@@ -53,10 +84,12 @@ embeddings_df_baseline = pd.read_csv("patient_embeddings.csv")
 # get the baseline conditions of each patient, to then use them to test clustering power
 path_file = '/net/mraid20/export/genie/LabData/Data/10K/for_review/'
 file_name = 'baseline_conditions_all.csv'
+file_name_1 = 'follow_up_conditions_all.csv'
 full_path = path_file + file_name
 
 # Read the CSV file into a DataFrame
 df_conditions_baseline = pd.read_csv(full_path)
+df_conditions_follow_up = pd.read_csv(path_file + file_name_1)
 
 # ===== Step 1: Data Preprocessing =====
 
@@ -76,11 +109,6 @@ merged_df = pd.merge(general_info_filtered, baseline_conditions, on="Registratio
 merged_df = merged_df.drop_duplicates(subset=["RegistrationCode"], keep="first")
 
 # Create a primary condition column (taking the first condition listed).
-def get_primary_condition(cond_str):
-    if pd.isna(cond_str) or cond_str == "":
-        return "None"
-    else:
-        return cond_str.split("; ")[0]
 
 merged_df["primary_condition"] = merged_df["baseline_conditions"].apply(get_primary_condition)
 
@@ -97,16 +125,14 @@ common_ids = set(merged_df["RegistrationCode"]).intersection(set(embeddings_df_b
 merged_df = merged_df[merged_df["RegistrationCode"].isin(common_ids)]
 embeddings_df = embeddings_df_baseline[embeddings_df_baseline["RegistrationCode"].isin(common_ids)]
 
+# Set the index of merged_df to RegistrationCode.
+#merged_df = merged_df.set_index("RegistrationCode")
+
 # ===== Step 3: Extract Features and Labels =====
 # For original data, select numeric features (remove identifier and condition columns).
 feature_columns = merged_df.select_dtypes(include=[np.number]).columns.tolist()
-for col in ["condition_label"]:  # remove label columns if present
-    if col in feature_columns:
-        feature_columns.remove(col)
-for col in ["RegistrationCode"]:
-    if col in feature_columns:
-        feature_columns.remove(col)
-for col in ["primary_condition", "baseline_conditions"]:
+# Remove label and other non-feature columns.
+for col in ["condition_label", "primary_condition", "baseline_conditions"]:
     if col in feature_columns:
         feature_columns.remove(col)
 
@@ -126,11 +152,7 @@ X_embedding = X_embedding.loc[list(common_index)]
 print("Number of patients used before filtering small classes:", len(X_original))
 
 # ===== Remove Classes with Fewer Than Two Samples =====
-def filter_classes(X, y):
-    counts = Counter(y)
-    valid_classes = {cls for cls, count in counts.items() if count > 1}
-    valid_idx = [idx for idx in y.index if y.loc[idx] in valid_classes]
-    return X.loc[valid_idx], y.loc[valid_idx]
+
 
 X_original, y = filter_classes(X_original, y)
 X_embedding, _ = filter_classes(X_embedding, y)  # y is the same for both representations
@@ -138,26 +160,13 @@ X_embedding, _ = filter_classes(X_embedding, y)  # y is the same for both repres
 print("Number of patients used after filtering small classes:", len(X_original))
 
 # ===== Step 4: Supervised Classification =====
-def evaluate_classification(X, y, representation_name=""):
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2,
-                                                        random_state=42, stratify=y)
-    clf = LogisticRegression(max_iter=1000, solver="lbfgs")
-    clf.fit(X_train, y_train)
-    y_pred = clf.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-    f1 = f1_score(y_test, y_pred, average="weighted")
-    print(f"{representation_name} - Accuracy: {acc:.3f}, F1-score: {f1:.3f}")
-    return acc, f1
+
 
 print("=== Supervised Classification ===")
 acc_orig, f1_orig = evaluate_classification(X_original, y, "Original Data")
 acc_emb, f1_emb = evaluate_classification(X_embedding, y, "Embeddings")
 
 # ===== Step 5: Unsupervised Clustering Evaluation =====
-def evaluate_clustering(X, n_clusters=5):
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(X)
-    return silhouette_score(X, cluster_labels)
 
 sil_orig = evaluate_clustering(X_original)
 sil_emb = evaluate_clustering(X_embedding)
@@ -291,3 +300,75 @@ plt.legend()
 
 plt.tight_layout()
 plt.show()
+
+### Let us find the most predictive embeddings for the 7 conditions we want to predict
+
+conditions = [
+    "Essential hypertension",
+    "Osteoporosis",
+    "Diabetes mellitus, type unspecified",
+    "Coronary atherosclerosis",
+    "Malignant neoplasms of breast",
+    "Hyperplasia of prostate",
+    "Basal cell carcinoma of skin"
+]
+
+# Step 1: Identify patients with the 7 specific conditions in df_conditions_baseline
+patients_with_specific_conditions = df_conditions_baseline[
+    df_conditions_baseline['english_name'].isin(conditions)
+]['RegistrationCode'].unique()
+
+# Step 2: Exclude these patients from df_conditions_follow_up
+df_follow_up_filtered = df_conditions_follow_up[
+    ~df_conditions_follow_up['RegistrationCode'].isin(patients_with_specific_conditions)
+]
+
+# Merge embeddings with condition labels
+# Select only the 'RegistrationCode' and 'english_name' columns
+conditions_subset = df_conditions_follow_up[['RegistrationCode', 'english_name']]
+merged_df = pd.merge(embeddings_df_baseline, conditions_subset, on='RegistrationCode', how='inner')
+merged_df['english_name'] = merged_df['english_name'].apply(lambda x: x if x in conditions else '0')
+
+# Define features (X) and target (y)
+X = merged_df.drop(columns=['RegistrationCode', 'english_name'])
+y = merged_df['english_name']
+
+# Step 2: Train a Random Forest Classifier
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+rf_model = RandomForestClassifier(n_estimators=100, random_state=42)
+rf_model.fit(X_train, y_train)
+
+# Evaluate initial model
+y_pred = rf_model.predict(X_test)
+print("Initial Model Accuracy:", accuracy_score(y_test, y_pred))
+print(classification_report(y_test, y_pred))
+
+# Step 3: Compute SHAP Values
+explainer = shap.Explainer(rf_model, X_train)
+shap_values = explainer(X_train)
+
+# Step 4: Select the Most Informative Subset
+# Calculate mean absolute SHAP values for each feature
+mean_shap_values = np.abs(shap_values.values).mean(axis=0)
+# Create a DataFrame for better visualization
+shap_df = pd.DataFrame({
+    'feature': X.columns,
+    'mean_abs_shap': mean_shap_values
+})
+# Sort features by mean absolute SHAP value
+shap_df = shap_df.sort_values(by='mean_abs_shap', ascending=False)
+# Select top N features (e.g., top 250)
+top_n = 250
+top_features = shap_df['feature'].head(top_n).tolist()
+
+# Step 5: Evaluate the Subset's Performance
+# Train a new model using only the top features
+X_train_subset = X_train[top_features]
+X_test_subset = X_test[top_features]
+rf_model_subset = RandomForestClassifier(n_estimators=100, random_state=42)
+rf_model_subset.fit(X_train_subset, y_train)
+
+# Evaluate subset model
+y_pred_subset = rf_model_subset.predict(X_test_subset)
+print("Subset Model Accuracy:", accuracy_score(y_test, y_pred_subset))
+print(classification_report(y_test, y_pred_subset))
