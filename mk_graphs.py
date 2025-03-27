@@ -14,7 +14,8 @@ df_conditions_baseline = pd.read_csv(
     '/net/mraid20/export/genie/LabData/Data/10K/for_review/baseline_conditions_all.csv')
 
 df_conditions_followup["Date"] = pd.to_datetime(df_conditions_followup["Date"]).dt.date
-df_conditions_baseline["created_at"] = pd.to_datetime(df_conditions_baseline["created_at"]).dt.date
+df_conditions_baseline["created_at"] = pd.to_datetime(df_conditions_baseline["created_at"], format='mixed').dt.date
+
 
 print("Loading CGM data...")
 cgm = CGMLoader().get_data(study_ids=[10, 1001, 1002])
