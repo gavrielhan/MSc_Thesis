@@ -37,49 +37,37 @@ num_signatures = nmf_signatures.shape[0]
 
 print("Loading patient embeddings...")
 baseline_embeddings = pd.read_csv("filtered_patient_embeddings.csv")
-followup_embeddings = pd.read_csv("followup_filtered_patient_embeddings.csv").drop(columns=["research_stage"])
+followup_embeddings = pd.read_csv("followup_filtered_patient_embeddings.csv")
+
+# Load sleep embeddings
+print("Loading sleep embeddings...")
+sleep_embeddings = pd.read_csv("filtered_sleep_embeddings.csv")
+sleep_embeddings = sleep_embeddings.set_index('RegistrationCode').dropna()
+# Before processing patients, calculate average sleep embedding
+average_sleep_embedding = sleep_embeddings.mean(axis=0).values
+# Unify multiple sleep embeddings by averaging them per patient
+sleep_embeddings = sleep_embeddings.groupby('RegistrationCode').mean()
 
 
 # Helper function: Align glucose signal to 96D
 def align_and_rescale_signal(signal, target_length=96):
-    """Align signal to target length with safe interpolation"""
     if len(signal) == target_length:
         return signal
-
-    # Ensure signal has valid values
     signal = np.nan_to_num(signal, nan=0.0, posinf=1000, neginf=0.0)
-
-    # Handle edge cases
     if len(signal) < 2:
         return np.zeros(target_length)
-
     x_existing = np.linspace(0, 1, len(signal))
     x_target = np.linspace(0, 1, target_length)
-
-    with np.errstate(divide='ignore', invalid='ignore'):
-        interp_func = interp1d(
-            x_existing,
-            signal,
-            kind='linear',
-            bounds_error=False,
-            fill_value=(signal[0], signal[-1])  # Extend first/last values
-        )
+    interp_func = interp1d(x_existing, signal, kind='linear', bounds_error=False, fill_value=(signal[0], signal[-1]))
     return interp_func(x_target)
-def compute_weights(signatures, signal):
-    """Robust weight computation with regularization"""
-    try:
-        # Add small regularization (ridge regression)
-        reg = 1e-6 * np.eye(signatures.shape[1])
-        weights = np.linalg.lstsq(
-            signatures.T @ signatures + reg,
-            signatures.T @ signal,
-            rcond=None
-        )[0]
-        return np.clip(weights, 0, 1)
-    except LinAlgError:
-        # Fallback to uniform weights if unstable
-        return np.ones(signatures.shape[0]) / signatures.shape[0]
 
+def compute_weights(signatures, signal):
+    try:
+        reg = 1e-6 * np.eye(signatures.shape[1])
+        weights = np.linalg.lstsq(signatures.T @ signatures + reg, signatures.T @ signal, rcond=None)[0]
+        return np.clip(weights, 0, 1)
+    except np.linalg.LinAlgError:
+        return np.ones(signatures.shape[0]) / signatures.shape[0]
 
 # Graph Construction
 print("Building graphs...")
@@ -103,32 +91,40 @@ for date, daily_data in df_cgm.groupby('Date'):
     for i, patient in enumerate(patients_in_day):
         print(f"Processing patient {patient}...")
         patient_to_idx[patient] = len(patient_nodes)
-
-        # Get closest past embedding
-        patient_baseline_date = df_conditions_baseline[df_conditions_baseline["RegistrationCode"] == patient][
-            "created_at"].min()
-        patient_followup_dates = df_conditions_followup[df_conditions_followup["RegistrationCode"] == patient]["Date"].dt.tz_localize(None)
-        patient_followup_dates = pd.Series([dt.date() for dt in patient_followup_dates])  # Convert to Pandas Series
         embedding = None
-        if patient_followup_dates.empty:
-            past_dates = patient_followup_dates[patient_followup_dates <= date]
-            if not past_dates.empty:
-                closest_past_date = past_dates.max()
-                embedding = followup_embeddings[followup_embeddings["RegistrationCode"] == patient].iloc[:, 1:].values
-                if not followup_embeddings.empty:
-                    embedding = followup_embeddings.iloc[:, 1:].values.flatten()
-        if embedding is None:
-            embedding = baseline_embeddings[baseline_embeddings["RegistrationCode"] == patient].iloc[:, 1:].values
+
+        # Get follow-up dates directly from embeddings (not conditions)
+        patient_embeddings = followup_embeddings[followup_embeddings["RegistrationCode"] == patient]
+
+        if not patient_embeddings.empty:
+            # Convert all dates to datetime.date for comparison
+            embedding_dates = pd.to_datetime(patient_embeddings["Date"]).dt.date
+            current_date = pd.to_datetime(date).date()  # Ensure comparison as date objects
+
+            # Find closest date <= current date
+            valid_dates = embedding_dates[embedding_dates <= current_date]
+            if not valid_dates.empty:
+                closest_date = valid_dates.max()
+                embedding = patient_embeddings.loc[embedding_dates == closest_date].drop(columns=['RegistrationCode','Date']).values
+
+
+        # Fallback to baseline if no valid follow-up
+        if embedding is None or embedding.size == 0:
+            baseline_embed = baseline_embeddings[
+                                 baseline_embeddings["RegistrationCode"] == patient
+                                 ].iloc[:, 1:].values
+            embedding = baseline_embed if baseline_embed.size > 0 else None
 
         print(f"Checking patient {patient} embeddings...")
-        print(f"Baseline date: {patient_baseline_date}")
-        print(f"Follow-up dates: {patient_followup_dates}")
 
         if embedding is None or embedding.size == 0:
             print(f"?? Warning: No embedding found for patient {patient} (date: {date})")
             continue  # Skip patient if no valid embedding exists
 
-        patient_nodes.append(torch.tensor(embedding.flatten(), dtype=torch.float))
+        sleep_embedding = sleep_embeddings.loc[patient].values if patient in sleep_embeddings.index else average_sleep_embedding
+        embedding = embedding.flatten().astype(np.float32)  # Ensure float32
+        sleep_embedding = sleep_embedding.astype(np.float32)
+        patient_nodes.append(torch.tensor(np.append(embedding,sleep_embedding), dtype=torch.float))
 
     # Create edges
     for patient in patients_in_day:
@@ -174,7 +170,7 @@ for date, daily_data in df_cgm.groupby('Date'):
     patient_nodes = torch.stack(patient_nodes)  # Shape: [num_patients, 131]
     hetero_graph['patient'].x = patient_nodes
 
-        # 3. Add edges (patient -> signature)
+    # 3. Add edges (patient -> signature)
     if edge_index:
         edge_index = torch.tensor(edge_index, dtype=torch.long).T
         edge_weights = torch.tensor(edge_weights, dtype=torch.float)
@@ -182,7 +178,22 @@ for date, daily_data in df_cgm.groupby('Date'):
         # Key change: Specify edge type ('patient', 'to', 'signature')
         hetero_graph['patient', 'to', 'signature'].edge_index = edge_index
         hetero_graph['patient', 'to', 'signature'].edge_attr = edge_weights
+    # 4. Add temporal edge
+        if len(all_graphs) > 0:  # Ensure there is a previous graph
+            prev_graph = all_graphs[-1]
 
+            if 'signature' in prev_graph and 'signature' in hetero_graph:
+                num_signatures = signature_nodes.shape[0]
+                temporal_edges = torch.tensor(
+                    [[i, i] for i in range(num_signatures)], dtype=torch.long
+                ).T  # Creates edges (i at t ? i at t-1)
+
+                hetero_graph['signature', 'temporal', 'signature'].edge_index = temporal_edges
         all_graphs.append(hetero_graph)
 
-print(f"? Graph building complete! {len(all_graphs)} graphs generated.")
+torch.save(all_graphs, "glucose_sleep_graphs.pt")
+print(f"Graphs saved successfully to 'glucose_sleep_graphs.pt'.")
+print(f"Graph building complete! {len(all_graphs)} graphs generated.")
+loaded_graphs = torch.load("glucose_sleep_graphs.pt", weights_only=False)
+if loaded_graphs:
+    print('Graphs are loadable')
