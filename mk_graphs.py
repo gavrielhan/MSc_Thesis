@@ -63,8 +63,7 @@ def align_and_rescale_signal(signal, target_length=96):
 
 def compute_weights(signatures, signal):
     try:
-        reg = 1e-6 * np.eye(signatures.shape[1])
-        weights = np.linalg.lstsq(signatures.T @ signatures + reg, signatures.T @ signal, rcond=None)[0]
+        weights = np.linalg.lstsq(signatures.T, signal, rcond=None)[0]
         return np.clip(weights, 0, 1)
     except np.linalg.LinAlgError:
         return np.ones(signatures.shape[0]) / signatures.shape[0]
@@ -79,118 +78,101 @@ df_conditions_followup = df_conditions_followup[df_conditions_followup["Registra
 
 grouped_cgm = df_cgm.groupby(["RegistrationCode", "Date"])["GlucoseValue"].apply(lambda x: x.values).reset_index()
 
+
+# Define chosen medical conditions
+chosen_medical_conditions = ["Hyperlipoproteinaemia ", "Essential hypertension", "Intermediate hyperglycaemia",
+                             "Other specified conditions associated with the spine (intervertebral disc displacement)",
+                             "Osteoporosis","Diabetes mellitus, type unspecified","Non-alcoholic fatty liver disease",
+                             "Coronary atherosclerosis","Malignant neoplasms of breast"]  # Replace with actual conditions
+condition_to_idx = {cond: i for i, cond in enumerate(chosen_medical_conditions)}
+num_conditions = len(chosen_medical_conditions)
+
+patient_last_index = {}
+remaining_patients = set(patients_in_baseline)
+
+#get the diagnosis dates for each patient and disease they have
+diagnosis_dates = df_conditions_followup.groupby(["RegistrationCode", "Date"])["english_name"].apply(list).reset_index()
+
 for date, daily_data in df_cgm.groupby('Date'):
-    print(f"Processing date: {date} ({len(daily_data)} measurements)")
-
-    patients_in_day = daily_data["RegistrationCode"].unique()
+    print(f"Processing date: {date}")
     signature_nodes = torch.tensor(nmf_signatures, dtype=torch.float)
-
     patient_nodes, patient_to_idx = [], {}
-    edge_index, edge_weights = [], []
+    condition_nodes = torch.eye(num_conditions, dtype=torch.float)
+    edge_index, edge_weights, condition_edges, patient_temporal_edges = [], [], [], []
 
-    for i, patient in enumerate(patients_in_day):
-        print(f"Processing patient {patient}...")
+    # Identify patients that should still be in the graph
+    valid_patients = remaining_patients.copy()
+    for patient in list(valid_patients):
+        if patient in diagnosis_dates and diagnosis_dates[patient] <= date:
+            remaining_patients.discard(patient)
+
+    for i, patient in enumerate(remaining_patients):
         patient_to_idx[patient] = len(patient_nodes)
-        embedding = None
+        embedding = followup_embeddings[
+            followup_embeddings["RegistrationCode"] == patient].copy()  # Make a copy of the slice
+        embedding.loc[:, "Date"] = pd.to_datetime(embedding["Date"]).dt.date  # Convert datetime to date
 
-        # Get follow-up dates directly from embeddings (not conditions)
-        patient_embeddings = followup_embeddings[followup_embeddings["RegistrationCode"] == patient]
+        # Keep only embeddings with a valid past date
+        valid_embeddings = embedding[embedding["Date"] <= date]
 
-        if not patient_embeddings.empty:
-            # Convert all dates to datetime.date for comparison
-            embedding_dates = pd.to_datetime(patient_embeddings["Date"]).dt.date
-            current_date = pd.to_datetime(date).date()  # Ensure comparison as date objects
+        if not valid_embeddings.empty:
+            # Select the latest available embedding (closest date)
+            latest_embedding = valid_embeddings.sort_values(by="Date").iloc[-1]  # Most recent row
+            embedding = latest_embedding.drop(labels=["RegistrationCode", "Date"]).to_numpy()
+        else:
+            embedding = np.array([])
 
-            # Find closest date <= current date
-            valid_dates = embedding_dates[embedding_dates <= current_date]
-            if not valid_dates.empty:
-                closest_date = valid_dates.max()
-                embedding = patient_embeddings.loc[embedding_dates == closest_date].drop(columns=['RegistrationCode','Date']).values
-
-
-        # Fallback to baseline if no valid follow-up
         if embedding is None or embedding.size == 0:
-            baseline_embed = baseline_embeddings[
-                                 baseline_embeddings["RegistrationCode"] == patient
-                                 ].iloc[:, 1:].values
+            baseline_embed = baseline_embeddings[baseline_embeddings["RegistrationCode"] == patient].iloc[:, 1:].values
             embedding = baseline_embed if baseline_embed.size > 0 else None
 
-        print(f"Checking patient {patient} embeddings...")
-
         if embedding is None or embedding.size == 0:
-            print(f"?? Warning: No embedding found for patient {patient} (date: {date})")
-            continue  # Skip patient if no valid embedding exists
-
-        sleep_embedding = sleep_embeddings.loc[patient].values if patient in sleep_embeddings.index else average_sleep_embedding
-        embedding = embedding.flatten().astype(np.float32)  # Ensure float32
-        sleep_embedding = sleep_embedding.astype(np.float32)
-        patient_nodes.append(torch.tensor(np.append(embedding,sleep_embedding), dtype=torch.float))
-
-    # Create edges
-    for patient in patients_in_day:
-        patient_signal = grouped_cgm[
-            (grouped_cgm["RegistrationCode"] == patient) & (grouped_cgm["Date"] == date)
-            ]["GlucoseValue"].values
-
-        if len(patient_signal) == 0:
-            print(f"?? Warning: No glucose signal found for patient {patient} on {date}")
-            continue  # Skip if no data
-
-        signal = patient_signal[0]  # Extract the array
-
-        if len(signal) != 96:
-            signal = align_and_rescale_signal(signal)
-
-        try:
-            weights = compute_weights(nmf_signatures, signal)
-            if not np.isfinite(weights).all():
-                weights = np.ones(num_signatures) / num_signatures
-        except:
-            weights = np.ones(num_signatures) / num_signatures
-
-        patient_idx = patient_to_idx.get(patient, None)
-        if patient_idx is None:
-            print(f"Skipping patient {patient} (no embedding found).")
             continue
 
-        for sig_idx, weight in enumerate(weights):
-            edge_index.append([patient_idx, num_signatures + sig_idx])
-            edge_weights.append(weight)
+        sleep_embedding = sleep_embeddings.loc[
+            patient].values if patient in sleep_embeddings.index else average_sleep_embedding
+        embedding = embedding.flatten().astype(np.float32)
+        sleep_embedding = sleep_embedding.astype(np.float32)
+        patient_nodes.append(torch.tensor(np.append(embedding, sleep_embedding), dtype=torch.float))
+        # Get glucose signal for this patient on this day
+        glucose_row = grouped_cgm[(grouped_cgm["RegistrationCode"] == patient) &
+                                  (grouped_cgm["Date"] == date)]
+        if not glucose_row.empty:
+            signal = glucose_row.iloc[0]["GlucoseValue"]
+            signal = align_and_rescale_signal(signal)
 
-    if not patient_nodes:  # Check if patient_nodes is empty
-        print(f"!! Skipping date {date} because no valid patient embeddings were found.")
-        continue  # Skip this date and move to the next one
-        # Create HeteroData graph
+            # Compute weights using NMF signatures
+            weights = compute_weights(nmf_signatures, signal)
+
+            for sig_idx, w in enumerate(weights):
+                if w > 0.01:  # Optional: filter very weak connections
+                    edge_index.append([patient_to_idx[patient], sig_idx])
+                    edge_weights.append(w)
+        # Temporal edges between consecutive appearances
+        if patient in patient_last_index:
+            patient_temporal_edges.append([patient_last_index[patient], patient_to_idx[patient]])
+        patient_last_index[patient] = patient_to_idx[patient]
+
     hetero_graph = HeteroData()
+    hetero_graph['signature'].x = signature_nodes
+    hetero_graph['patient'].x = torch.stack(patient_nodes)
+    hetero_graph['condition'].x = condition_nodes
 
-    # 1. Add signature nodes (type: 'signature')
-    hetero_graph['signature'].x = signature_nodes  # Features: 96D
-
-    # 2. Add patient nodes (type: 'patient')
-    patient_nodes = torch.stack(patient_nodes)  # Shape: [num_patients, 131]
-    hetero_graph['patient'].x = patient_nodes
-
-    # 3. Add edges (patient -> signature)
     if edge_index:
-        edge_index = torch.tensor(edge_index, dtype=torch.long).T
-        edge_weights = torch.tensor(edge_weights, dtype=torch.float)
 
-        # Key change: Specify edge type ('patient', 'to', 'signature')
-        hetero_graph['patient', 'to', 'signature'].edge_index = edge_index
-        hetero_graph['patient', 'to', 'signature'].edge_attr = edge_weights
-    # 4. Add temporal edge
-        if len(all_graphs) > 0:  # Ensure there is a previous graph
-            prev_graph = all_graphs[-1]
+        hetero_graph['patient', 'to', 'signature'].edge_index = torch.tensor(edge_index, dtype=torch.long).T
+        hetero_graph['patient', 'to', 'signature'].edge_attr = torch.tensor(edge_weights, dtype=torch.float)
 
-            if 'signature' in prev_graph and 'signature' in hetero_graph:
-                num_signatures = signature_nodes.shape[0]
-                temporal_edges = torch.tensor(
-                    [[i, i] for i in range(num_signatures)], dtype=torch.long
-                ).T  # Creates edges (i at t ? i at t-1)
+    if condition_edges:
 
-                hetero_graph['signature', 'temporal', 'signature'].edge_index = temporal_edges
-        all_graphs.append(hetero_graph)
+        hetero_graph['patient', 'has', 'condition'].edge_index = torch.tensor(condition_edges, dtype=torch.long).T
 
+    if patient_temporal_edges:
+
+        hetero_graph['patient', 'temporal', 'patient'].edge_index = torch.tensor(patient_temporal_edges,
+                                                                                 dtype=torch.long).T
+
+    all_graphs.append(hetero_graph)
 torch.save(all_graphs, "glucose_sleep_graphs.pt")
 print(f"Graphs saved successfully to 'glucose_sleep_graphs.pt'.")
 print(f"Graph building complete! {len(all_graphs)} graphs generated.")
