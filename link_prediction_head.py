@@ -18,7 +18,7 @@ class LinkMLPPredictor(nn.Module):
         src = patient_embeds[edge_index[0]]  # [N, input_dim]
         dst = condition_embeds[edge_index[1]]  # [N, input_dim]
         x = torch.cat([src, dst], dim=1)  # [N, 2 * input_dim]
-        return self.mlp(x).squeeze()  # [N]
+        return self.mlp(x).view(-1)  # [N]
 
 
 class CoxHead(nn.Module):
