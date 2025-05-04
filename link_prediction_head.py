@@ -10,7 +10,6 @@ class LinkMLPPredictor(nn.Module):
             nn.Linear(input_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()  # for binary classification (link or no link)
         )
 
     def forward(self, patient_embeds, condition_embeds, edge_index):
@@ -21,19 +20,21 @@ class LinkMLPPredictor(nn.Module):
         return self.mlp(x).view(-1)  # [N]
 
 
+
 class CoxHead(nn.Module):
     """
     Cox regression head for time-to-event modeling from GNN patient embeddings.
     Predicts a continuous risk score (log hazard ratio) per patient.
     """
 
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, num_conditions: int):
         """
         Args:
             input_dim (int): Dimensionality of the patient embedding.
+            num_conditions (int): Number of conditions to predict risk for.
         """
         super(CoxHead, self).__init__()
-        self.linear = nn.Linear(input_dim, 1)
+        self.linear = nn.Linear(input_dim, num_conditions)
 
     def forward(self, patient_embeddings: torch.Tensor) -> torch.Tensor:
         """
@@ -41,32 +42,52 @@ class CoxHead(nn.Module):
             patient_embeddings (Tensor): [N, input_dim] tensor of patient embeddings
 
         Returns:
-            risk_scores (Tensor): [N] tensor of log hazard scores
+            risk_scores (Tensor): [N, num_conditions] tensor of log hazard scores
         """
-        return self.linear(patient_embeddings).squeeze(-1)
+        return self.linear(patient_embeddings)
 
     @staticmethod
     def cox_partial_log_likelihood(risk_scores: torch.Tensor,
                                    durations: torch.Tensor,
                                    events: torch.Tensor) -> torch.Tensor:
         """
-        Compute negative partial log-likelihood for Cox proportional hazards.
-
-        Args:
-            risk_scores (Tensor): [N] predicted log hazard scores
-            durations (Tensor): [N] observed times (either to event or censoring)
-            events (Tensor): [N] binary indicator (1 = event occurred, 0 = censored)
-
-        Returns:
-            loss (Tensor): scalar loss value
+        Compute dynamically-weighted negative partial log-likelihood across conditions.
         """
-        # Sort by descending duration
-        order = torch.argsort(durations, descending=True)
-        risk_scores = risk_scores[order]
-        events = events[order]
+        losses = []
+        weights = []
 
-        log_cumsum_exp = torch.logcumsumexp(risk_scores, dim=0)
-        likelihood = (risk_scores - log_cumsum_exp) * events
+        num_conditions = risk_scores.size(1)
+        for cond_idx in range(num_conditions):
+            cond_risk = risk_scores[:, cond_idx]
+            cond_duration = durations[:, cond_idx]
+            cond_event = events[:, cond_idx]
 
-        # Return negative partial log-likelihood
-        return -torch.sum(likelihood) / torch.sum(events)
+            mask = (cond_event >= 0)
+            cond_risk = cond_risk[mask]
+            cond_duration = cond_duration[mask]
+            cond_event = cond_event[mask]
+
+            if cond_risk.numel() == 0:
+                continue
+
+            order = torch.argsort(cond_duration, descending=True)
+            cond_risk = cond_risk[order]
+            cond_event = cond_event[order]
+
+            log_cumsum_exp = torch.logcumsumexp(cond_risk, dim=0)
+            likelihood = (cond_risk - log_cumsum_exp) * cond_event
+
+            if cond_event.sum() > 0:
+                loss = -torch.sum(likelihood) / cond_event.sum()
+                losses.append(loss)
+                weights.append(loss)   # use loss magnitude as proxy for dynamic importance
+
+        if len(losses) == 0:
+            return 0.0 * risk_scores.sum()
+
+        weights = torch.stack(weights)
+        weights = weights / weights.sum()  # normalize
+        losses = torch.stack(losses)
+
+        return (losses * weights).sum()
+
