@@ -63,8 +63,7 @@ followup_embeddings["Date"] = pd.to_datetime(followup_embeddings["Date"]).dt.dat
 followup_dict = dict(tuple(followup_embeddings.groupby("RegistrationCode")))
 baseline_embeddings_indexed = baseline_embeddings.set_index("RegistrationCode")
 
-chosen_conditions = [
-    "Hyperlipoproteinaemia ", "Essential hypertension", "Intermediate hyperglycaemia",
+chosen_conditions = [ "Essential hypertension",
     "Other specified conditions associated with the spine (intervertebral disc displacement)",
     "Osteoporosis", "Diabetes mellitus, type unspecified", "Non-alcoholic fatty liver disease",
     "Coronary atherosclerosis", "Malignant neoplasms of breast"

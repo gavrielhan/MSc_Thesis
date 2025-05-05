@@ -103,8 +103,10 @@ test_graphs = torch.load("split/test_graphs_3d.pt", weights_only = False)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NEGATIVE_MULTIPLIER = 3  # you can adjust this multiplier later
 # Count total positive edges in the training split
-total_pos = sum(g.edge_index_dict[('patient','has','condition')].size(1)
-                for g in train_graphs if ('patient','has','condition') in g.edge_index_dict
+total_pos = sum(
+    g[('patient','has','condition')].edge_index.size(1)
+    for g in train_graphs
+    if ('patient','has','condition') in g.edge_types
 )
 # Negatives sampled per batch is NEGATIVE_MULTIPLIER × positives
 total_neg = total_pos * NEGATIVE_MULTIPLIER
@@ -222,63 +224,77 @@ def evaluate(model, predictor, cox_head, loader, device, NEGATIVE_MULTIPLIER):
     total_cox_loss = 0.0
     all_link_preds = []
     all_link_labels = []
+    # New: per-condition storage
+    per_cond_preds = {}
+    per_cond_labels = {}
     all_risk_scores = []
     all_durations = []
     all_events = []
 
     num_batches = 0
 
+    # We'll determine number of conditions on first batch
+    num_conditions = None
+
     for batch in tqdm(loader, desc="Evaluating"):
         batch = batch.to(device)
 
-        if len(batch.edge_types) == 0 or (
-            ('patient', 'has', 'condition') not in batch.edge_types and
-            ('patient', 'follows', 'patient') not in batch.edge_types
-        ):
+        if len(batch.edge_types) == 0 or ('patient','has','condition') not in batch.edge_types:
             continue
+
+        out = model(batch.x_dict, batch.edge_index_dict)
+        patient_embeds   = out['patient']
+        condition_embeds = out['condition']
+
+        # Initialize per-condition dicts once
+        if num_conditions is None:
+            num_conditions = condition_embeds.size(0)
+            for ci in range(num_conditions):
+                per_cond_preds[ci] = []
+                per_cond_labels[ci] = []
 
         num_batches += 1
 
-        out = model(batch.x_dict, batch.edge_index_dict)
-        patient_embeds = out.get('patient')
-        condition_embeds = out.get('condition')
-
         # --- Link prediction ---
-        if ('patient', 'has', 'condition') in batch.edge_index_dict:
-            pos_edge_index = batch[('patient', 'has', 'condition')].edge_index
-            src_nodes, dst_nodes = pos_edge_index
-            for cond_idx in range(condition_embeds.size(0)):
-                mask = (dst_nodes == cond_idx)
-                if mask.sum() == 0:
-                    continue
+        pos_edge_index = batch[('patient','has','condition')].edge_index
+        src_nodes, dst_nodes = pos_edge_index
+        for cond_idx in range(num_conditions):
+            mask = (dst_nodes == cond_idx)
+            if mask.sum() == 0:
+                continue
 
-                cond_src = src_nodes[mask]
-                cond_edge_index = torch.stack([cond_src, dst_nodes[mask]], dim=0)
+            cond_src = src_nodes[mask]
+            cond_edge_index = torch.stack([cond_src, dst_nodes[mask]], dim=0)
+            pos_preds  = predictor(patient_embeds, condition_embeds, cond_edge_index)
+            pos_labels = torch.ones_like(pos_preds)
 
-                pos_preds = predictor(patient_embeds, condition_embeds, cond_edge_index)
-                pos_labels = torch.ones_like(pos_preds)
-                num_neg = pos_preds.size(0) * NEGATIVE_MULTIPLIER
-                neg_src = torch.randint(0, patient_embeds.size(0), (num_neg,), device=device)
-                neg_dst = torch.full((num_neg,), cond_idx, device=device)
-                neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+            num_neg = pos_preds.size(0) * NEGATIVE_MULTIPLIER
+            neg_src = torch.randint(0, patient_embeds.size(0), (num_neg,), device=device)
+            neg_dst = torch.full((num_neg,), cond_idx, device=device)
+            neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
+            neg_preds  = predictor(patient_embeds, condition_embeds, neg_edge_index)
+            neg_labels = torch.zeros_like(neg_preds)
 
-                neg_preds = predictor(patient_embeds, condition_embeds, neg_edge_index)
-                neg_labels = torch.zeros_like(neg_preds)
+            preds  = torch.cat([pos_preds,  neg_preds])
+            labels = torch.cat([pos_labels, neg_labels])
 
-                preds = torch.cat([pos_preds, neg_preds])
-                labels = torch.cat([pos_labels, neg_labels])
+            all_link_preds.append(preds.detach().cpu())
+            all_link_labels.append(labels.detach().cpu())
 
-                all_link_preds.append(preds.detach().cpu())
-                all_link_labels.append(labels.detach().cpu())
+            # accumulate per-condition
+            per_cond_preds[cond_idx].append(preds.detach().cpu())
+            per_cond_labels[cond_idx].append(labels.detach().cpu())
 
-                pos_weight = torch.tensor([global_pos_weight], device=device)
-                total_link_loss += F.binary_cross_entropy_with_logits(preds, labels, pos_weight=pos_weight).item()
+            # loss with global weighting
+            total_link_loss += F.binary_cross_entropy_with_logits(
+                preds, labels, pos_weight=torch.tensor([global_pos_weight], device=device)
+            ).item()
 
         # --- Cox regression ---
         if hasattr(batch['patient'], 'event') and hasattr(batch['patient'], 'duration'):
             risk_scores = cox_head(patient_embeds)
-            durations = batch['patient'].duration
-            events = batch['patient'].event
+            durations   = batch['patient'].duration
+            events      = batch['patient'].event
 
             all_risk_scores.append(risk_scores.detach().cpu())
             all_durations.append(durations.detach().cpu())
@@ -288,49 +304,50 @@ def evaluate(model, predictor, cox_head, loader, device, NEGATIVE_MULTIPLIER):
 
     # --- Average losses ---
     avg_link_loss = total_link_loss / max(1, num_batches)
-    avg_cox_loss = total_cox_loss / max(1, num_batches)
+    avg_cox_loss  = total_cox_loss / max(1, num_batches)
 
-    # --- Compute ROC AUC for link prediction ---
+    # --- Global metrics ---
     if all_link_preds:
         y_true = torch.cat(all_link_labels).numpy()
         y_score = torch.cat(all_link_preds).numpy()
         link_auc = roc_auc_score(y_true, y_score)
-        pr_auc = average_precision_score(y_true, y_score)
+        pr_auc   = average_precision_score(y_true, y_score)
     else:
         link_auc = pr_auc = None
 
-    # --- Compute C-index per condition and mean C-index ---
+    # --- Per-condition PR-AUC ---
+    pr_auc_per_condition = [None] * num_conditions
+    for ci in range(num_conditions):
+        if per_cond_preds[ci]:
+            y_t = torch.cat(per_cond_labels[ci]).numpy()
+            y_s = torch.cat(per_cond_preds[ci]).numpy()
+            pr_auc_per_condition[ci] = average_precision_score(y_t, y_s)
+
+    # --- C-index per condition & mean ---
     c_indices = []
+    mean_c_index = None
     if all_risk_scores:
-        risks = torch.cat(all_risk_scores).cpu().numpy()  # shape (T, C)
-        durs = torch.cat(all_durations).cpu().numpy()  # shape (T, C)
-        evs = torch.cat(all_events).cpu().numpy()  # shape (T, C)
-
-        c_indices = []
-        num_conditions = risks.shape[1]
-
-        for cond_idx in range(num_conditions):
-            mask = evs[:, cond_idx] >= 0
+        risks = torch.cat(all_risk_scores).numpy()
+        durs  = torch.cat(all_durations).numpy()
+        evs   = torch.cat(all_events).numpy()
+        for ci in range(num_conditions):
+            mask = evs[:,ci] >= 0
             if mask.sum() > 0:
-                # Extract the 1-D vectors for this condition
-                dur_vec = durs[mask, cond_idx]
-                pred_vec = risks[mask, cond_idx]
-                ev_vec = evs[mask, cond_idx]
-
+                dur_vec  = durs[mask, ci]
+                pred_vec = risks[mask, ci]
+                ev_vec   = evs[mask, ci]
                 try:
                     c_idx = concordance_index(dur_vec, -pred_vec, ev_vec)
                 except ZeroDivisionError:
                     c_idx = None
             else:
                 c_idx = None
-
             c_indices.append(c_idx)
-        valid_cs = [c for c in c_indices if c is not None]
-        mean_c_index = sum(valid_cs) / len(valid_cs) if valid_cs else None
-    else:
-        mean_c_index = None
+        valid = [c for c in c_indices if c is not None]
+        if valid:
+            mean_c_index = sum(valid) / len(valid)
 
-    return avg_link_loss, avg_cox_loss, c_indices, mean_c_index, link_auc, pr_auc
+    return avg_link_loss, avg_cox_loss, c_indices, mean_c_index, link_auc, pr_auc, pr_auc_per_condition
 
 
 
@@ -338,7 +355,7 @@ def evaluate(model, predictor, cox_head, loader, device, NEGATIVE_MULTIPLIER):
 in_dims = {
     'patient': 138,
     'signature': 96,
-    'condition': 9,
+    'condition': 7,
 }
 
 model = HeteroGAT(
@@ -349,7 +366,7 @@ model = HeteroGAT(
 ).to(device)
 
 link_head = LinkMLPPredictor(input_dim=128).to(device)
-cox_head = CoxHead(input_dim=128, num_conditions=9).to(device)
+cox_head = CoxHead(input_dim=128, num_conditions=7).to(device)
 
 optimizer = torch.optim.Adam(list(model.parameters()) +
                              list(link_head.parameters()) +
@@ -361,26 +378,29 @@ val_loader = DataLoader(val_graphs, batch_size=1)
 test_loader = DataLoader(test_graphs, batch_size=1)
 
 EPOCHS = 50
+history = []
 for epoch in range(1, EPOCHS + 1):
     train_loss = train(model, link_head, cox_head, train_loader, optimizer, device)
-    val_link_loss, val_cox_loss, val_c_indices, val_mean_c_index, val_link_auc, val_pr_auc = evaluate(model, link_head, cox_head, val_loader, device, NEGATIVE_MULTIPLIER)
+    val_avg_link, avg_cox, cidx_list, mean_cidx, link_auc, pr_auc, pr_auc_per_cond= evaluate(model, link_head, cox_head, val_loader, device, NEGATIVE_MULTIPLIER)
     # After training finished
     results = {
         "final_train_loss": train_loss,
-        "final_val_link_loss": val_link_loss,
-        "final_val_link_auc": val_link_auc,
-        "final_val_pr_auc": val_pr_auc,
-        "final_val_cox_loss": val_cox_loss,
-        "c_indices_per_condition": val_c_indices,
-        "mean_c_index": val_mean_c_index,
+        "final_val_link_loss": val_avg_link,
+        "final_val_link_auc": link_auc,
+        "final_val_pr_auc": pr_auc,
+        "final_val_cox_loss": avg_cox,
+        "c_indices_per_condition": cidx_list,
+        "pr_auc_per_condition": pr_auc_per_cond,
+        "mean_c_index": mean_cidx,
         "epoch": epoch,
         "NEGATIVE_MULTIPLIER": NEGATIVE_MULTIPLIER,
         "timestamp": datetime.datetime.now().isoformat()
     }
+    history.append(results)
 
     print(f"[Epoch {epoch}] Train Loss: {train_loss:.4f} | "
-          f"Val Link Loss: {val_link_loss:.4f} |"
-          f"Val Cox Loss: {val_cox_loss:.4f} | Val C-Index: {val_c_indices}")
+          f"Val Link Loss: {val_avg_link:.4f} |"
+          f"Val Cox Loss: {avg_cox:.4f} | Val C-Index: {cidx_list}")
 
 # Create results directory if it doesn't exist
 os.makedirs("results", exist_ok=True)
@@ -390,6 +410,6 @@ timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 filename = f"results/results_{timestamp}.json"
 
 with open(filename, 'w') as f:
-    json.dump(results, f, indent=4)
+    json.dump(history, f, indent=2)
 
 print(f"Saved training results to {filename}")
