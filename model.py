@@ -242,7 +242,16 @@ def evaluate(model, predictor, cox_head, loader, device, NEGATIVE_MULTIPLIER):
         if len(batch.edge_types) == 0 or ('patient','has','condition') not in batch.edge_types:
             continue
 
-        out = model(batch.x_dict, batch.edge_index_dict)
+        # 1) Copy over the node features as-is
+        x_dict = batch.x_dict
+        # 2) Build a new edge_index_dict that drops the true disease edges
+        ei_masked = {
+            et: idx
+            for et, idx in batch.edge_index_dict.items()
+            if et != ('patient', 'has', 'condition')
+        }
+        # 3) Run the GNN on the masked graph
+        out = model(x_dict, ei_masked)
         patient_embeds   = out['patient']
         condition_embeds = out['condition']
 
