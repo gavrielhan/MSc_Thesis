@@ -157,6 +157,14 @@ def build_graph(wi, wstart, wend, patients, do_train):
     do_train=True  -> add has-condition edges and drop after diag
     do_train=False -> never add has-condition; never drop
     """
+    if do_train:
+        # Remove patients diagnosed before the current window `wi`
+        diagnosed_before = {
+            d["patient"]
+            for d in diag_map
+            if d["window"] < wi
+        }
+        patients = [p for p in patients if p not in diagnosed_before]
     het = HeteroData()
     het["signature"].x = torch.tensor(nmf_signatures, dtype=torch.float)
     het["condition"].x = torch.eye(num_conds, dtype=torch.float)
