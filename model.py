@@ -23,7 +23,7 @@ import numpy as np
 
 
 class HeteroGAT(nn.Module):
-    def __init__(self, metadata, in_dims, hidden_dim=128, out_dim=128, num_heads=4, dropout=0.2):
+    def __init__(self, metadata, in_dims, hidden_dim=128, out_dim=128, num_heads=8, dropout=0.2):
         super().__init__()
         self.metadata = metadata
         self.hidden_dim = hidden_dim
@@ -94,9 +94,6 @@ class HeteroGAT(nn.Module):
         return x_dict3
 
 
-
-
-
 all_graphs =  torch.load("glucose_sleep_graphs_3d.pt", weights_only = False)
 
 
@@ -124,7 +121,7 @@ diag_by_win_test  = build_diag_by_win(full_diag_map, test_graphs)
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 8  # you can adjust this multiplier later
+NEGATIVE_MULTIPLIER = 10  # you can adjust this multiplier later
 # Count total positive edges in the training split
 total_pos = sum(
     g[('patient','has','condition')].edge_index.size(1)
@@ -443,11 +440,14 @@ in_dims = {
     'condition': 7,
 }
 metadata = (
-    ['patient', 'condition', 'signature'],
+    ['patient','condition','signature'],
     [
-        ('patient', 'to', 'signature'),
-        ('patient', 'follows', 'patient'),
-        ('patient', 'has', 'condition'),
+      ('patient','to','signature'),
+      ('signature','to_rev','patient'),
+      ('patient','has','condition'),
+      ('condition','has_rev','patient'),
+      ('patient','follows','patient'),
+      ('patient','follows_rev','patient'),
     ]
 )
 model = HeteroGAT(
@@ -469,7 +469,7 @@ train_loader = DataLoader(train_graphs, batch_size=1, shuffle=True)
 val_loader = DataLoader(val_graphs, batch_size=1)
 test_loader = DataLoader(test_graphs, batch_size=1)
 
-EPOCHS = 50
+EPOCHS = 200
 history = []
 for epoch in range(1, EPOCHS + 1):
     train_loss = train(model, link_head, cox_head, train_loader, optimizer, device)

@@ -11,6 +11,7 @@ import torch
 from scipy.interpolate import interp1d
 from torch_geometric.data import HeteroData
 from LabData.DataLoaders.CGMLoader import CGMLoader
+from torch_geometric.utils import to_undirected
 
 # ========== CONFIG ==========
 WINDOW_SIZE = 3  # days
@@ -257,6 +258,16 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
         ei = het['patient', 'follows', 'patient'].edge_index
         assert ei.max().item() < het['patient'].x.size(0), \
             f"[Window {wi}] Invalid index in 'follows' edge: max={ei.max().item()} vs num_patients={het['patient'].x.size(0)}"
+    # ??? Make every relation bidirectional ???
+    for src, rel, dst in [('patient','to','signature'),
+       ('patient','has','condition'),
+       ('patient','follows','patient'),]:
+        if (src, rel, dst) in het.edge_types:
+            ei = het[src, rel, dst].edge_index
+            rev_rel = (dst, rel + '_rev', src)
+            het[rev_rel].edge_index = ei.flip(0)
+
+
     return wi, het
 
 # store last_loc per split
@@ -290,6 +301,15 @@ split_last_locs = {
 for wi, (wstart, wend) in enumerate(window_ranges):
     print(f"[TRAIN]   Window {wi}: {wstart} ? {wend}")
     _, g = build_graph(wi, wstart, wend, train_set, True, split_last_locs["train"])
+    for rel in g.edge_types:
+        ei = g[rel].edge_index
+        src_type, _, dst_type = rel
+        n_src = g[src_type].x.size(0)
+        n_dst = g[dst_type].x.size(0)
+        # Row 0 must index into src, row 1 into dst
+        assert ei[0].max().item() < n_src, f"{rel} src OOB: {ei[0].max()} ? {n_src}"
+        assert ei[1].max().item() < n_dst, f"{rel} dst OOB: {ei[1].max()} ? {n_dst}"
+
     train_graphs.append(g)
 
 # --- VAL ---
@@ -298,6 +318,15 @@ val_graphs = []
 for wi, (wstart, wend) in enumerate(window_ranges):
     print(f"[VALID]   Window {wi}: {wstart} ? {wend}")
     _, g = build_graph(wi, wstart, wend, val_set, False, split_last_locs["val"])
+    for rel in g.edge_types:
+        ei = g[rel].edge_index
+        src_type, _, dst_type = rel
+        n_src = g[src_type].x.size(0)
+        n_dst = g[dst_type].x.size(0)
+        # Row 0 must index into src, row 1 into dst
+        assert ei[0].max().item() < n_src, f"{rel} src OOB: {ei[0].max()} ? {n_src}"
+        assert ei[1].max().item() < n_dst, f"{rel} dst OOB: {ei[1].max()} ? {n_dst}"
+
     val_graphs.append(g)
 
 # --- TEST ---
@@ -306,6 +335,15 @@ test_graphs = []
 for wi, (wstart, wend) in enumerate(window_ranges):
     print(f"[TEST]    Window {wi}: {wstart} ? {wend}")
     _, g = build_graph(wi, wstart, wend, test_set, False, split_last_locs["test"])
+    for rel in g.edge_types:
+        ei = g[rel].edge_index
+        src_type, _, dst_type = rel
+        n_src = g[src_type].x.size(0)
+        n_dst = g[dst_type].x.size(0)
+        # Row 0 must index into src, row 1 into dst
+        assert ei[0].max().item() < n_src, f"{rel} src OOB: {ei[0].max()} ? {n_src}"
+        assert ei[1].max().item() < n_dst, f"{rel} dst OOB: {ei[1].max()} ? {n_dst}"
+
     test_graphs.append(g)
 
 pulse.set()
