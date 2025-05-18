@@ -1,7 +1,9 @@
 from link_prediction_head import CoxHead
 from link_prediction_head import LinkMLPPredictor
+from risk_calibration import fit_absolute_risk_calibrator
 import torch
 import torch.nn as nn
+import math
 from torch_geometric.nn import GATConv, HeteroConv, GCNConv
 from torch_geometric.nn import Linear
 from torch.nn import Module, ModuleDict
@@ -16,6 +18,8 @@ import os
 import json
 from sklearn.metrics import average_precision_score
 from collections import defaultdict
+import numpy as np
+
 
 
 class HeteroGAT(nn.Module):
@@ -120,7 +124,7 @@ diag_by_win_test  = build_diag_by_win(full_diag_map, test_graphs)
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 3  # you can adjust this multiplier later
+NEGATIVE_MULTIPLIER = 8  # you can adjust this multiplier later
 # Count total positive edges in the training split
 total_pos = sum(
     g[('patient','has','condition')].edge_index.size(1)
@@ -139,12 +143,17 @@ def train(model, predictor, cox_head, loader, optimizer, device):
     predictor.train()
     cox_head.train()
 
-    total_loss = 0
+    total_loss = 0.0
     num_batches = 0
 
-    for batch in tqdm(loader, desc="Training"):
+    for batch_idx, batch in enumerate(tqdm(loader, desc="Training")):
         batch = batch.to(device)
+        # Sanity?check inputs
+        for ntype, x in batch.x_dict.items():
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                raise RuntimeError(f"[Batch {batch_idx}] Bad input on node '{ntype}': contains NaN or Inf")
 
+        # Skip batches with no useful edges
         if len(batch.edge_types) == 0 or (
             ('patient', 'has', 'condition') not in batch.edge_types and
             ('patient', 'follows', 'patient') not in batch.edge_types
@@ -154,82 +163,125 @@ def train(model, predictor, cox_head, loader, optimizer, device):
 
         optimizer.zero_grad()
         out = model(batch.x_dict, batch.edge_index_dict)
+        # Sanity?check GNN outputs
+        for ntype, h in out.items():
+            if torch.isnan(h).any() or torch.isinf(h).any():
+                raise RuntimeError(f"[Batch {batch_idx}] NaNs in model output for '{ntype}'")
 
-        patient_embeds = out.get('patient')
-        condition_embeds = out.get('condition')
+        patient_embeds   = out['patient']
+        condition_embeds = out['condition']
 
-        link_loss = 0
-        valid_conditions = 0  # <<< count conditions where at least 1 pos edge
+        # ------ FIX: initialize losses as tensors that require grad ------
+        zero = patient_embeds.sum() * 0.0
+        link_loss = zero.clone()
+        valid_conditions = 0
+        cox_loss = zero.clone()
 
+        # Link prediction loss
         if ('patient', 'has', 'condition') in batch.edge_index_dict:
-            pos_edge_index = batch[('patient', 'has', 'condition')].edge_index
-            src_nodes = pos_edge_index[0]
-            dst_nodes = pos_edge_index[1]
+            pos_ei = batch[('patient', 'has', 'condition')].edge_index
+            src_nodes, dst_nodes = pos_ei
 
             for cond_idx in range(condition_embeds.size(0)):
                 mask = (dst_nodes == cond_idx)
                 if mask.sum() > 0:
-                    cond_src = src_nodes[mask]
-                    cond_dst = dst_nodes[mask]
+                    cond_src  = src_nodes[mask]
+                    cond_dst  = dst_nodes[mask]
+                    cond_ei   = torch.stack([cond_src, cond_dst], dim=0)
 
-                    cond_edge_index = torch.stack([cond_src, cond_dst], dim=0)
+                    pos_preds = predictor(patient_embeds, condition_embeds, cond_ei)
+                    pos_labels= torch.ones(pos_preds.size(0), device=device)
 
-                    pos_preds = predictor(patient_embeds, condition_embeds, cond_edge_index)
-                    pos_labels = torch.ones(pos_preds.size(0), device=device)
+                    num_neg   = pos_preds.size(0) * NEGATIVE_MULTIPLIER
+                    neg_src   = torch.randint(0, patient_embeds.size(0), (num_neg,), device=device)
+                    neg_dst   = torch.full((num_neg,), cond_idx, device=device)
+                    neg_ei    = torch.stack([neg_src, neg_dst], dim=0)
+                    neg_preds = predictor(patient_embeds, condition_embeds, neg_ei)
+                    neg_labels= torch.zeros(neg_preds.size(0), device=device)
 
-                    num_neg = pos_preds.size(0) * NEGATIVE_MULTIPLIER
-                    neg_src = torch.randint(0, patient_embeds.size(0), (num_neg,), device=device)
-                    neg_dst = torch.full((num_neg,), cond_idx, device=device)
+                    if torch.isnan(pos_preds).any() or torch.isnan(neg_preds).any():
+                        raise RuntimeError(f"[Batch {batch_idx}][Cond {cond_idx}] NaN in link predictions")
 
-                    neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
-                    neg_preds = predictor(patient_embeds, condition_embeds, neg_edge_index)
-                    neg_labels = torch.zeros(neg_preds.size(0), device=device)
-
-                    preds = torch.cat([pos_preds, neg_preds], dim=0)
+                    preds  = torch.cat([pos_preds, neg_preds], dim=0)
                     labels = torch.cat([pos_labels, neg_labels], dim=0)
-
-
-                    # use the same global weight every time
                     pos_weight = torch.tensor([global_pos_weight], device=device)
                     link_loss += F.binary_cross_entropy_with_logits(preds, labels, pos_weight=pos_weight)
 
-                    valid_conditions += 1  # <<< only count if condition had positive edges
-                else:
-                    ok = 0
+                    valid_conditions += 1
 
             if valid_conditions > 0:
                 link_loss /= valid_conditions
             else:
-                link_loss = 0.0 * patient_embeds.sum()  # <<< no valid conditions, set loss to 0
+                link_loss = 0.0 * patient_embeds.sum()
 
-        # --- Cox Regression Loss ---
-        if hasattr(batch['patient'], 'event') and hasattr(batch['patient'], 'duration'):
-            events = batch['patient'].event
-            num_events = (events > 0).sum()
+            # --- Cox regression loss, per?condition (robust) ---
+            cox_loss = zero.clone()
+            valid_cox_conds = 0
+            num_conditions = condition_embeds.size(0)
 
+            if hasattr(batch['patient'], 'event') and hasattr(batch['patient'], 'duration'):
+                events = batch['patient'].event  # [n_patients, num_conds]
+                durations = batch['patient'].duration  # [n_patients, num_conds]
+                risk_scores = cox_head(patient_embeds)  # [n_patients, num_conds]
 
-            if num_events > 0:
-                risk_scores = cox_head(patient_embeds)
-                durations = batch['patient'].duration
-                cox_loss = CoxHead.cox_partial_log_likelihood(risk_scores, durations, events)
+                for ci in range(num_conditions):
+                    ev_col = events[:, ci]
+                    if ev_col.sum().item() > 0:
+                        dur_col = durations[:, ci]
+                        score_col = risk_scores[:, ci]
+
+                        # guard each slice
+                        if torch.isnan(score_col).any() or torch.isinf(score_col).any():
+                            raise RuntimeError(f"[Batch {batch_idx}][Cox cond {ci}] Bad risk_scores")
+
+                        # unsqueeze to (n_patients, 1)
+                        score_ci = score_col.unsqueeze(1)
+                        dur_ci = dur_col.unsqueeze(1)
+                        evt_ci = ev_col.unsqueeze(1)
+
+                        loss_ci = CoxHead.cox_partial_log_likelihood(score_ci, dur_ci, evt_ci)
+                        cox_loss += loss_ci
+                        valid_cox_conds += 1
+
+                if valid_cox_conds > 0:
+                    cox_loss /= valid_cox_conds
             else:
-
-                cox_loss = 0.0 * patient_embeds.sum()
-
-        else:
-            print("Batch missing duration/event attributes")  # <<<
-            cox_loss = 0.0 * patient_embeds.sum()
-
-
-        # --- Final loss ---
+                print(f"[Batch {batch_idx}] Missing duration/event attrs")
+        # --- Final loss and backward ---
         loss = link_loss + cox_loss
-        loss.backward()
-        optimizer.step()
+        # Sanity?check losses
+        for name, l in (("link_loss", link_loss), ("cox_loss", cox_loss)):
+            if isinstance(l, torch.Tensor):
+                if not torch.isfinite(l).all():
+                    raise RuntimeError(f"[Batch {batch_idx}] {name} is non-finite: {l}")
+            else:
+                if not math.isfinite(l):
+                    raise RuntimeError(f"[Batch {batch_idx}] {name} is non-finite: {l}")
 
+        if not torch.isfinite(loss).all():
+            raise RuntimeError(f"[Batch {batch_idx}] total loss is non-finite: {loss}")
+
+        loss.backward()
+
+        # Clip gradients and check
+        torch.nn.utils.clip_grad_norm_(
+            list(model.parameters()) +
+            list(predictor.parameters()) +
+            list(cox_head.parameters()),
+            max_norm=1.0
+        )
+        for name, param in list(model.named_parameters()) + \
+                           list(predictor.named_parameters()) + \
+                           list(cox_head.named_parameters()):
+            if param.grad is not None and torch.isnan(param.grad).any():
+                raise RuntimeError(f"[Batch {batch_idx}] NaN in grad of '{name}'")
+
+        optimizer.step()
         total_loss += loss.item()
         num_batches += 1
 
     return total_loss / max(1, num_batches)
+
 
 
 
@@ -390,9 +442,16 @@ in_dims = {
     'signature': 96,
     'condition': 7,
 }
-
+metadata = (
+    ['patient', 'condition', 'signature'],
+    [
+        ('patient', 'to', 'signature'),
+        ('patient', 'follows', 'patient'),
+        ('patient', 'has', 'condition'),
+    ]
+)
 model = HeteroGAT(
-    metadata=all_graphs[0].metadata(),
+    metadata=metadata,
     in_dims=in_dims,
     hidden_dim=128,
     out_dim=128
@@ -415,16 +474,21 @@ history = []
 for epoch in range(1, EPOCHS + 1):
     train_loss = train(model, link_head, cox_head, train_loader, optimizer, device)
     with torch.no_grad():
-        train_cond_embeds = None
-        for g in train_graphs:
-            g = g.to(device)
-            ei_masked = {et: g[et].edge_index for et in g.edge_types if et != ('patient', 'has', 'condition')}
-            out = model(g.x_dict, ei_masked)
-            C = out["condition"]
-            train_cond_embeds = C if train_cond_embeds is None else train_cond_embeds + C
-        train_cond_embeds /= len(train_graphs)
+        # a) Build C×C identity (one?hot) for all conditions
+        C = in_dims['condition']
+        eye = torch.eye(C, device=device)  # [C, C]
 
-    # Now pass train_cond_embeds to evaluation
+        # 2) Input proj
+        h = model.input_proj['condition'](eye)  # [C, hidden_dim]
+
+        # 3) Three ?conv?fallback? steps (just ReLU)
+        h = F.relu(h)
+        h = F.relu(h)
+        h = F.relu(h)
+
+        # 4) Final linear projection
+        train_cond_embeds = model.linear_proj['condition'](h)
+        # Now pass train_cond_embeds to evaluation
     val_avg_link, avg_cox, cidx_list, mean_cidx, link_auc, pr_auc, pr_auc_per_cond = evaluate(
         model, link_head, cox_head, val_loader, device,
         NEGATIVE_MULTIPLIER, diag_by_win_val, train_cond_embeds

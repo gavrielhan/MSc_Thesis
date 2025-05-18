@@ -51,43 +51,57 @@ class CoxHead(nn.Module):
                                    durations: torch.Tensor,
                                    events: torch.Tensor) -> torch.Tensor:
         """
-        Compute dynamically-weighted negative partial log-likelihood across conditions.
+        Compute dynamically-weighted negative partial log-likelihood across conditions,
+        with a fallback to uniform weights if dynamic weights are all zero.
         """
         losses = []
-        weights = []
 
         num_conditions = risk_scores.size(1)
-        for cond_idx in range(num_conditions):
-            cond_risk = risk_scores[:, cond_idx]
-            cond_duration = durations[:, cond_idx]
-            cond_event = events[:, cond_idx]
+        for ci in range(num_conditions):
+            # slice out one condition
+            rs = risk_scores[:, ci]
+            du = durations[:, ci]
+            ev = events[:, ci]
 
-            mask = (cond_event >= 0)
-            cond_risk = cond_risk[mask]
-            cond_duration = cond_duration[mask]
-            cond_event = cond_event[mask]
+            # keep only those with an event and positive duration
+            mask = (ev > 0) & (du > 0)
+            rs = rs[mask]
+            du = du[mask]
+            ev = ev[mask]
 
-            if cond_risk.numel() == 0:
+            if rs.numel() == 0:
                 continue
 
-            order = torch.argsort(cond_duration, descending=True)
-            cond_risk = cond_risk[order]
-            cond_event = cond_event[order]
+            # sort by descending duration
+            order = torch.argsort(du, descending=True)
+            rs = rs[order]
+            ev = ev[order]
 
-            log_cumsum_exp = torch.logcumsumexp(cond_risk, dim=0)
-            likelihood = (cond_risk - log_cumsum_exp) * cond_event
+            # partial?likelihood: logcumsumexp trick
+            log_cum = torch.logcumsumexp(rs, dim=0)
+            lik = (rs - log_cum) * ev
 
-            if cond_event.sum() > 0:
-                loss = -torch.sum(likelihood) / cond_event.sum()
-                losses.append(loss)
-                weights.append(loss)   # use loss magnitude as proxy for dynamic importance
+            # only if there was at least one event
+            n_ev = ev.sum()
+            if n_ev > 0:
+                loss_ci = -lik.sum() / n_ev
+                losses.append(loss_ci)
 
+        # if no conditions produced a loss, return zero
         if len(losses) == 0:
             return 0.0 * risk_scores.sum()
 
-        weights = torch.stack(weights)
-        weights = weights / weights.sum()  # normalize
-        losses = torch.stack(losses)
+        losses = torch.stack(losses)  # shape [K]
 
+        # dynamic weights = loss magnitude
+        weights = losses.clone()
+        wsum = weights.sum()
+        if wsum.abs() < 1e-8:
+            # fallback to uniform weights when dynamic ones vanish
+            weights = torch.ones_like(weights) / weights.numel()
+        else:
+            weights = weights / wsum
+
+        # final, weighted sum of condition losses
         return (losses * weights).sum()
 

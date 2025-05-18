@@ -152,7 +152,7 @@ for d in diag_map:
     diag_by_win[d["window"]].append((d["patient"], d["cond"], d["date"]))
 
 # ========== build_graph fn ==========
-def build_graph(wi, wstart, wend, patients, do_train):
+def build_graph(wi, wstart, wend, patients, do_train, last_loc):
     """
     do_train=True  -> add has-condition edges and drop after diag
     do_train=False -> never add has-condition; never drop
@@ -165,10 +165,15 @@ def build_graph(wi, wstart, wend, patients, do_train):
             if d["window"] < wi
         }
         patients = [p for p in patients if p not in diagnosed_before]
+        for p in diagnosed_before:
+            if p in last_loc:
+                del last_loc[p]
     het = HeteroData()
     het["signature"].x = torch.tensor(nmf_signatures, dtype=torch.float)
     het["condition"].x = torch.eye(num_conds, dtype=torch.float)
-
+    het['meta'] = {}
+    het['meta']['start_date'] = str(wstart)  # store as string to avoid serialization issues
+    het['meta']['end_date'] = str(wend)
     # collect patient embeddings & names
     feats, names = [], []
     for p in patients:
@@ -190,19 +195,16 @@ def build_graph(wi, wstart, wend, patients, do_train):
     for p in names:
         ev_row, du_row = [], []
         for ci in range(num_conds):
-            # find diag window
-            hits = [d for d in diag_by_win[wi] if d[0]==p and d[1]==ci]
-            if hits:
+            # Find first diagnosis window (if any)
+            future_diags = [d["window"] for d in diag_map if
+                            d["patient"] == p and d["cond"] == ci and d["window"] >= wi]
+            if future_diags:
                 ev_row.append(1)
-                # duration in windows
-                win_idx = wi
-                # find first window index for p,ci
-                fi = min(dd["window"] for dd in diag_map
-                         if dd["patient"]==p and dd["cond"]==ci)
-                du_row.append(fi - win_idx)
+                du_row.append(min(future_diags) - wi)
             else:
                 ev_row.append(0)
                 du_row.append(0.0)
+
         ev.append(ev_row); du.append(du_row)
     het["patient"].event    = torch.tensor(ev, dtype=torch.long)
     het["patient"].duration = torch.tensor(du, dtype=torch.float)
@@ -232,15 +234,29 @@ def build_graph(wi, wstart, wend, patients, do_train):
             het["patient", "has", "condition"].edge_index = torch.tensor(ci_edges).T
 
     # temporal follows (keep everyone in val/test)
-    prev = build_graph.last_loc
-    src,dst = [],[]
-    for ni,p in enumerate(names):
-        if p in prev:
-            src.append(prev[p][1]); dst.append(ni)
-        prev[p] = (wi,ni)
-    if src:
-        het["patient","follows","patient"].edge_index = torch.tensor([src,dst])
+    # ? Build valid follows edges, avoid stale indices
+    src, dst = [], []
+    name_to_idx = {p: i for i, p in enumerate(names)}
 
+    # ? Clean up stale last_loc entries
+    for p in list(last_loc.keys()):
+        if p not in name_to_idx:
+            del last_loc[p]
+
+    # ? Now build follows safely
+    for p, ni in name_to_idx.items():
+        if p in last_loc:
+            prev_wi, prev_idx = last_loc[p]
+            if prev_idx < het['patient'].x.size(0):  # Should always be true now, but safe
+                src.append(prev_idx)
+                dst.append(ni)
+        last_loc[p] = (wi, ni)
+    if src:
+        het["patient", "follows", "patient"].edge_index = torch.tensor([src, dst])
+    if ('patient', 'follows', 'patient') in het.edge_types:
+        ei = het['patient', 'follows', 'patient'].edge_index
+        assert ei.max().item() < het['patient'].x.size(0), \
+            f"[Window {wi}] Invalid index in 'follows' edge: max={ei.max().item()} vs num_patients={het['patient'].x.size(0)}"
     return wi, het
 
 # store last_loc per split
@@ -265,9 +281,15 @@ pulse = start_pulse_timer("Still building?", delay=1800)
 # --- TRAIN ---
 build_graph.last_loc = {}
 train_graphs = []
+split_last_locs = {
+    "train": {},
+    "val": {},
+    "test": {}
+}
+
 for wi, (wstart, wend) in enumerate(window_ranges):
     print(f"[TRAIN]   Window {wi}: {wstart} ? {wend}")
-    _, g = build_graph(wi, wstart, wend, train_set, True)
+    _, g = build_graph(wi, wstart, wend, train_set, True, split_last_locs["train"])
     train_graphs.append(g)
 
 # --- VAL ---
@@ -275,7 +297,7 @@ build_graph.last_loc = {}
 val_graphs = []
 for wi, (wstart, wend) in enumerate(window_ranges):
     print(f"[VALID]   Window {wi}: {wstart} ? {wend}")
-    _, g = build_graph(wi, wstart, wend, val_set, False)
+    _, g = build_graph(wi, wstart, wend, val_set, False, split_last_locs["val"])
     val_graphs.append(g)
 
 # --- TEST ---
@@ -283,18 +305,22 @@ build_graph.last_loc = {}
 test_graphs = []
 for wi, (wstart, wend) in enumerate(window_ranges):
     print(f"[TEST]    Window {wi}: {wstart} ? {wend}")
-    _, g = build_graph(wi, wstart, wend, test_set, False)
+    _, g = build_graph(wi, wstart, wend, test_set, False, split_last_locs["test"])
     test_graphs.append(g)
 
 pulse.set()
+
+for split_name, patient_list in [("train", train_set), ("val", val_set), ("test", test_set)]:
+    num_diags = sum(
+        1 for d in diag_map
+        if d["patient"] in patient_list
+    )
+    print(f"{split_name}: {num_diags} future diagnoses in diag_map")
 
 # Then save as before:
 torch.save(train_graphs, os.path.join(OUTPUT_DIR, "train_graphs_3d.pt"))
 torch.save(val_graphs,   os.path.join(OUTPUT_DIR, "val_graphs_3d.pt"))
 torch.save(test_graphs,  os.path.join(OUTPUT_DIR, "test_graphs_3d.pt"))
-
-
-
 
 
 print("Done. Graphs and diagnosis_mapping.json are ready.")
