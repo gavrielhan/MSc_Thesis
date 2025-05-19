@@ -18,80 +18,113 @@ import os
 import json
 from sklearn.metrics import average_precision_score
 from collections import defaultdict
-import numpy as np
-
 
 
 class HeteroGAT(nn.Module):
-    def __init__(self, metadata, in_dims, hidden_dim=128, out_dim=128, num_heads=8, dropout=0.2):
+    def __init__(
+        self,
+        metadata,
+        in_dims,
+        hidden_dim: int = 128,
+        out_dim:   int = 128,
+        num_heads: int = 8,
+        dropout:   float = 0.2
+    ):
         super().__init__()
-        self.metadata = metadata
+        self.metadata = metadata  # (node_types, edge_types)
+
+        # Input projections for each node type
+        self.input_proj = nn.ModuleDict({
+            n: Linear(in_dims[n], hidden_dim) for n in metadata[0]
+        })
         self.hidden_dim = hidden_dim
 
-        self.input_proj = nn.ModuleDict({
-            node_type: Linear(in_dims[node_type], hidden_dim)
-            for node_type in metadata[0]
-        })
+        def make_layer(in_d, out_d):
+            convs = {}
+            for et in metadata[1]:
+                if et in [('patient','to','signature'),
+                          ('signature','to_rev','patient')]:
+                    # GAT with built-in edge_attr support (edge_dim=1)
+                    convs[et] = GATConv(
+                        in_channels=(in_d, in_d),
+                        out_channels=out_d // num_heads,
+                        heads=num_heads,
+                        dropout=dropout,
+                        add_self_loops=False,
+                        edge_dim=1,
+                    )
+                elif et == ('patient','follows','patient') or et == ('patient','follows_rev','patient'):
+                    convs[et] = GCNConv(in_d, out_d)
+                else:
+                    # all other relations (including condition has/has_rev)
+                    convs[et] = GATConv(
+                        in_channels=(in_d, in_d),
+                        out_channels=out_d // num_heads,
+                        heads=num_heads,
+                        dropout=dropout,
+                        add_self_loops=False,
+                    )
+            return HeteroConv(convs, aggr='sum')
 
-        self.convs1 = HeteroConv({
-            edge_type: (
-                GCNConv(hidden_dim, hidden_dim)
-                if edge_type == ('patient', 'follows', 'patient') else
-                GATConv((hidden_dim, hidden_dim), hidden_dim // num_heads, heads=num_heads, dropout=dropout, add_self_loops=False)
-            )
-            for edge_type in metadata[1]
-        }, aggr='sum')
+        # Three hetero?layers
+        self.convs1 = make_layer(hidden_dim, hidden_dim)
+        self.convs2 = make_layer(hidden_dim, hidden_dim)
+        self.convs3 = make_layer(hidden_dim, out_dim)
 
-        self.convs2 = HeteroConv({
-            edge_type: (
-                GCNConv(hidden_dim, hidden_dim)
-                if edge_type == ('patient', 'follows', 'patient') else
-                GATConv((hidden_dim, hidden_dim), hidden_dim // num_heads, heads=num_heads, dropout=dropout, add_self_loops=False)
-            )
-            for edge_type in metadata[1]
-        }, aggr='sum')
-
-        # ? Add a 3rd convolutional layer
-        self.convs3 = HeteroConv({
-            edge_type: (
-                GCNConv(hidden_dim, out_dim)
-                if edge_type == ('patient', 'follows', 'patient') else
-                GATConv((hidden_dim, hidden_dim), out_dim // num_heads, heads=num_heads, dropout=dropout, add_self_loops=False)
-            )
-            for edge_type in metadata[1]
-        }, aggr='sum')
-
+        # Final projections
         self.linear_proj = nn.ModuleDict({
-            node_type: Linear(out_dim, out_dim)
-            for node_type in metadata[0]
+            n: Linear(out_dim, out_dim)
+            for n in metadata[0]
+        })
+        self.shrink = nn.ModuleDict({
+            n: Linear(hidden_dim, out_dim)
+            for n in metadata[0]
         })
 
-    def forward(self, x_dict, edge_index_dict):
-        x_dict = {k: self.input_proj[k](v) for k, v in x_dict.items()}
+    def forward(self, x_dict, edge_index_dict, edge_attr_dict=None):
+        # 1) Input proj
+        x0 = {n: self.input_proj[n](x) for n, x in x_dict.items()}
 
-        x_dict1 = self.convs1(x_dict, edge_index_dict)
-        for node_type in self.metadata[0]:
-            if node_type not in x_dict1 or x_dict1[node_type] is None:
-                x_dict1[node_type] = x_dict[node_type]
+        # 2) Build the 1?dim edge_attr dict for signature edges
+        ew = {}
+        rel_fwd = ('patient','to','signature')
+        rel_rev = ('signature','to_rev','patient')
+        if edge_attr_dict and rel_fwd in edge_attr_dict:
+            w = edge_attr_dict[rel_fwd].float().view(-1,1)  # cast to float32
+            ew[rel_fwd] = w
+            ew[rel_rev] = w.flip(0)
+
+        # 3) conv1 + fallback + ReLU
+        x1 = self.convs1(x0, edge_index_dict, edge_attr_dict=ew)
+        for n in self.metadata[0]:
+            if n not in x1 or x1[n] is None:
+                x1[n] = x0[n]
             else:
-                x_dict1[node_type] = F.relu(x_dict1[node_type])
+                x1[n] = F.relu(x1[n])
 
-        x_dict2 = self.convs2(x_dict1, edge_index_dict)
-        for node_type in self.metadata[0]:
-            if node_type not in x_dict2 or x_dict2[node_type] is None:
-                x_dict2[node_type] = x_dict1[node_type]
+        # 4) conv2 + fallback + ReLU
+        x2 = self.convs2(x1, edge_index_dict, edge_attr_dict=ew)
+        for n in self.metadata[0]:
+            if n not in x2 or x2[n] is None:
+                x2[n] = x1[n]
             else:
-                x_dict2[node_type] = F.relu(x_dict2[node_type])
+                x2[n] = F.relu(x2[n])
 
-        x_dict3 = self.convs3(x_dict2, edge_index_dict)
-        for node_type in self.metadata[0]:
-            if node_type not in x_dict3 or x_dict3[node_type] is None:
-                x_dict3[node_type] = x_dict2[node_type]
-            else:
-                x_dict3[node_type] = F.relu(x_dict3[node_type])
+        # 5) conv3 + fallback + ReLU
+        x3 = self.convs3(x2, edge_index_dict, edge_attr_dict=ew)
+        for n in self.metadata[0]:
+            h = x3.get(n, x2[n])
+            h = F.relu(h)
 
-        x_dict3 = {key: self.linear_proj[key](x) for key, x in x_dict3.items()}
-        return x_dict3
+            # **NEW**: if for any node?type we still have 256 dims,
+            # shrink it down to 128 before going to linear_proj
+            if h.size(1) == self.hidden_dim:
+                h = F.relu(self.shrink[n](h))
+
+            x3[n] = h
+
+            # final projections (now guaranteed to be 128?128 everywhere)
+        return {n: self.linear_proj[n](h) for n, h in x3.items()}
 
 
 all_graphs =  torch.load("glucose_sleep_graphs_3d.pt", weights_only = False)
@@ -159,7 +192,11 @@ def train(model, predictor, cox_head, loader, optimizer, device):
             continue
 
         optimizer.zero_grad()
-        out = model(batch.x_dict, batch.edge_index_dict)
+        edge_attr_dict = {}
+        rel = ('patient', 'to', 'signature')
+        if rel in batch.edge_types and hasattr(batch[rel], 'edge_attr'):
+            edge_attr_dict[rel] = batch[rel].edge_attr
+        out = model(batch.x_dict, batch.edge_index_dict, edge_attr_dict)
         # Sanity?check GNN outputs
         for ntype, h in out.items():
             if torch.isnan(h).any() or torch.isinf(h).any():
@@ -313,9 +350,12 @@ def evaluate(model, predictor, cox_head, loader, device,
             for et in batch.edge_types
             if et != ('patient', 'has', 'condition')
         }
-
-        # --- Get patient embeddings ---
-        out = model(batch.x_dict, edge_index_dict)
+        edge_attr_dict = {}
+        rel = ('patient', 'to', 'signature')
+        if rel in batch.edge_types and hasattr(batch[rel], 'edge_attr'):
+            edge_attr_dict[rel] = batch[rel].edge_attr
+        out = model(batch.x_dict, edge_index_dict, edge_attr_dict)
+        # get patient embeddings
         P = out['patient']  # [n_patients, hidden]
 
         # --- Use fixed condition embeddings from training ---
@@ -453,7 +493,7 @@ metadata = (
 model = HeteroGAT(
     metadata=metadata,
     in_dims=in_dims,
-    hidden_dim=128,
+    hidden_dim=256,
     out_dim=128
 ).to(device)
 
@@ -486,7 +526,10 @@ for epoch in range(1, EPOCHS + 1):
         h = F.relu(h)
         h = F.relu(h)
 
-        # 4) Final linear projection
+        # **now** shrink to 128
+        h = F.relu(model.shrink['condition'](h))  #  [7×128]
+
+        # final projection (now matches 128?128)
         train_cond_embeds = model.linear_proj['condition'](h)
         # Now pass train_cond_embeds to evaluation
     val_avg_link, avg_cox, cidx_list, mean_cidx, link_auc, pr_auc, pr_auc_per_cond = evaluate(
