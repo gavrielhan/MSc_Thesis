@@ -18,7 +18,10 @@ import os
 import json
 from sklearn.metrics import average_precision_score
 from collections import defaultdict
+from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(BASE_DIR)
 
 class HeteroGAT(nn.Module):
     def __init__(
@@ -27,7 +30,7 @@ class HeteroGAT(nn.Module):
         in_dims,
         hidden_dim: int = 128,
         out_dim:   int = 128,
-        num_heads: int = 8,
+        num_heads: int = 4,
         dropout:   float = 0.2
     ):
         super().__init__()
@@ -126,6 +129,22 @@ class HeteroGAT(nn.Module):
             # final projections (now guaranteed to be 128?128 everywhere)
         return {n: self.linear_proj[n](h) for n, h in x3.items()}
 
+class JointHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # these are *unconstrained* parameters
+        self._raw_link = nn.Parameter(torch.zeros(1))
+        self._raw_cox  = nn.Parameter(torch.zeros(1))
+
+    def forward(self, link_loss, cox_loss):
+        # softplus ? always > 0
+        log_var_link = F.softplus(self._raw_link)
+        log_var_cox  = F.softplus(self._raw_cox)
+
+        term_link = 0.5 * link_loss * torch.exp(-log_var_link) + 0.5 * log_var_link
+        term_cox  = 0.5 * cox_loss  * torch.exp(-log_var_cox ) + 0.5 * log_var_cox
+
+        return term_link + term_cox
 
 all_graphs =  torch.load("glucose_sleep_graphs_3d.pt", weights_only = False)
 
@@ -135,10 +154,12 @@ train_graphs = torch.load("split/train_graphs_3d.pt", weights_only = False)
 val_graphs = torch.load("split/val_graphs_3d.pt", weights_only = False)
 test_graphs = torch.load("split/test_graphs_3d.pt", weights_only = False)
 
+
 # Load our diagnosis?window mapping
 # Load the full diagnosis?window mapping:
 with open("diagnosis_mapping.json") as f:
     full_diag_map = json.load(f)
+
 
 def build_diag_by_win(full_map, graphs):
     pts = {p for g in graphs for p in g['patient'].name}
@@ -152,9 +173,8 @@ diag_by_win_train = build_diag_by_win(full_diag_map, train_graphs)
 diag_by_win_val   = build_diag_by_win(full_diag_map, val_graphs)
 diag_by_win_test  = build_diag_by_win(full_diag_map, test_graphs)
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 10  # you can adjust this multiplier later
+NEGATIVE_MULTIPLIER = 3  # you can adjust this multiplier later
 # Count total positive edges in the training split
 total_pos = sum(
     g[('patient','has','condition')].edge_index.size(1)
@@ -282,7 +302,7 @@ def train(model, predictor, cox_head, loader, optimizer, device):
             else:
                 print(f"[Batch {batch_idx}] Missing duration/event attrs")
         # --- Final loss and backward ---
-        loss = link_loss + cox_loss
+        loss = joint_head(link_loss, cox_loss)
         # Sanity?check losses
         for name, l in (("link_loss", link_loss), ("cox_loss", cox_loss)):
             if isinstance(l, torch.Tensor):
@@ -493,17 +513,31 @@ metadata = (
 model = HeteroGAT(
     metadata=metadata,
     in_dims=in_dims,
-    hidden_dim=256,
+    hidden_dim=128,
     out_dim=128
 ).to(device)
 
 link_head = LinkMLPPredictor(input_dim=128).to(device)
 cox_head = CoxHead(input_dim=128, num_conditions=7).to(device)
 
-optimizer = torch.optim.Adam(list(model.parameters()) +
-                             list(link_head.parameters()) +
-                             list(cox_head.parameters()), lr=1e-3)
+joint_head = JointHead().to(device)
+optimizer = torch.optim.Adam(
+    list(model.parameters()) +
+    list(link_head.parameters()) +
+    list(cox_head.parameters()) +
+    list(joint_head.parameters()),
+    lr=1e-3
+)
+scheduler = StepLR(optimizer, step_size=10, gamma=0.5)
 
+# Option B: reduce on plateau of validation link?loss
+# scheduler = ReduceLROnPlateau(
+#     optimizer,
+#     mode='min',
+#     factor=0.5,
+#     patience=5,
+#     verbose=True
+# )
 # Create DataLoaders for each split
 train_loader = DataLoader(train_graphs, batch_size=1, shuffle=True)
 val_loader = DataLoader(val_graphs, batch_size=1)
@@ -522,7 +556,6 @@ for epoch in range(1, EPOCHS + 1):
         h = model.input_proj['condition'](eye)  # [C, hidden_dim]
 
         # 3) Three ?conv?fallback? steps (just ReLU)
-        h = F.relu(h)
         h = F.relu(h)
         h = F.relu(h)
 
@@ -551,6 +584,11 @@ for epoch in range(1, EPOCHS + 1):
         "timestamp": datetime.datetime.now().isoformat()
     }
     history.append(results)
+    # ? for StepLR:
+    scheduler.step()
+
+    # ? if using ReduceLROnPlateau, comment out the above line and instead do:
+    # scheduler.step(val_avg_link)
 
     print(f"[Epoch {epoch}] Train Loss: {train_loss:.4f} | "
           f"Val Link Loss: {val_avg_link:.4f} |"
