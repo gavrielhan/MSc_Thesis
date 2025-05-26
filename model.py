@@ -174,7 +174,7 @@ diag_by_win_val   = build_diag_by_win(full_diag_map, val_graphs)
 diag_by_win_test  = build_diag_by_win(full_diag_map, test_graphs)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 3  # you can adjust this multiplier later
+NEGATIVE_MULTIPLIER = 2  # you can adjust this multiplier later
 # Count total positive edges in the training split
 total_pos = sum(
     g[('patient','has','condition')].edge_index.size(1)

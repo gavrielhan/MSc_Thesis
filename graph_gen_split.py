@@ -267,7 +267,7 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
             rev_rel = (dst, rel + '_rev', src)
             het[rev_rel].edge_index = ei.flip(0)
 
-
+    het.window = wi
     return wi, het
 
 # store last_loc per split
