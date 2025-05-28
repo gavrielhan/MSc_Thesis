@@ -5,19 +5,53 @@ import torch.nn.functional as F
 
 class LinkMLPPredictor(nn.Module):
     def __init__(self, input_dim, hidden_dim=128):
+        """
+        A 2?layer MLP with a skip (residual) connection from the first layer's input
+        into the second layer.
+
+        Args:
+            input_dim  (int): dimensionality of each patient / condition embed
+            hidden_dim (int): dimensionality of the hidden layers
+        """
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        # we'll concatenate patient + condition ? 2 * input_dim
+        self.fc1 = nn.Linear(input_dim * 2, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, 1)
+
+        # If the concatenated dimension ? hidden_dim, project it to match:
+        if input_dim * 2 != hidden_dim:
+            self.res_proj = nn.Linear(input_dim * 2, hidden_dim)
+        else:
+            self.res_proj = nn.Identity()
+
+        self.act = nn.ReLU()
 
     def forward(self, patient_embeds, condition_embeds, edge_index):
-        # edge_index: shape [2, num_edges] ? [patient_idx, condition_idx]
-        src = patient_embeds[edge_index[0]]  # [N, input_dim]
-        dst = condition_embeds[edge_index[1]]  # [N, input_dim]
-        x = torch.cat([src, dst], dim=1)  # [N, 2 * input_dim]
-        return self.mlp(x).view(-1)  # [N]
+        """
+        Args:
+          patient_embeds   Tensor [N_pat, input_dim]
+          condition_embeds Tensor [N_cond, input_dim]
+          edge_index       LongTensor [2, E]  (rows: [pat_idx, cond_idx])
+
+        Returns:
+          logits           Tensor [E]
+        """
+        src = patient_embeds[edge_index[0]]  # [E, input_dim]
+        dst = condition_embeds[edge_index[1]]  # [E, input_dim]
+        x = torch.cat([src, dst], dim=1)  # [E, 2 * input_dim]
+
+        # 1) First layer
+        h1 = self.act(self.fc1(x))  # [E, hidden_dim]
+
+        # 2) Residual: project original x ? hidden_dim
+        res = self.res_proj(x)  # [E, hidden_dim]
+
+        # 3) Second layer + skip
+        h2 = self.act(self.fc2(h1) + res)  # [E, hidden_dim]
+
+        # 4) Final logit
+        return self.fc_out(h2).view(-1)  # [E]
 
 
 
@@ -105,3 +139,42 @@ class CoxHead(nn.Module):
         # final, weighted sum of condition losses
         return (losses * weights).sum()
 
+class CosineLinkPredictor(nn.Module):
+    def __init__(self, input_dim, init_scale: float = 1.0, use_bias: bool = True):
+        """
+        A link predictor that scores (p?c) by
+            logits = scale * cosine_similarity(p, c) + bias
+        so that you can train it via BCEWithLogits.
+
+        Args:
+            input_dim  (int): dimensionality of each patient/condition embed
+            init_scale (float): initial value for the learnable scale
+            use_bias   (bool): whether to include a learnable bias term
+        """
+        super().__init__()
+        self.cos   = nn.CosineSimilarity(dim=1, eps=1e-6)
+        self.scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float))
+        if use_bias:
+            self.bias = nn.Parameter(torch.zeros(1))
+        else:
+            self.register_buffer("bias", torch.zeros(1))
+
+    def forward(self, patient_embeds, condition_embeds, edge_index):
+        """
+        Args:
+          patient_embeds   Tensor [N_pat, input_dim]
+          condition_embeds Tensor [N_cond, input_dim]
+          edge_index       LongTensor [2, E]  (rows: [pat_idx, cond_idx])
+
+        Returns:
+          logits           Tensor [E]
+        """
+        # gather the embeddings for each edge
+        src = patient_embeds[edge_index[0]]    # [E, input_dim]
+        dst = condition_embeds[edge_index[1]]  # [E, input_dim]
+
+        # compute cosine similarity in [?1, 1]
+        sim = self.cos(src, dst)               # [E]
+
+        # scale (and bias) turn it into unbounded logits
+        return sim * self.scale + self.bias   # [E]
