@@ -378,26 +378,30 @@ def train(model, predictor, cox_head, joint_head, loader, optimizer, device):
 
         pseudo_edges = []
         top_d = torch.argmax(probs, dim=1)  # [N_pat]
+        candidate_pool = torch.nonzero(unlabeled_mask, as_tuple=False).view(-1)
 
         for cidx in range(Cdim):
             num_to_add = Nhat[cidx].item()
-            if num_to_add <= 0:
+            if num_to_add <= 0 or candidate_pool.numel() == 0:
                 continue
-            p_c = probs[:, cidx]
-            candidate_mask = (
-                unlabeled_mask
-                & (top_d == cidx)
-                & (p_c > EPS_PSEUDO)
-            )
-            if candidate_mask.sum().item() == 0:
+            sample_n = min(num_to_add * 3, candidate_pool.size(0))
+            perm = torch.randperm(candidate_pool.size(0), device=device)[:sample_n]
+            sample_idx = candidate_pool[perm]
+
+            p_c = probs[sample_idx, cidx]
+            mask = (top_d[sample_idx] == cidx) & (p_c > EPS_PSEUDO)
+            if mask.sum().item() == 0:
                 continue
-            cand_indices = torch.nonzero(candidate_mask, as_tuple=False).view(-1)
-            cand_probs   = p_c[cand_indices]
+            cand_indices = sample_idx[mask]
+            cand_probs = p_c[mask]
             topk = min(num_to_add, cand_indices.size(0))
             _, topk_idxs = torch.topk(cand_probs, k=topk, largest=True)
             sel_patients = cand_indices[topk_idxs]
             for i_sel in sel_patients.tolist():
                 pseudo_edges.append((i_sel, cidx))
+            if sel_patients.numel() > 0:
+                remove_mask = (candidate_pool.unsqueeze(1) == sel_patients.view(-1)).any(dim=1)
+                candidate_pool = candidate_pool[~remove_mask]
 
         M_pseudo = len(pseudo_edges)
         if M_pseudo == 0:
