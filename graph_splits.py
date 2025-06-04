@@ -52,7 +52,8 @@ def get_event_duration(idx, name, cond_idx, patient_cond_idx_map):
         event_idx = patient_cond_idx_map[name][cond_idx]
         if event_idx == idx:
             event = 1
-            duration = 0.0
+            # Avoid zero duration which would be ignored by Cox loss
+            duration = 1.0
         elif event_idx > idx:
             event = 0
             duration = event_idx - idx
