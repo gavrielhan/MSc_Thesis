@@ -201,7 +201,9 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
                             d["patient"] == p and d["cond"] == ci and d["window"] >= wi]
             if future_diags:
                 ev_row.append(1)
-                du_row.append(min(future_diags) - wi)
+                dur = min(future_diags) - wi
+                # Avoid zero duration which would be ignored by Cox loss
+                du_row.append(dur if dur > 0 else 1.0)
             else:
                 ev_row.append(0)
                 du_row.append(0.0)
