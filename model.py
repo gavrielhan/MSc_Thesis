@@ -209,94 +209,99 @@ global_pos_weight = total_neg / (total_pos + 1e-6)
 global_pos_weight = torch.tensor([global_pos_weight], device=device)
 
 
-def train(model, predictor, cox_head, loader, optimizer, device):
+
+#  HYPERPARAMETERS FOR PSEUDO-LABELING
+# ----------------------------------------------------------------------------------
+EPS_PSEUDO    = 0.90   # ?: confidence threshold (choose between 0.8?0.95 in practice)
+LAMBDA_PSEUDO = 0.50   # ?: weight on the pseudo?label loss
+# ----------------------------------------------------------------------------------
+
+def train(model, predictor, cox_head, joint_head, loader, optimizer, device):
+    """
+    Combined training loop with Balanced Pseudo?Label Generation (Section 3.2).
+    """
     model.train()
     predictor.train()
     cox_head.train()
+
 
     total_loss = 0.0
     num_batches = 0
 
     for batch_idx, batch in enumerate(tqdm(loader, desc="Training")):
         batch = batch.to(device)
-        # Sanity?check inputs
+
+        # 1) Sanity?check: no NaNs / Infs in node features
         for ntype, x in batch.x_dict.items():
             if torch.isnan(x).any() or torch.isinf(x).any():
-                raise RuntimeError(f"[Batch {batch_idx}] Bad input on node '{ntype}': contains NaN or Inf")
+                raise RuntimeError(
+                    f"[Batch {batch_idx}] Bad input on node '{ntype}': contains NaN or Inf"
+                )
 
-        # Skip batches with no useful edges
+        # 2) Skip if no useful edges
         if len(batch.edge_types) == 0 or (
-            ('patient', 'has', 'condition') not in batch.edge_types and
-            ('patient', 'follows', 'patient') not in batch.edge_types
+            ('patient', 'has', 'condition') not in batch.edge_types
+            and ('patient', 'follows', 'patient') not in batch.edge_types
         ):
-            print("[SKIP] Skipping batch with no useful edges.")
             continue
 
         optimizer.zero_grad()
+
+        # 3) Forward through HeteroGAT
         edge_attr_dict = {}
-        rel = ('patient', 'to', 'signature')
-        if rel in batch.edge_types and hasattr(batch[rel], 'edge_attr'):
-            edge_attr_dict[rel] = batch[rel].edge_attr
-        out = model(batch.x_dict, batch.edge_index_dict, edge_attr_dict)
-        # Sanity?check GNN outputs
-        for ntype, h in out.items():
-            if torch.isnan(h).any() or torch.isinf(h).any():
-                raise RuntimeError(f"[Batch {batch_idx}] NaNs in model output for '{ntype}'")
+        rel_sig = ('patient', 'to', 'signature')
+        if rel_sig in batch.edge_types and hasattr(batch[rel_sig], 'edge_attr'):
+            edge_attr_dict[rel_sig] = batch[rel_sig].edge_attr
 
-        patient_embeds   = out['patient']
-        condition_embeds = out['condition']
+        out_dict = model(batch.x_dict, batch.edge_index_dict, edge_attr_dict)
+        patient_embeds   = out_dict['patient']    # [N_pat, D_hidden]
+        condition_embeds = out_dict['condition']  # [C,     D_hidden]
 
-        # ------ FIX: initialize losses as tensors that require grad ------
-        zero = patient_embeds.sum() * 0.0
-        # Link prediction loss
-        # --- build our positive edges over the next HORIZON windows ---
-        # Link prediction loss over the next HORIZON windows
-        window_idx = int(batch.window)  # your build_graph stashed wi ? batch.window
-        # 1) collect all (patient, condition) diagnoses in [t+1 .. t+HORIZON]
+        zero      = patient_embeds.sum() * 0.0
+        link_loss = zero.clone()
+        cox_loss  = zero.clone()
+
+        # 4) HORIZON?based link?prediction loss
+        window_idx = int(batch.window)
         pos_pairs = []
         for w in range(window_idx + 1, window_idx + 1 + HORIZON):
             pos_pairs.extend([
-                (p, ci)
-                for (p, ci) in diag_by_win_train.get(w, [])
+                (p, ci) for (p, ci) in diag_by_win_train.get(w, [])
             ])
 
-        # 2) turn names ? indices
-        names = [n for sub in batch['patient'].name
-                 for n in (sub if isinstance(sub, list) else [sub])]  # list of patient IDs in this batch
+        # Flatten patient IDs
+        names = [
+            n for sub in batch['patient'].name
+                 for n in (sub if isinstance(sub, list) else [sub])
+        ]
         is_female = torch.tensor(
             [gender_map.get(p, 'female') == 'female' for p in names],
             device=device, dtype=torch.bool
         )
+
+        # Remove (male, BREAST_IDX) from positives
         pos_pairs = [
             (p, ci) for (p, ci) in pos_pairs
             if not (ci == BREAST_IDX and not is_female[names.index(p)])
         ]
-        src_nodes = []
-        dst_nodes = []
+
+        src_nodes, dst_nodes = [], []
         for p, ci in pos_pairs:
             if p in names:
                 src_nodes.append(names.index(p))
                 dst_nodes.append(ci)
 
-        # 3) build pos_ei if any positives exist
         if src_nodes:
             pos_ei = torch.stack([
                 torch.tensor(src_nodes, device=device),
                 torch.tensor(dst_nodes, device=device),
-            ], dim=0)  # shape [2, N_pos]
-        else:
-            pos_ei = None
-
-        # 4) if we have any future positives, do BCE; otherwise zero
-        if pos_ei is not None:
+            ], dim=0)
             pos_preds = predictor(patient_embeds, condition_embeds, pos_ei)
             pos_labels = torch.ones_like(pos_preds)
 
             num_neg = pos_preds.size(0) * NEGATIVE_MULTIPLIER
-            # sample initial negatives
             neg_src = torch.randint(0, patient_embeds.size(0), (num_neg,), device=device)
             neg_dst = torch.randint(0, condition_embeds.size(0), (num_neg,), device=device)
-            # enforce female-only for breast?cancer negatives
             mask_b = (neg_dst == BREAST_IDX)
             if mask_b.any():
                 female_idx = torch.where(is_female)[0]
@@ -315,24 +320,21 @@ def train(model, predictor, cox_head, loader, optimizer, device):
         else:
             link_loss = zero.clone()
 
-        # --- now, _outside_ of that horizon logic_, do your Cox loss exactly once per batch ---
-        cox_loss = zero.clone()
-        valid_cox_conds = 0
-        num_conditions = condition_embeds.size(0)
+        # 5) Cox?regression loss (per condition)
         if hasattr(batch['patient'], 'event') and hasattr(batch['patient'], 'duration'):
-            events = batch['patient'].event
-            durations = batch['patient'].duration
-            risk_scores = cox_head(patient_embeds)
-            for ci in range(num_conditions):
+            events    = batch['patient'].event    # [N_pat, C]
+            durations = batch['patient'].duration # [N_pat, C]
+            risk_scores = cox_head(patient_embeds)  # [N_pat, C]
+            valid_cox_conds = 0
+            for ci in range(condition_embeds.size(0)):
                 ev_col = events[:, ci]
                 if ev_col.sum().item() > 0:
-                    dur_col = durations[:, ci]
+                    dur_col   = durations[:, ci]
                     score_col = risk_scores[:, ci]
-                    # guards?
                     loss_ci = CoxHead.cox_partial_log_likelihood(
                         score_col.unsqueeze(1),
                         dur_col.unsqueeze(1),
-                        ev_col.unsqueeze(1),
+                        ev_col.unsqueeze(1)
                     )
                     cox_loss += loss_ci
                     valid_cox_conds += 1
@@ -340,57 +342,129 @@ def train(model, predictor, cox_head, loader, optimizer, device):
                 cox_loss /= valid_cox_conds
         else:
             print(f"[Batch {batch_idx}] Missing duration/event attrs")
-        # --- Final loss and backward ---
-        loss = joint_head(link_loss, cox_loss)
-        # Sanity?check losses
-        for name, l in (("link_loss", link_loss), ("cox_loss", cox_loss)):
-            if isinstance(l, torch.Tensor):
-                if not torch.isfinite(l).all():
-                    raise RuntimeError(f"[Batch {batch_idx}] {name} is non-finite: {l}")
-            else:
-                if not math.isfinite(l):
-                    raise RuntimeError(f"[Batch {batch_idx}] {name} is non-finite: {l}")
 
-        if not torch.isfinite(loss).all():
-            raise RuntimeError(f"[Batch {batch_idx}] total loss is non-finite: {loss}")
+        L_original = joint_head(link_loss, cox_loss)
 
-        loss.backward()
+        # 6) Balanced Pseudo?Label Generation
+        N_pat = patient_embeds.size(0)
+        Cdim  = condition_embeds.size(0)
 
-        # Clip gradients and check
+        row_repeat = torch.arange(N_pat, device=device).repeat_interleave(Cdim)
+        col_tile   = torch.arange(Cdim,   device=device).repeat(N_pat)
+        dense_ei = torch.stack([row_repeat, col_tile], dim=0)  # [2, N_pat*C]
+
+        dense_logits = predictor(patient_embeds, condition_embeds, dense_ei)
+        dense_logits = dense_logits.view(N_pat, Cdim)         # [N_pat, C]
+        probs = F.softmax(dense_logits, dim=1)                # [N_pat, C]
+
+        if ('patient', 'has', 'condition') in batch.edge_types:
+            true_edges = batch[('patient', 'has', 'condition')].edge_index
+            true_src   = true_edges[0]
+            true_dst   = true_edges[1]
+        else:
+            true_src = torch.empty((0,), dtype=torch.long, device=device)
+            true_dst = torch.empty((0,), dtype=torch.long, device=device)
+
+        already_labeled_mask = torch.zeros(N_pat, dtype=torch.bool, device=device)
+        if true_src.numel() > 0:
+            already_labeled_mask[ true_src ] = True
+        unlabeled_mask = ~already_labeled_mask
+
+        counts_per_class = torch.zeros(Cdim, device=device, dtype=torch.long)
+        for cidx in range(Cdim):
+            counts_per_class[cidx] = (true_dst == cidx).sum()
+        M_max = counts_per_class.max().item()
+        Nhat  = (M_max - counts_per_class).clamp(min=0)
+
+        pseudo_edges = []
+        top_d = torch.argmax(probs, dim=1)  # [N_pat]
+
+        for cidx in range(Cdim):
+            num_to_add = Nhat[cidx].item()
+            if num_to_add <= 0:
+                continue
+            p_c = probs[:, cidx]
+            candidate_mask = (
+                unlabeled_mask
+                & (top_d == cidx)
+                & (p_c > EPS_PSEUDO)
+            )
+            if candidate_mask.sum().item() == 0:
+                continue
+            cand_indices = torch.nonzero(candidate_mask, as_tuple=False).view(-1)
+            cand_probs   = p_c[cand_indices]
+            topk = min(num_to_add, cand_indices.size(0))
+            _, topk_idxs = torch.topk(cand_probs, k=topk, largest=True)
+            sel_patients = cand_indices[topk_idxs]
+            for i_sel in sel_patients.tolist():
+                pseudo_edges.append((i_sel, cidx))
+
+        M_pseudo = len(pseudo_edges)
+        if M_pseudo == 0:
+            L_ps = zero.clone()
+        else:
+            pe_rows = torch.tensor(
+                [p[0] for p in pseudo_edges],
+                device=device, dtype=torch.long
+            )
+            pe_cols = torch.tensor(
+                [p[1] for p in pseudo_edges],
+                device=device, dtype=torch.long
+            )
+            all_logits_for_sel = dense_logits[pe_rows]  # [M_pseudo, C]
+            target_labels     = pe_cols                # [M_pseudo]
+            L_ps = F.cross_entropy(
+                all_logits_for_sel,
+                target_labels,
+                reduction='mean'
+            )
+
+        # 7) Total loss and backward
+        L_total = L_original + (LAMBDA_PSEUDO * L_ps)
+        L_total.backward()
+
         torch.nn.utils.clip_grad_norm_(
             list(model.parameters()) +
             list(predictor.parameters()) +
-            list(cox_head.parameters()),
+            list(cox_head.parameters()) +
+            list(joint_head.parameters()),
             max_norm=1.0
         )
-        for name, param in list(model.named_parameters()) + \
-                           list(predictor.named_parameters()) + \
-                           list(cox_head.named_parameters()):
-            if param.grad is not None and torch.isnan(param.grad).any():
-                raise RuntimeError(f"[Batch {batch_idx}] NaN in grad of '{name}'")
-
         optimizer.step()
-        total_loss += loss.item()
+
+        total_loss += L_total.item()
         num_batches += 1
 
     return total_loss / max(1, num_batches)
 
 
 
-
 @torch.no_grad()
 def evaluate(model, predictor, cox_head, loader, device,
              NEGATIVE_MULTIPLIER, diag_by_win_map, frozen_condition_embeddings):
-    model.eval(); predictor.eval(); cox_head.eval()
+    """
+    Evaluate loop over validation/test graphs.
+
+    - Uses the same HORIZON?based logic for link-prediction as in train()
+    - Applies the same female?only filtering for BREAST_IDX
+    - Computes per?condition AUC/PR, plus Cox c?index
+    """
+    model.eval()
+    predictor.eval()
+    cox_head.eval()
 
     total_link_loss = 0.0
     total_cox_loss  = 0.0
-    all_link_preds,  all_link_labels  = [], []
-    per_cond_preds,  per_cond_labels  = {}, {}
-    all_risk_scores, all_durations, all_events = [], [], []
-    num_batches = 0
+    all_link_preds  = []
+    all_link_labels = []
+    per_cond_preds  = {}
+    per_cond_labels = {}
+    all_risk_scores = []
+    all_durations   = []
+    all_events      = []
+    num_batches     = 0
 
-    # Number of conditions
+    # Number of conditions (Cdim)
     num_conditions = cox_head.linear.out_features
     for ci in range(num_conditions):
         per_cond_preds[ci]  = []
@@ -399,111 +473,130 @@ def evaluate(model, predictor, cox_head, loader, device,
     for window_idx, batch in enumerate(tqdm(loader, desc="Evaluating")):
         batch = batch.to(device)
 
-        # Skip if no patients
+        # 1) Skip if no patient nodes
         if 'patient' not in batch.x_dict or batch['patient'].x.size(0) == 0:
             continue
 
-        # Prepare edges + attrs for GNN forward
+        # 2) Build edge_index_dict for all relations except the 'has?condition' edges
         edge_index_dict = {
             et: batch[et].edge_index
             for et in batch.edge_types
             if et != ('patient', 'has', 'condition')
         }
+
+        # 3) Gather edge_attr for ('patient','to','signature'), if it exists
         edge_attr_dict = {}
-        rel = ('patient', 'to', 'signature')
-        if rel in batch.edge_types and hasattr(batch[rel], 'edge_attr'):
-            edge_attr_dict[rel] = batch[rel].edge_attr
+        rel_sig = ('patient', 'to', 'signature')
+        if rel_sig in batch.edge_types and hasattr(batch[rel_sig], 'edge_attr'):
+            edge_attr_dict[rel_sig] = batch[rel_sig].edge_attr
 
-        # Forward pass
-        out = model(batch.x_dict, edge_index_dict, edge_attr_dict)
-        P = out['patient']
-        C = frozen_condition_embeddings.to(device)
+        # 4) Forward pass through HeteroGAT
+        out_dict = model(batch.x_dict, edge_index_dict, edge_attr_dict)
+        P = out_dict['patient']    # [N_pat, D_hidden]
+        C = frozen_condition_embeddings.to(device)  # [Cdim, D_hidden]
 
-        # Skip empty embeddings
+        # 5) Skip if embeddings are empty
         if P.size(0) == 0 or C.size(0) == 0:
             continue
+
+        # 6) Build all positive pairs in [window_idx+1 .. window_idx+HORIZON]
         pos_pairs = []
         for w in range(window_idx + 1, window_idx + 1 + HORIZON):
             pos_pairs.extend(diag_by_win_map.get(w, []))
-        # Flatten the patient names list once
-        flat_names = [n for sub in batch['patient'].name
-                 for n in (sub if isinstance(sub, list) else [sub])]
+
+        # 7) Flatten the list of patient IDs in this batch
+        flat_names = [
+            nid for sub in batch['patient'].name
+                 for nid in (sub if isinstance(sub, list) else [sub])
+        ]
+        # 7.a) Build boolean mask "is_female_flat" for each node?index in this batch
         is_female_flat = torch.tensor(
-            [gender_map.get(p, 'female') == 'female' for p in flat_names],
+            [gender_map.get(pid, 'female') == 'female' for pid in flat_names],
             device=device, dtype=torch.bool
         )
+
+        # 8) Drop any (male, BREAST_IDX) from pos_pairs
         pos_pairs = [
             (p, ci) for (p, ci) in pos_pairs
             if not (ci == BREAST_IDX and not is_female_flat[flat_names.index(p)])
         ]
 
-        # Map to node indices
+        # 9) Convert pos_pairs (RegistrationCode, condition_idx) ? node?indices
         src_nodes, dst_nodes = [], []
-        for p, ci in pos_pairs:
+        for (p, ci) in pos_pairs:
             if p in flat_names:
                 src_nodes.append(flat_names.index(p))
                 dst_nodes.append(ci)
 
-        # If no positives in horizon, skip this batch
-        if not src_nodes:
+        # 10) If no positives remain in horizon, skip this batch
+        if len(src_nodes) == 0:
             continue
 
         pos_ei = torch.stack([
             torch.tensor(src_nodes, device=device),
-            torch.tensor(dst_nodes, device=device),
+            torch.tensor(dst_nodes, device=device)
         ], dim=0)  # shape [2, #pos]
 
-        # ----- Link prediction loss & metrics -----
+        # ?? LINK?PREDICTION LOSS & METRICS ?? #
         for cond_idx in range(num_conditions):
-            mask = (pos_ei[1] == cond_idx)
-            # drop any male?breast positives
+            # 10.a) Mask for positives of this condition
+            mask_pos = (pos_ei[1] == cond_idx)
+            # 10.b) Drop any male?breast positives if cond_idx == BREAST_IDX
             if cond_idx == BREAST_IDX:
-                mask &= is_female_flat[pos_ei[0]]
-            if not mask.any():
+                mask_pos &= is_female_flat[pos_ei[0]]
+
+            if not mask_pos.any():
                 continue
 
-            # Positive logits
-            pe  = pos_ei[:, mask]
-            pp  = predictor(P, C, pe)
-            pl  = torch.ones_like(pp)
+            # 10.c) Positive edge_index for this cond_idx
+            pe = pos_ei[:, mask_pos]
+            pp = predictor(P, C, pe)           # [#pos, ]
+            pl = torch.ones_like(pp)           # [#pos, ]
 
-            # Negative sampling
+            # 10.d) Negative sampling
             n_neg   = pp.size(0) * NEGATIVE_MULTIPLIER
             neg_src = torch.randint(0, P.size(0), (n_neg,), device=device)
             neg_dst = torch.full((n_neg,), cond_idx, device=device)
+
+            # If cond_idx == BREAST_IDX, restrict neg_src to female indices
             if cond_idx == BREAST_IDX:
                 female_idx = torch.where(is_female_flat)[0]
                 mask_b = (neg_dst == BREAST_IDX)
                 neg_src[mask_b] = female_idx[
-                    torch.randint(0, female_idx.size(0), (int(mask_b.sum()),), device=device)
+                    torch.randint(
+                        0, female_idx.size(0),
+                        (int(mask_b.sum()),),
+                        device=device
+                    )
                 ]
-            ne      = torch.stack([neg_src, neg_dst], dim=0)
-            npred   = predictor(P, C, ne)
-            nl      = torch.zeros_like(npred)
 
-            # Collect for metrics
-            preds  = torch.cat([pp, npred])
-            labels = torch.cat([pl, nl])
+            ne = torch.stack([neg_src, neg_dst], dim=0)  # [2, n_neg]
+            npred = predictor(P, C, ne)                  # [n_neg, ]
+            nl    = torch.zeros_like(npred)              # [n_neg, ]
 
-            all_link_preds .append(preds.cpu())
-            all_link_labels.append(labels.cpu())
-            per_cond_preds [cond_idx].append(preds.cpu())
-            per_cond_labels[cond_idx].append(labels.cpu())
+            # 10.e) Collect for metrics
+            all_preds  = torch.cat([pp, npred], dim=0)
+            all_labels = torch.cat([pl, nl], dim=0)
 
-            # Accumulate loss
+            all_link_preds .append(all_preds.cpu())
+            all_link_labels.append(all_labels.cpu())
+            per_cond_preds [cond_idx].append(all_preds.cpu())
+            per_cond_labels[cond_idx].append(all_labels.cpu())
+
+            # 10.f) Accumulate BCE loss (with same global_pos_weight)
             total_link_loss += F.binary_cross_entropy_with_logits(
-                preds, labels, pos_weight=global_pos_weight
+                all_preds, all_labels, pos_weight=global_pos_weight
             ).item()
 
-        # ----- Cox regression loss -----
+        # ?? COX PARTIAL LOG?LIKELIHOOD LOSS ?? #
         if hasattr(batch['patient'], 'event') and hasattr(batch['patient'], 'duration'):
-            risks = cox_head(P)
-            durs  = batch['patient'].duration
-            evts  = batch['patient'].event
+            risks = cox_head(P)                   # [N_pat, Cdim]
+            durs = batch['patient'].duration      # [N_pat, Cdim]
+            evts = batch['patient'].event         # [N_pat, Cdim]
 
             all_risk_scores.append(risks.cpu())
-            all_durations .append(durs.cpu())
-            all_events    .append(evts.cpu())
+            all_durations  .append(durs.cpu())
+            all_events     .append(evts.cpu())
 
             total_cox_loss += CoxHead.cox_partial_log_likelihood(
                 risks, durs, evts
@@ -511,11 +604,11 @@ def evaluate(model, predictor, cox_head, loader, device,
 
         num_batches += 1
 
-    # Compute averaged losses
+    # ?? FINAL LOSS AVERAGES ?? #
     avg_link = total_link_loss / max(1, num_batches)
-    avg_cox  = total_cox_loss   / max(1, num_batches)
+    avg_cox  = total_cox_loss  / max(1, num_batches)
 
-    # Global AUC / PR?AUC
+    # ?? GLOBAL AUC / PR?AUC ?? #
     if all_link_preds:
         y_true  = torch.cat(all_link_labels).numpy()
         y_score = torch.cat(all_link_preds).numpy()
@@ -524,7 +617,7 @@ def evaluate(model, predictor, cox_head, loader, device,
     else:
         link_auc = pr_auc = None
 
-    # PR?AUC per condition
+    # ?? PER?CONDITION PR?AUC ?? #
     pr_per_cond = [None] * num_conditions
     for ci in range(num_conditions):
         if per_cond_preds[ci]:
@@ -532,25 +625,31 @@ def evaluate(model, predictor, cox_head, loader, device,
             y_s = torch.cat(per_cond_preds [ci]).numpy()
             pr_per_cond[ci] = average_precision_score(y_t, y_s)
 
-    # C?index per condition
+    # ?? PER?CONDITION C?INDEX ?? #
     c_idxs, mean_c = [], None
     if all_risk_scores:
-        R = torch.cat(all_risk_scores).numpy()
-        D = torch.cat(all_durations).numpy()
-        E = torch.cat(all_events   ).numpy()
+        R = torch.cat(all_risk_scores).numpy()  # [total_batches*N_pat, Cdim]
+        D = torch.cat(all_durations).numpy()    # same shape
+        E = torch.cat(all_events).numpy()       # same shape
+
         for ci in range(num_conditions):
             mask = E[:, ci] >= 0
             if mask.sum() > 0:
                 try:
-                    c = concordance_index(D[mask, ci], -R[mask, ci], E[mask, ci])
+                    c = concordance_index(
+                        D[mask, ci],
+                        -R[mask, ci],
+                        E[mask, ci]
+                    )
                 except ZeroDivisionError:
                     c = None
             else:
                 c = None
             c_idxs.append(c)
-        valid = [c for c in c_idxs if c is not None]
-        if valid:
-            mean_c = sum(valid) / len(valid)
+
+        valid_c = [c for c in c_idxs if c is not None]
+        if valid_c:
+            mean_c = sum(valid_c) / len(valid_c)
 
     return avg_link, avg_cox, c_idxs, mean_c, link_auc, pr_auc, pr_per_cond
 
@@ -609,7 +708,7 @@ test_loader = DataLoader(test_graphs, batch_size=1, num_workers = 4)
 EPOCHS = 200
 history = []
 for epoch in range(1, EPOCHS + 1):
-    train_loss = train(model, link_head, cox_head, train_loader, optimizer, device)
+    train_loss = train(model, link_head, cox_head,joint_head,train_loader, optimizer, device)
     with torch.no_grad():
         # a) Build C×C identity (one?hot) for all conditions
         C = in_dims['condition']
