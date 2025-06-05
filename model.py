@@ -3,6 +3,7 @@ from link_prediction_head import LinkMLPPredictor
 from link_prediction_head import CosineLinkPredictor
 from risk_calibration import fit_absolute_risk_calibrator
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 import math
 from torch_geometric.nn import GATConv, HeteroConv, GCNConv
@@ -284,20 +285,6 @@ gender_map = dict(zip(age_gender['RegistrationCode'], age_gender['gender']))
 
 BREAST_IDX = chosen.index("Malignant neoplasms of breast")
 
-all_graphs =  torch.load("glucose_sleep_graphs_3d.pt", weights_only = False)
-
-
-# Load your pre-split graph lists
-train_graphs = torch.load("split/train_graphs_3d.pt", weights_only = False)
-val_graphs = torch.load("split/val_graphs_3d.pt", weights_only = False)
-test_graphs = torch.load("split/test_graphs_3d.pt", weights_only = False)
-
-
-# Load our diagnosis?window mapping
-# Load the full diagnosis?window mapping:
-with open("diagnosis_mapping.json") as f:
-    full_diag_map = json.load(f)
-
 
 def build_diag_by_win(full_map, graphs):
     pts = {p for g in graphs for p in g['patient'].name}
@@ -307,25 +294,9 @@ def build_diag_by_win(full_map, graphs):
             m[d["window"]].append((d["patient"], d["cond"]))
     return m
 
-diag_by_win_train = build_diag_by_win(full_diag_map, train_graphs)
-diag_by_win_val   = build_diag_by_win(full_diag_map, val_graphs)
-diag_by_win_test  = build_diag_by_win(full_diag_map, test_graphs)
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NEGATIVE_MULTIPLIER = 2  # you can adjust this multiplier later
 HORIZON = 10   # how many graphs ahead to predict over
-
-# Count total positive edges in the training split
-total_pos = sum(
-    g[('patient','has','condition')].edge_index.size(1)
-    for g in train_graphs
-    if ('patient','has','condition') in g.edge_types
-)
-# Negatives sampled per batch is NEGATIVE_MULTIPLIER × positives
-total_neg = total_pos * NEGATIVE_MULTIPLIER
-
-global_pos_weight = total_neg / (total_pos + 1e-6)
-global_pos_weight = torch.tensor([global_pos_weight], device=device)
 
 
 
@@ -855,157 +826,148 @@ optimizer = torch.optim.Adam(
 
 #scheduler = StepLR(optimizer, step_size=10, gamma=0.5)
 
-# Option B: reduce on plateau of validation link?loss
-scheduler = ReduceLROnPlateau(
-    optimizer,
-    mode='min',
-    factor=0.5,
-    patience=5,
-    verbose=True
- )
-# Create DataLoaders for each split
-train_loader = DataLoader(train_graphs, batch_size=1, shuffle=True, num_workers = 4)
-val_loader = DataLoader(val_graphs, batch_size=1, num_workers = 4)
-test_loader = DataLoader(test_graphs, batch_size=1, num_workers = 4)
 
-num_conditions = 7
-with torch.no_grad():
-    # 1) Start from one?hot identity for all conditions
-    eye = torch.eye(num_conditions, device=device)  # [C, C]
+def main():
+    mp.set_start_method("spawn", force=True)
 
-    # 2) Input?project into hidden_dim
-    h = model.input_proj['condition'](eye)          # [C, hidden_dim]
-    h = F.relu(h)                                   # first ?fake? conv?fallback
-    h = F.relu(h)                                   # second ?fake? conv?fallback
+    global train_graphs, val_graphs, test_graphs
+    global diag_by_win_train, diag_by_win_val, diag_by_win_test
+    global global_pos_weight, scheduler
 
-    # 3) Shrink from hidden_dim?out_dim (only if still at hidden_dim)
-    #    (Your forward does exactly this before final projection.)
-    h = F.relu(model.shrink['condition'](h))        # [C, out_dim]
+    all_graphs = torch.load("glucose_sleep_graphs_3d.pt", weights_only=False)
 
-    # 4) Final linear projection to produce the embedding that link_head expects
-    cond_embeds = model.linear_proj['condition'](h)  # [C, out_dim]
-    # cond_embeds is now a [C×out_dim] Tensor on `device`
+    train_graphs = torch.load("split/train_graphs_3d.pt", weights_only=False)
+    val_graphs = torch.load("split/val_graphs_3d.pt", weights_only=False)
+    test_graphs = torch.load("split/test_graphs_3d.pt", weights_only=False)
 
-# Choose a confidence threshold eps (e.g. 0.9 or 0.95)
-pseudo_eps = 0.9
+    with open("diagnosis_mapping.json") as f:
+        full_diag_map = json.load(f)
 
-# NOTE: you must have already defined `gender_map` and `BREAST_IDX` somewhere above
-#   `gender_map: { RegistrationCode ? 'male' or 'female' }`
-#   `BREAST_IDX` = index of ?breast cancer? in your condition list (e.g. 6 if it?s the 7th)
+    diag_by_win_train = build_diag_by_win(full_diag_map, train_graphs)
+    diag_by_win_val   = build_diag_by_win(full_diag_map, val_graphs)
+    diag_by_win_test  = build_diag_by_win(full_diag_map, test_graphs)
 
-pseudo_edges_per_graph = generate_pseudo_labels(
-    train_graphs,
-    model=model,
-    link_head=link_head,
-    cond_embeds=cond_embeds,
-    eps=pseudo_eps,
-    device=device,
-    gender_map=gender_map,
-    BREAST_IDX=BREAST_IDX
-)
-# ??? Add pseudo edges into each training graph ???????????????????????????????
-for wi, g in enumerate(train_graphs):
-    pse = pseudo_edges_per_graph[wi]  # list of (i_node, c_node)
+    total_pos = sum(
+        g[('patient','has','condition')].edge_index.size(1)
+        for g in train_graphs
+        if ('patient','has','condition') in g.edge_types
+    )
+    total_neg = total_pos * NEGATIVE_MULTIPLIER
+    global_pos_weight = torch.tensor([total_neg / (total_pos + 1e-6)], device=device)
 
-    if not pse:
-        continue
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=5,
+        verbose=True
+    )
 
-    # Extract existing real edges (if any):
-    if ('patient','has','condition') in g.edge_types:
-        old_ei = g['patient','has','condition'].edge_index  # [2, E_real]
-    else:
-        old_ei = torch.empty((2, 0), dtype=torch.long)
+    train_loader = DataLoader(train_graphs, batch_size=1, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_graphs, batch_size=1, num_workers=4)
+    test_loader = DataLoader(test_graphs, batch_size=1, num_workers=4)
 
-    # Build a tensor of new pseudo?edges
-    src = torch.tensor([i for (i,c) in pse], dtype=torch.long, device=device)
-    dst = torch.tensor([c for (i,c) in pse], dtype=torch.long, device=device)
-    new_ei = torch.stack([src, dst], dim=0)  # [2, E_pseudo]
-
-    # Concatenate real + pseudo
-    merged_ei = torch.cat([old_ei.to(device), new_ei], dim=1)  # [2, E_real + E_pseudo]
-    g['patient','has','condition'].edge_index = merged_ei
-
-    # Also add the reverse edges in ('condition','has_rev','patient'):
-    merged_rev = merged_ei.flip(0)  # flip rows?[condition, patient]
-    g['condition','has_rev','patient'].edge_index = merged_rev
-
-pseudo_label_by_window = {}  # will map window w ? { patient_idx: cond_idx }
-
-for w, edge_list in enumerate(pseudo_edges_per_graph):
-    # edge_list is a list like [(i?, c?), (i?, c?), ?], already sorted by confidence descending.
-    seen = set()
-    label_map = {}
-    for (p_idx, c_idx) in edge_list:
-        if p_idx not in seen:
-            label_map[p_idx] = c_idx
-            seen.add(p_idx)
-    pseudo_label_by_window[w] = label_map
-EPOCHS = 200
-history = []
-for epoch in range(1, EPOCHS + 1):
-    train_loss = train(model, link_head, cox_head, patient_classifier, train_loader, optimizer, device)
+    num_conditions = 7
     with torch.no_grad():
-        # a) Build C×C identity (one?hot) for all conditions
-        C = in_dims['condition']
-        eye = torch.eye(C, device=device)  # [C, C]
-
-        # 2) Input proj
-        h = model.input_proj['condition'](eye)  # [C, hidden_dim]
-
-        # 3) Three ?conv?fallback? steps (just ReLU)
+        eye = torch.eye(num_conditions, device=device)
+        h = model.input_proj['condition'](eye)
         h = F.relu(h)
         h = F.relu(h)
+        h = F.relu(model.shrink['condition'](h))
+        cond_embeds = model.linear_proj['condition'](h)
 
-        # **now** shrink to 128
-        h = F.relu(model.shrink['condition'](h))  #  [7×128]
-
-        # final projection (now matches 128?128)
-        train_cond_embeds = model.linear_proj['condition'](h)
-        # Now pass train_cond_embeds to evaluation
-    val_avg_link, avg_cox, avg_node_ce, node_acc, cidx_list, mean_cidx, link_auc, pr_auc, pr_auc_per_cond = evaluate(
-        model, link_head, cox_head, patient_classifier, val_loader, device,
-        NEGATIVE_MULTIPLIER, diag_by_win_val, train_cond_embeds
+    pseudo_eps = 0.9
+    pseudo_edges_per_graph = generate_pseudo_labels(
+        train_graphs,
+        model=model,
+        link_head=link_head,
+        cond_embeds=cond_embeds,
+        eps=pseudo_eps,
+        device=device,
+        gender_map=gender_map,
+        BREAST_IDX=BREAST_IDX
     )
-    # After training finished
-    results = {
-        "final_train_loss": train_loss,
-        "final_val_link_loss": val_avg_link,
-        "final_val_link_auc": link_auc,
-        "final_val_pr_auc": pr_auc,
-        "final_val_cox_loss": avg_cox,
-        "final_val_node_ce": avg_node_ce,
-        "final_val_node_acc": node_acc,
-        "c_indices_per_condition": cidx_list,
-        "pr_auc_per_condition": pr_auc_per_cond,
-        "mean_c_index": mean_cidx,
-        "epoch": epoch,
-        "NEGATIVE_MULTIPLIER": NEGATIVE_MULTIPLIER,
-        "timestamp": datetime.datetime.now().isoformat()
-    }
-    history.append(results)
-    # ? for StepLR:
-    # scheduler.step()
 
-    # ? if using ReduceLROnPlateau, comment out the above line and instead do:
-    scheduler.step(val_avg_link)
-    node_ce_str = f"{avg_node_ce:.4f}" if avg_node_ce is not None else "nan"
-    node_acc_str = f"{node_acc:.4f}" if node_acc is not None else "nan"
-    print(
-        f"[Epoch {epoch}] Train Loss: {train_loss:.4f} | "
-        f"Val Link Loss: {val_avg_link:.4f} | "
-        f"Val Cox Loss: {avg_cox:.4f} | "
-        f"Val Node CE: {node_ce_str} | "
-        f"Node Acc: {node_acc_str} | "
-        f"Val C-Index: {cidx_list}"
-    )
-# Create results directory if it doesn't exist
-os.makedirs("results", exist_ok=True)
+    for wi, g in enumerate(train_graphs):
+        pse = pseudo_edges_per_graph[wi]
+        if not pse:
+            continue
+        if ('patient','has','condition') in g.edge_types:
+            old_ei = g['patient','has','condition'].edge_index
+        else:
+            old_ei = torch.empty((2, 0), dtype=torch.long)
+        src = torch.tensor([i for (i, c) in pse], dtype=torch.long, device=device)
+        dst = torch.tensor([c for (i, c) in pse], dtype=torch.long, device=device)
+        new_ei = torch.stack([src, dst], dim=0)
+        merged_ei = torch.cat([old_ei.to(device), new_ei], dim=1)
+        g['patient','has','condition'].edge_index = merged_ei
+        merged_rev = merged_ei.flip(0)
+        g['condition','has_rev','patient'].edge_index = merged_rev
 
-# Save with timestamp
-timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-filename = f"results/results_{timestamp}.json"
+    pseudo_label_by_window = {}
+    for w, edge_list in enumerate(pseudo_edges_per_graph):
+        seen = set()
+        label_map = {}
+        for (p_idx, c_idx) in edge_list:
+            if p_idx not in seen:
+                label_map[p_idx] = c_idx
+                seen.add(p_idx)
+        pseudo_label_by_window[w] = label_map
 
-with open(filename, 'w') as f:
-    json.dump(history, f, indent=2)
+    EPOCHS = 200
+    history = []
+    for epoch in range(1, EPOCHS + 1):
+        train_loss = train(model, link_head, cox_head, patient_classifier, train_loader, optimizer, device)
+        with torch.no_grad():
+            C = in_dims['condition']
+            eye = torch.eye(C, device=device)
+            h = model.input_proj['condition'](eye)
+            h = F.relu(h)
+            h = F.relu(h)
+            h = F.relu(model.shrink['condition'](h))
+            train_cond_embeds = model.linear_proj['condition'](h)
 
-print(f"Saved training results to {filename}")
+        val_avg_link, avg_cox, avg_node_ce, node_acc, cidx_list, mean_cidx, link_auc, pr_auc, pr_auc_per_cond = evaluate(
+            model, link_head, cox_head, patient_classifier, val_loader, device,
+            NEGATIVE_MULTIPLIER, diag_by_win_val, train_cond_embeds
+        )
+        results = {
+            "final_train_loss": train_loss,
+            "final_val_link_loss": val_avg_link,
+            "final_val_link_auc": link_auc,
+            "final_val_pr_auc": pr_auc,
+            "final_val_cox_loss": avg_cox,
+            "final_val_node_ce": avg_node_ce,
+            "final_val_node_acc": node_acc,
+            "c_indices_per_condition": cidx_list,
+            "pr_auc_per_condition": pr_auc_per_cond,
+            "mean_c_index": mean_cidx,
+            "epoch": epoch,
+            "NEGATIVE_MULTIPLIER": NEGATIVE_MULTIPLIER,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        history.append(results)
+
+        scheduler.step(val_avg_link)
+        node_ce_str = f"{avg_node_ce:.4f}" if avg_node_ce is not None else "nan"
+        node_acc_str = f"{node_acc:.4f}" if node_acc is not None else "nan"
+        print(
+            f"[Epoch {epoch}] Train Loss: {train_loss:.4f} | "
+            f"Val Link Loss: {val_avg_link:.4f} | "
+            f"Val Cox Loss: {avg_cox:.4f} | "
+            f"Val Node CE: {node_ce_str} | "
+            f"Node Acc: {node_acc_str} | "
+            f"Val C-Index: {cidx_list}"
+        )
+
+    os.makedirs("results", exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"results/results_{timestamp}.json"
+    with open(filename, 'w') as f:
+        json.dump(history, f, indent=2)
+    print(f"Saved training results to {filename}")
+
+
+if __name__ == "__main__":
+    mp.freeze_support()
+    main()
