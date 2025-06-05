@@ -506,7 +506,7 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
             )  # shape [N_pseudo]
 
             pseudo_labels = torch.tensor(
-                [label_map[i.item()] for i in node_indices.cpu().tolist()],
+                [label_map[i] for i in node_indices.cpu().tolist()],
                 device=device, dtype=torch.long
             )  # shape [N_pseudo], each in [0..C-1]
 
@@ -733,7 +733,7 @@ def evaluate(model, link_head, cox_head, patient_classifier,loader,device,NEGATI
             )  # e.g. [i1, i2, i5, ?]
 
             pseudo_labels = torch.tensor(
-                [label_map[i.item()] for i in node_indices.cpu().tolist()],
+                [label_map[i] for i in node_indices.cpu().tolist()],
                 device=device, dtype=torch.long
             )  # shape [#unique_patients]
 
