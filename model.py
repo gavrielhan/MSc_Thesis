@@ -943,7 +943,7 @@ for w, edge_list in enumerate(pseudo_edges_per_graph):
 EPOCHS = 200
 history = []
 for epoch in range(1, EPOCHS + 1):
-    train_loss = train(model, link_head, cox_head,joint_head,train_loader, optimizer, device)
+    train_loss = train(model, link_head, cox_head, patient_classifier, train_loader, optimizer, device)
     with torch.no_grad():
         # a) Build C×C identity (one?hot) for all conditions
         C = in_dims['condition']
@@ -962,9 +962,9 @@ for epoch in range(1, EPOCHS + 1):
         # final projection (now matches 128?128)
         train_cond_embeds = model.linear_proj['condition'](h)
         # Now pass train_cond_embeds to evaluation
-    val_avg_link, avg_cox, cidx_list, mean_cidx, link_auc, pr_auc, pr_auc_per_cond = evaluate(
-        model, link_head, cox_head, val_loader, device,
-        NEGATIVE_MULTIPLIER, diag_by_win_val, train_cond_embeds, patient_classifier=patient_classifier
+    val_avg_link, avg_cox, avg_node_ce, node_acc, cidx_list, mean_cidx, link_auc, pr_auc, pr_auc_per_cond = evaluate(
+        model, link_head, cox_head, patient_classifier, val_loader, device,
+        NEGATIVE_MULTIPLIER, diag_by_win_val, train_cond_embeds
     )
     # After training finished
     results = {
@@ -973,6 +973,8 @@ for epoch in range(1, EPOCHS + 1):
         "final_val_link_auc": link_auc,
         "final_val_pr_auc": pr_auc,
         "final_val_cox_loss": avg_cox,
+        "final_val_node_ce": avg_node_ce,
+        "final_val_node_acc": node_acc,
         "c_indices_per_condition": cidx_list,
         "pr_auc_per_condition": pr_auc_per_cond,
         "mean_c_index": mean_cidx,
@@ -982,15 +984,20 @@ for epoch in range(1, EPOCHS + 1):
     }
     history.append(results)
     # ? for StepLR:
-    #scheduler.step()
+    # scheduler.step()
 
     # ? if using ReduceLROnPlateau, comment out the above line and instead do:
     scheduler.step(val_avg_link)
-
-    print(f"[Epoch {epoch}] Train Loss: {train_loss:.4f} | "
-          f"Val Link Loss: {val_avg_link:.4f} |"
-          f"Val Cox Loss: {avg_cox:.4f} | Val C-Index: {cidx_list}")
-
+    node_ce_str = f"{avg_node_ce:.4f}" if avg_node_ce is not None else "nan"
+    node_acc_str = f"{node_acc:.4f}" if node_acc is not None else "nan"
+    print(
+        f"[Epoch {epoch}] Train Loss: {train_loss:.4f} | "
+        f"Val Link Loss: {val_avg_link:.4f} | "
+        f"Val Cox Loss: {avg_cox:.4f} | "
+        f"Val Node CE: {node_ce_str} | "
+        f"Node Acc: {node_acc_str} | "
+        f"Val C-Index: {cidx_list}"
+    )
 # Create results directory if it doesn't exist
 os.makedirs("results", exist_ok=True)
 
