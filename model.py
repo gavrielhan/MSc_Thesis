@@ -306,7 +306,7 @@ EPS_PSEUDO    = 0.90   # ?: confidence threshold (choose between 0.8?0.95 in pra
 LAMBDA_PSEUDO = 0.50   # ?: weight on the pseudo?label loss
 # ----------------------------------------------------------------------------------
 
-def train(model, link_head, cox_head, patient_classifier, loader, optimizer, device):
+def train(model, link_head, cox_head, patient_classifier, loader, optimizer, device, pseudo_label_by_window):
     model.train()
     link_head.train()
     cox_head.train()
@@ -917,7 +917,16 @@ def main():
     EPOCHS = 200
     history = []
     for epoch in range(1, EPOCHS + 1):
-        train_loss = train(model, link_head, cox_head, patient_classifier, train_loader, optimizer, device)
+        train_loss = train(
+            model,
+            link_head,
+            cox_head,
+            patient_classifier,
+            train_loader,
+            optimizer,
+            device,
+            pseudo_label_by_window,
+        )
         with torch.no_grad():
             C = in_dims['condition']
             eye = torch.eye(C, device=device)
