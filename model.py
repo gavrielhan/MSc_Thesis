@@ -279,7 +279,13 @@ age_gender = age_gender[~age_gender['age'].isna()]
 
 gender_dictionary = {1:'male', 0:'female'}
 
-age_gender.loc[:,'gender'] = age_gender['gender'].fillna(0).map(gender_dictionary)
+age_gender['gender'] = (
+    age_gender['gender']
+    .fillna(0)
+    .astype(int)
+    .map(gender_dictionary)
+    .astype('category')
+)
 # gender_df has columns ['RegistrationCode','gender'], where gender is 'male' or 'female'
 gender_map = dict(zip(age_gender['RegistrationCode'], age_gender['gender']))
 
@@ -829,7 +835,7 @@ optimizer = torch.optim.Adam(
 
 def main():
     mp.set_start_method("spawn", force=True)
-
+    torch.multiprocessing.set_sharing_strategy("file_system")
     global train_graphs, val_graphs, test_graphs
     global diag_by_win_train, diag_by_win_val, diag_by_win_test
     global global_pos_weight, scheduler
