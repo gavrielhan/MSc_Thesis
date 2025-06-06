@@ -866,7 +866,6 @@ def main():
         mode='min',
         factor=0.5,
         patience=5,
-        verbose=True
     )
 
     train_loader = DataLoader(train_graphs, batch_size=1, shuffle=True, num_workers=4)
