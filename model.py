@@ -2,6 +2,8 @@ from link_prediction_head import CoxHead
 from link_prediction_head import LinkMLPPredictor
 from link_prediction_head import CosineLinkPredictor
 from risk_calibration import fit_absolute_risk_calibrator
+import pandas as pd
+import seaborn as sns
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
@@ -22,6 +24,8 @@ from sklearn.metrics import average_precision_score
 from collections import defaultdict
 from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 from LabData.DataLoaders.BodyMeasuresLoader import BodyMeasuresLoader
+import numpy as np
+import matplotlib.pyplot as plt
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE_DIR)
@@ -274,6 +278,58 @@ def generate_pseudo_labels(
 
     return pseudo_edges_per_graph
 
+def plot_link_prediction_curves(
+    link_scores: np.ndarray,
+    diag_windows: np.ndarray,
+    disease_name: str,
+    save_path: str
+):
+    """
+    link_scores: array of shape (n_patients, n_windows)
+                 link_scores[i, t] = model?s predicted score
+                                  for patient i at window t
+    diag_windows: array of shape (n_patients,)
+                  diag_windows[i] = true diagnosis window for patient i
+    disease_name: string for title/legend
+    save_path:    filepath to save the PNG
+    """
+    n_patients, n_windows = link_scores.shape
+    windows = np.arange(n_windows)
+
+    # Melt into long form for seaborn
+    df = pd.DataFrame(link_scores, columns=windows)
+    df_long = df.melt(var_name="window", value_name="score")
+
+    sns.set(style="whitegrid", context="notebook", palette="tab10")
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Mean curve ± 1 stddev
+    sns.lineplot(
+        data=df_long,
+        x="window", y="score",
+        estimator="mean", ci="sd",
+        lw=2, ax=ax
+    )
+
+    # Decorations
+    ax.set_title(f"Link?Prediction Scores for ?{disease_name}?", fontsize=16, pad=12)
+    ax.set_xlabel("Window Index", fontsize=14)
+    ax.set_ylabel("Predicted Score", fontsize=14)
+    ax.set_xlim(0, n_windows - 1)
+    ax.set_ylim(0.0, 1.02)
+
+    # Diagnosis distribution ? median + IQR band
+    median = np.median(diag_windows)
+    p25, p75 = np.percentile(diag_windows, [25, 75])
+    ax.axvline(median, color="black", linestyle="--", label="Median Diagnosis Window")
+    ax.axvspan(p25, p75, color="gray", alpha=0.2, label="25?75% Diagnosis Window")
+
+    ax.legend(loc="upper right", fontsize=12)
+    plt.tight_layout()
+
+    # Save to disk
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 # get gender informaition per patients
 study_ids = [10, 1001, 1002]
@@ -997,6 +1053,36 @@ def main():
         json.dump(history, f, indent=2)
     print(f"Saved training results to {filename}")
 
+    # 1) First compute frozen cond embeddings once:
+    with torch.no_grad():
+        eye = torch.eye(in_dims['condition'], device=device)
+        h = model.input_proj['condition'](eye)
+        h = F.relu(h)
+        h = F.relu(h)
+        h = F.relu(model.shrink['condition'](h))
+        cond_embeds = model.linear_proj['condition'](h)  # [C, D]
+
+    # 2) Then call for whichever disease index you like, e.g. idx=6 for breast:
+    plot_link_prediction_curves(
+        link_scores=test_scores[:, 3],
+        diag_windows=true_windows,
+        disease_name="Diabetes Mellitus, Type Unspecified",
+        save_path="outputs/diabetes_curves.png"
+    )
+
+
+    os.makedirs("models", exist_ok=True)
+    torch.save({
+    'epoch': EPOCHS,
+    'model_state': model.state_dict(),
+    'link_head_state': link_head.state_dict(),
+    'cox_head_state': cox_head.state_dict(),
+    'patient_classifier_state': patient_classifier.state_dict(),
+    'joint_head_state': joint_head.state_dict(),
+    'optimizer_state': optimizer.state_dict(),
+    'scheduler_state': scheduler.state_dict() if hasattr(scheduler, 'state_dict') else None,
+}, f"models/checkpoint_epoch{EPOCHS}.pth")
+    print(f"Saved model checkpoint to models/checkpoint_epoch{EPOCHS}.pth")
 
 if __name__ == "__main__":
     mp.freeze_support()
