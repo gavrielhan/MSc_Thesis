@@ -140,14 +140,21 @@ class HeteroGAT(nn.Module):
         return {n: self.linear_proj[n](h) for n, h in x3.items()}
 
 class JointHead(nn.Module):
-    def __init__(self, link_weight: float = 1.0, cox_weight: float = 0.2):
+    def __init__(self):
         super().__init__()
-        # store as simple floats (or as buffers if you like)
-        self.link_weight = link_weight
-        self.cox_weight  = cox_weight
+        # initialize raw (unbounded) parameters at 0.0
+        self.s_link = nn.Parameter(torch.zeros(1))
+        self.s_cox = nn.Parameter(torch.zeros(1))
 
     def forward(self, link_loss: torch.Tensor, cox_loss: torch.Tensor) -> torch.Tensor:
-        return self.link_weight * link_loss + self.cox_weight * cox_loss
+        # compute positive log-variances via softplus
+        log_var_link = F.softplus(self.s_link)
+        log_var_cox = F.softplus(self.s_cox)
+
+        term_link = 0.5 * link_loss * torch.exp(-log_var_link) + 0.5 * log_var_link
+        term_cox = 0.5 * cox_loss * torch.exp(-log_var_cox) + 0.5 * log_var_cox
+
+        return term_link + term_cox
 
 def generate_pseudo_labels(
     train_graphs: list,
@@ -301,15 +308,15 @@ def build_diag_by_win(full_map, graphs):
     return m
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 2  # you can adjust this multiplier later
-HORIZON = 10   # how many graphs ahead to predict over
+NEGATIVE_MULTIPLIER = 1  # you can adjust this multiplier later
+HORIZON = 5   # how many graphs ahead to predict over
 
 
 
 #  HYPERPARAMETERS FOR PSEUDO-LABELING
 # ----------------------------------------------------------------------------------
 EPS_PSEUDO    = 0.90   # ?: confidence threshold (choose between 0.8?0.95 in practice)
-LAMBDA_PSEUDO = 0.50   # ?: weight on the pseudo?label loss
+LAMBDA_PSEUDO = 0.40   # ?: weight on the pseudo?label loss
 # ----------------------------------------------------------------------------------
 
 def train(model, link_head, cox_head, patient_classifier, loader, optimizer, device, pseudo_label_by_window):
@@ -416,8 +423,15 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
             pos_labels = torch.ones_like(pos_preds)
 
             num_neg = pos_preds.size(0) * NEGATIVE_MULTIPLIER
-            neg_src = torch.randint(0, patient_embeds.size(0), (num_neg,), device=device)
-            neg_dst = torch.randint(0, condition_embeds.size(0), (num_neg,), device=device)
+            neg_src = torch.randint(low = 0,
+                                    high = patient_embeds.size(0),
+                                    size = (num_neg,),
+                                    dtype = torch.long,
+                                    device=device)
+            neg_dst = torch.randint(low = 0, high = condition_embeds.size(0),
+                                    size = (num_neg,),
+                                    dtype = torch.long,
+                                    device=device)
 
             # enforce female?only for breast negatives:
             mask_b = (neg_dst == BREAST_IDX)
@@ -814,7 +828,7 @@ model = HeteroGAT(
 link_head = CosineLinkPredictor(input_dim=128, init_scale=1.0, use_bias=True).to(device)
 cox_head = CoxHead(input_dim=128, num_conditions=7).to(device)
 
-joint_head = JointHead(link_weight=1.0, cox_weight=1.5).to(device)
+joint_head = JointHead().to(device)
 patient_classifier = nn.Linear(
     128,               # same as your final patient embedding dim (e.g. 128)
     7         # output one score per condition
@@ -881,47 +895,48 @@ def main():
         h = F.relu(model.shrink['condition'](h))
         cond_embeds = model.linear_proj['condition'](h)
 
-    pseudo_eps = 0.9
-    pseudo_edges_per_graph = generate_pseudo_labels(
-        train_graphs,
-        model=model,
-        link_head=link_head,
-        cond_embeds=cond_embeds,
-        eps=pseudo_eps,
-        device=device,
-        gender_map=gender_map,
-        BREAST_IDX=BREAST_IDX
-    )
-
-    for wi, g in enumerate(train_graphs):
-        pse = pseudo_edges_per_graph[wi]
-        if not pse:
-            continue
-        if ('patient','has','condition') in g.edge_types:
-            old_ei = g['patient','has','condition'].edge_index
-        else:
-            old_ei = torch.empty((2, 0), dtype=torch.long)
-        src = torch.tensor([i for (i, c) in pse], dtype=torch.long, device=device)
-        dst = torch.tensor([c for (i, c) in pse], dtype=torch.long, device=device)
-        new_ei = torch.stack([src, dst], dim=0)
-        merged_ei = torch.cat([old_ei.to(device), new_ei], dim=1)
-        g['patient','has','condition'].edge_index = merged_ei
-        merged_rev = merged_ei.flip(0)
-        g['condition','has_rev','patient'].edge_index = merged_rev
-
-    pseudo_label_by_window = {}
-    for w, edge_list in enumerate(pseudo_edges_per_graph):
-        seen = set()
-        label_map = {}
-        for (p_idx, c_idx) in edge_list:
-            if p_idx not in seen:
-                label_map[p_idx] = c_idx
-                seen.add(p_idx)
-        pseudo_label_by_window[w] = label_map
-
+    pseudo_eps = 0.4
     EPOCHS = 200
     history = []
     for epoch in range(1, EPOCHS + 1):
+        if (epoch - 1)%5==0:
+            pseudo_edges_per_graph = generate_pseudo_labels(
+                train_graphs,
+                model=model,
+                link_head=link_head,
+                cond_embeds=cond_embeds,
+                eps=pseudo_eps,
+                device=device,
+                gender_map=gender_map,
+                BREAST_IDX=BREAST_IDX
+            )
+
+            for wi, g in enumerate(train_graphs):
+                pse = pseudo_edges_per_graph[wi]
+                if not pse:
+                    continue
+                if ('patient', 'has', 'condition') in g.edge_types:
+                    old_ei = g['patient', 'has', 'condition'].edge_index
+                else:
+                    old_ei = torch.empty((2, 0), dtype=torch.long)
+                src = torch.tensor([i for (i, c) in pse], dtype=torch.long, device=device)
+                dst = torch.tensor([c for (i, c) in pse], dtype=torch.long, device=device)
+                new_ei = torch.stack([src, dst], dim=0)
+                merged_ei = torch.cat([old_ei.to(device), new_ei], dim=1)
+                g['patient', 'has', 'condition'].edge_index = merged_ei
+                merged_rev = merged_ei.flip(0)
+                g['condition', 'has_rev', 'patient'].edge_index = merged_rev
+
+            pseudo_label_by_window = {}
+            for w, edge_list in enumerate(pseudo_edges_per_graph):
+                seen = set()
+                label_map = {}
+                for (p_idx, c_idx) in edge_list:
+                    if p_idx not in seen:
+                        label_map[p_idx] = c_idx
+                        seen.add(p_idx)
+                pseudo_label_by_window[w] = label_map
+
         train_loss = train(
             model,
             link_head,
@@ -971,7 +986,8 @@ def main():
             f"Val Cox Loss: {avg_cox:.4f} | "
             f"Val Node CE: {node_ce_str} | "
             f"Node Acc: {node_acc_str} | "
-            f"Val C-Index: {cidx_list}"
+            f"Val C-Index: {cidx_list} | "
+            f"PR AUC per condition: {pr_auc_per_cond}"
         )
 
     os.makedirs("results", exist_ok=True)
