@@ -920,169 +920,181 @@ def main():
         full_diag_map = json.load(f)
 
     diag_by_win_train = build_diag_by_win(full_diag_map, train_graphs)
-    diag_by_win_val   = build_diag_by_win(full_diag_map, val_graphs)
-    diag_by_win_test  = build_diag_by_win(full_diag_map, test_graphs)
+    diag_by_win_val = build_diag_by_win(full_diag_map, val_graphs)
+    diag_by_win_test = build_diag_by_win(full_diag_map, test_graphs)
 
+    # 2) Compute global pos weight
     total_pos = sum(
-        g[('patient','has','condition')].edge_index.size(1)
+        g[('patient', 'has', 'condition')].edge_index.size(1)
         for g in train_graphs
-        if ('patient','has','condition') in g.edge_types
+        if ('patient', 'has', 'condition') in g.edge_types
     )
     total_neg = total_pos * NEGATIVE_MULTIPLIER
+    global global_pos_weight
     global_pos_weight = torch.tensor([total_neg / (total_pos + 1e-6)], device=device)
 
-    scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,
-        patience=5,
-    )
+    # 3) Scheduler
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
+    # 4) DataLoaders
     train_loader = DataLoader(train_graphs, batch_size=1, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_graphs, batch_size=1, num_workers=4)
     test_loader = DataLoader(test_graphs, batch_size=1, num_workers=4)
 
-    num_conditions = 7
-    with torch.no_grad():
-        eye = torch.eye(num_conditions, device=device)
-        h = model.input_proj['condition'](eye)
-        h = F.relu(h)
-        h = F.relu(h)
-        h = F.relu(model.shrink['condition'](h))
-        cond_embeds = model.linear_proj['condition'](h)
+    # 5) Prepare a placeholder for pseudo?labels
+    pseudo_label_by_window = {wi: {} for wi in range(len(train_graphs))}
 
-    pseudo_eps = 0.4
-    EPOCHS = 200
+    # 6) Training loop
     history = []
+    EPOCHS =200
+    pseudo_eps = 0.85
     for epoch in range(1, EPOCHS + 1):
-        if (epoch - 1)%5==0:
-            pseudo_edges_per_graph = generate_pseudo_labels(
-                train_graphs,
-                model=model,
-                link_head=link_head,
-                cond_embeds=cond_embeds,
-                eps=pseudo_eps,
-                device=device,
-                gender_map=gender_map,
-                BREAST_IDX=BREAST_IDX
+        # every 5 epochs, regenerate pseudo?labels
+        if (epoch - 1) % 5 == 0:
+            # a) recompute frozen condition embeddings
+            with torch.no_grad():
+                C = in_dims['condition']
+                eye = torch.eye(C, device=device)
+                h = model.input_proj['condition'](eye)
+                h = F.relu(h);
+                h = F.relu(h)
+                h = F.relu(model.shrink['condition'](h))
+                cond_embeds = model.linear_proj['condition'](h)
+
+            # b) generate and inject pseudo?edges
+            pse = generate_pseudo_labels(
+                train_graphs, model, link_head, cond_embeds,
+                eps=pseudo_eps, device=device,
+                gender_map=gender_map, BREAST_IDX=BREAST_IDX
             )
-
             for wi, g in enumerate(train_graphs):
-                pse = pseudo_edges_per_graph[wi]
-                if not pse:
+                new_edges = pse[wi]
+                if not new_edges:
                     continue
-                if ('patient', 'has', 'condition') in g.edge_types:
-                    old_ei = g['patient', 'has', 'condition'].edge_index
-                else:
-                    old_ei = torch.empty((2, 0), dtype=torch.long)
-                src = torch.tensor([i for (i, c) in pse], dtype=torch.long, device=device)
-                dst = torch.tensor([c for (i, c) in pse], dtype=torch.long, device=device)
-                new_ei = torch.stack([src, dst], dim=0)
-                merged_ei = torch.cat([old_ei.to(device), new_ei], dim=1)
-                g['patient', 'has', 'condition'].edge_index = merged_ei
-                merged_rev = merged_ei.flip(0)
-                g['condition', 'has_rev', 'patient'].edge_index = merged_rev
+                old_ei = g.get(('patient', 'has', 'condition'), torch.empty((2, 0), dtype=torch.long))
+                src = torch.tensor([i for i, c in new_edges], dtype=torch.long, device=device)
+                dst = torch.tensor([c for i, c in new_edges], dtype=torch.long, device=device)
+                merged = torch.cat([old_ei.to(device), torch.stack([src, dst], dim=0)], dim=1)
+                g[('patient', 'has', 'condition')].edge_index = merged
+                g[('condition', 'has_rev', 'patient')].edge_index = merged.flip(0)
 
-            pseudo_label_by_window = {}
-            for w, edge_list in enumerate(pseudo_edges_per_graph):
-                seen = set()
-                label_map = {}
-                for (p_idx, c_idx) in edge_list:
-                    if p_idx not in seen:
-                        label_map[p_idx] = c_idx
-                        seen.add(p_idx)
-                pseudo_label_by_window[w] = label_map
+            # c) build the per?window label map
+            pseudo_label_by_window.clear()
+            for wi, edges in enumerate(pse):
+                m = {}
+                for i, c in edges:
+                    if i not in m:
+                        m[i] = c
+                pseudo_label_by_window[wi] = m
 
+        # d) one epoch of train()
         train_loss = train(
-            model,
-            link_head,
-            cox_head,
-            patient_classifier,
-            train_loader,
-            optimizer,
-            device,
-            pseudo_label_by_window,
+            model, link_head, cox_head, patient_classifier,
+            train_loader, optimizer, device,
+            pseudo_label_by_window
         )
+
+        # e) recompute condition embeds for eval
         with torch.no_grad():
             C = in_dims['condition']
             eye = torch.eye(C, device=device)
             h = model.input_proj['condition'](eye)
-            h = F.relu(h)
+            h = F.relu(h);
             h = F.relu(h)
             h = F.relu(model.shrink['condition'](h))
             train_cond_embeds = model.linear_proj['condition'](h)
 
-        val_avg_link, avg_cox, avg_node_ce, node_acc, cidx_list, mean_cidx, link_auc, pr_auc, pr_auc_per_cond = evaluate(
-            model, link_head, cox_head, patient_classifier, val_loader, device,
-            NEGATIVE_MULTIPLIER, diag_by_win_val, train_cond_embeds
+        # f) validation
+        val_metrics = evaluate(
+            model, link_head, cox_head, patient_classifier,
+            val_loader, device,
+            NEGATIVE_MULTIPLIER, diag_by_win_val,
+            train_cond_embeds
         )
-        results = {
-            "final_train_loss": train_loss,
-            "final_val_link_loss": val_avg_link,
-            "final_val_link_auc": link_auc,
-            "final_val_pr_auc": pr_auc,
-            "final_val_cox_loss": avg_cox,
-            "final_val_node_ce": avg_node_ce,
-            "final_val_node_acc": node_acc,
-            "c_indices_per_condition": cidx_list,
-            "pr_auc_per_condition": pr_auc_per_cond,
-            "mean_c_index": mean_cidx,
+        avg_link, avg_cox, avg_node_ce, node_acc, cidx_list, mean_cidx, link_auc, pr_auc, pr_per_cond = val_metrics
+
+        scheduler.step(avg_link)
+
+        history.append({
             "epoch": epoch,
-            "NEGATIVE_MULTIPLIER": NEGATIVE_MULTIPLIER,
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        history.append(results)
-
-        scheduler.step(val_avg_link)
-        node_ce_str = f"{avg_node_ce:.4f}" if avg_node_ce is not None else "nan"
-        node_acc_str = f"{node_acc:.4f}" if node_acc is not None else "nan"
+            "train_loss": train_loss,
+            "val_link_loss": avg_link,
+            "val_cox_loss": avg_cox,
+            "val_node_ce": avg_node_ce,
+            "val_node_acc": node_acc,
+            "val_c_indices": cidx_list,
+            "val_mean_c": mean_cidx,
+            "val_link_auc": link_auc,
+            "val_pr_auc": pr_auc,
+            "val_pr_per_cond": pr_per_cond,
+            "timestamp": datetime.datetime.now().isoformat(),
+        })
         print(
-            f"[Epoch {epoch}] Train Loss: {train_loss:.4f} | "
-            f"Val Link Loss: {val_avg_link:.4f} | "
-            f"Val Cox Loss: {avg_cox:.4f} | "
-            f"Val Node CE: {node_ce_str} | "
-            f"Node Acc: {node_acc_str} | "
-            f"Val C-Index: {cidx_list} | "
-            f"PR AUC per condition: {pr_auc_per_cond}"
-        )
+            f"[Epoch {epoch}] Train {train_loss:.4f} | ValLink {avg_link:.4f} | Cox {avg_cox:.4f} | NodeCE {avg_node_ce:.4f}")
 
+    # 7) Save history
     os.makedirs("results", exist_ok=True)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"results/results_{timestamp}.json"
-    with open(filename, 'w') as f:
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    with open(f"results/history_{ts}.json", "w") as f:
         json.dump(history, f, indent=2)
-    print(f"Saved training results to {filename}")
 
-    # 1) First compute frozen cond embeddings once:
+    # 8) Final test?time inference for plotting
+    test_scores = []
+    true_windows = []
+    model.eval();
+    link_head.eval()
     with torch.no_grad():
+        # recompute final condition embeds
         eye = torch.eye(in_dims['condition'], device=device)
         h = model.input_proj['condition'](eye)
-        h = F.relu(h)
+        h = F.relu(h);
         h = F.relu(h)
         h = F.relu(model.shrink['condition'](h))
-        cond_embeds = model.linear_proj['condition'](h)  # [C, D]
+        cond_embeds = model.linear_proj['condition'](h)
 
-    # 2) Then call for whichever disease index you like, e.g. idx=6 for breast:
+        for wi, batch in enumerate(DataLoader(test_graphs, batch_size=1)):
+            batch = batch.to(device)
+            out = model(batch.x_dict,
+                        {et: batch[et].edge_index for et in batch.edge_types if et != ('patient', 'has', 'condition')},
+                        {})
+            P = out['patient']
+            if P.size(0) == 0:
+                test_scores.append(torch.zeros(0, dtype=torch.float, device=device))
+                true_windows.append([])
+                continue
+            # score every patient ? disease 3
+            idx = 3
+            ei = torch.stack([torch.arange(P.size(0), device=device), torch.full((P.size(0),), idx, device=device)],
+                             dim=0)
+            scores = torch.sigmoid(link_head(P, cond_embeds, ei))  # [N_pat]
+            test_scores.append(scores.cpu().numpy())
+            # record true diag-window(s) for disease 3 from your mapping
+            tw = [w for (p, c) in diag_by_win_test.get(wi, []) if c == idx]
+            true_windows.append(tw)
+
+    # 9) Plot & save
+    os.makedirs("outputs", exist_ok=True)
     plot_link_prediction_curves(
-        link_scores=test_scores[:, 3],
+        link_scores=test_scores,
         diag_windows=true_windows,
-        disease_name="Diabetes Mellitus, Type Unspecified",
+        disease_name=chosen[3],
         save_path="outputs/diabetes_curves.png"
     )
 
-
+    # 10) Save model checkpoint
     os.makedirs("models", exist_ok=True)
-    torch.save({
-    'epoch': EPOCHS,
-    'model_state': model.state_dict(),
-    'link_head_state': link_head.state_dict(),
-    'cox_head_state': cox_head.state_dict(),
-    'patient_classifier_state': patient_classifier.state_dict(),
-    'joint_head_state': joint_head.state_dict(),
-    'optimizer_state': optimizer.state_dict(),
-    'scheduler_state': scheduler.state_dict() if hasattr(scheduler, 'state_dict') else None,
-}, f"models/checkpoint_epoch{EPOCHS}.pth")
-    print(f"Saved model checkpoint to models/checkpoint_epoch{EPOCHS}.pth")
+    ckpt = {
+        'model': model.state_dict(),
+        'link_head': link_head.state_dict(),
+        'cox_head': cox_head.state_dict(),
+        'patient_classifier': patient_classifier.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'epoch': EPOCHS,
+    }
+    torch.save(ckpt, f"models/checkpoint_{EPOCHS}.pth")
+    print(f"Saved checkpoint to models/checkpoint_{EPOCHS}.pth")
+
 
 if __name__ == "__main__":
     mp.freeze_support()
