@@ -279,59 +279,68 @@ def generate_pseudo_labels(
     return pseudo_edges_per_graph
 
 def plot_link_prediction_curves(
-    link_scores: np.ndarray,
-    diag_windows: np.ndarray,
+    link_scores: list[np.ndarray],
+    diag_windows: list[list[int]],
     disease_name: str,
     save_path: str
 ):
     """
-    link_scores: array of shape (n_patients, n_windows)
-                 link_scores[i, t] = model?s predicted score
-                                  for patient i at window t
-    diag_windows: array of shape (n_patients,)
-                  diag_windows[i] = true diagnosis window for patient i
-    disease_name: string for title/legend
-    save_path:    filepath to save the PNG
+    link_scores: list of length T, each an array of shape (n_patients_t,)
+    diag_windows: list of lists, each inner list are the true windows for patients,
+                  across your split (can be nested lists)
     """
-    n_patients, n_windows = link_scores.shape
-    windows = np.arange(n_windows)
+    # 1) Compute per-window mean & std
+    means = np.array([scores.mean()    if scores.size else np.nan
+                      for scores in link_scores])
+    stds  = np.array([scores.std(ddof=0) if scores.size else np.nan
+                      for scores in link_scores])
+    T = len(link_scores)
+    x = np.arange(T)
 
-    # Melt into long form for seaborn
-    df = pd.DataFrame(link_scores, columns=windows)
-    df_long = df.melt(var_name="window", value_name="score")
+    # 2) Flatten diag_windows to 1D array
+    flat = []
+    for sub in diag_windows:
+        if isinstance(sub, (list, tuple, np.ndarray)):
+            flat.extend(sub)
+        else:
+            flat.append(sub)
+    if len(flat) == 0:
+        median = p25 = p75 = None
+    else:
+        flat = np.array(flat)
+        median = np.median(flat)
+        p25, p75 = np.percentile(flat, [25, 75])
 
+    # 3) Plot
     sns.set(style="whitegrid", context="notebook", palette="tab10")
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    # Mean curve ± 1 stddev
-    sns.lineplot(
-        data=df_long,
-        x="window", y="score",
-        estimator="mean", ci="sd",
-        lw=2, ax=ax
-    )
+    ax.plot(x, means, color="blue", lw=2, label="Mean score")
+    ax.fill_between(x,
+                    means - stds,
+                    means + stds,
+                    color="blue",
+                    alpha=0.3,
+                    label="±1 std")
 
-    # Decorations
-    ax.set_title(f"Link?Prediction Scores for ?{disease_name}?", fontsize=16, pad=12)
+    ax.set_title(f"Link Prediction Scores for {disease_name}", fontsize=16, pad=12)
     ax.set_xlabel("Window Index", fontsize=14)
     ax.set_ylabel("Predicted Score", fontsize=14)
-    ax.set_xlim(0, n_windows - 1)
+    ax.set_xlim(0, T - 1)
     ax.set_ylim(0.0, 1.02)
 
-    # Diagnosis distribution ? median + IQR band
-    median = np.median(diag_windows)
-    p25, p75 = np.percentile(diag_windows, [25, 75])
-    ax.axvline(median, color="black", linestyle="--", label="Median Diagnosis Window")
-    ax.axvspan(p25, p75, color="gray", alpha=0.2, label="25?75% Diagnosis Window")
+    # 4) Diagnosis median & IQR
+    if median is not None:
+        ax.axvline(median, color="black", linestyle="--", label="Median Diagnosis Window")
+        ax.axvspan(p25, p75, color="gray", alpha=0.2, label="25?75% Diagnosis Window")
 
     ax.legend(loc="upper right", fontsize=12)
     plt.tight_layout()
 
-    # Save to disk
+    # 5) Save
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
-
-# get gender informaition per patients
+# get gender information per patients
 study_ids = [10, 1001, 1002]
 bm = BodyMeasuresLoader().get_data(study_ids=study_ids, groupby_reg='first').df.join(BodyMeasuresLoader().get_data(study_ids=study_ids, groupby_reg='first').df_metadata)
 
@@ -386,12 +395,12 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
 
     for batch_idx, batch in enumerate(tqdm(loader, desc="Training")):
         batch = batch.to(device)
-        # ??? Sanity?check inputs ???????????????????????????????????????????????????????????????????
+        # Sanity check inputs
         for ntype, x in batch.x_dict.items():
             if torch.isnan(x).any() or torch.isinf(x).any():
                 raise RuntimeError(f"[Batch {batch_idx}] Bad input on node '{ntype}': contains NaN or Inf")
 
-        # ??? Skip if no useful edges at all ???????????????????????????????????????????????????????
+        # Skip if no useful edges at all
         if len(batch.edge_types) == 0 or (
             ('patient', 'has', 'condition') not in batch.edge_types
             and ('patient', 'follows', 'patient') not in batch.edge_types
@@ -400,16 +409,16 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
             continue
 
         optimizer.zero_grad()
-        # ??? Build edge_attr_dict for signature edges ?????????????????????????????????????????
+        # Build edge_attr_dict for signature edges
         edge_attr_dict = {}
         rel = ('patient', 'to', 'signature')
         if rel in batch.edge_types and hasattr(batch[rel], 'edge_attr'):
             edge_attr_dict[rel] = batch[rel].edge_attr
 
-        # ??? 1) Forward through HeteroGAT ?????????????????????????????????????????????????????
+        # 1) Forward through HeteroGAT
         out = model(batch.x_dict, batch.edge_index_dict, edge_attr_dict)
 
-        # ??? Sanity?check GNN outputs ?????????????????????????????????????????????????????????????
+        # Sanity?check GNN outputs
         for ntype, h in out.items():
             if torch.isnan(h).any() or torch.isinf(h).any():
                 raise RuntimeError(f"[Batch {batch_idx}] NaNs in model output for '{ntype}'")
@@ -417,7 +426,7 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
         patient_embeds   = out['patient']    # [N_pat, out_dim]
         condition_embeds = out['condition']  # [C, out_dim]
 
-        # ??? Prepare ZERO tensor to ?fill in? empty?loss cases ???????????????????????????????????
+        #  Prepare ZERO tensor to fill in empty-loss cases
         zero = patient_embeds.sum() * 0.0
 
         # ??? 2) Link?prediction loss over horizon ????????????????????????????????????????????????
@@ -602,7 +611,7 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
 
 
 @torch.no_grad()
-def evaluate(model, link_head, cox_head, patient_classifier,loader,device,NEGATIVE_MULTIPLIER,diag_by_win_map,frozen_condition_embeddings):
+def evaluate(model, link_head, cox_head, patient_classifier,loader,device,NEGATIVE_MULTIPLIER,diag_by_win_map,frozen_condition_embeddings,plot_idx):
     model.eval()
     link_head.eval()
     cox_head.eval()
@@ -613,7 +622,7 @@ def evaluate(model, link_head, cox_head, patient_classifier,loader,device,NEGATI
     total_node_loss = 0.0   # accumulate pseudo?node (CE) over all windows
     total_node_count = 0    # count number of patients on which we computed CE
     total_node_correct = 0  # to track accuracy
-
+    window_scores = []
     all_link_preds,  all_link_labels  = [], []
     per_cond_preds,  per_cond_labels  = {}, {}
     all_risk_scores, all_durations, all_events = [], [], []
@@ -643,16 +652,25 @@ def evaluate(model, link_head, cox_head, patient_classifier,loader,device,NEGATI
         if rel in batch.edge_types and hasattr(batch[rel], 'edge_attr'):
             edge_attr_dict[rel] = batch[rel].edge_attr
 
-        # ??? 3) Forward pass through HeteroGAT ???????????????????????????????????????????
+        # ??? 3) Forward pass through HeteroGAT
         out = model(batch.x_dict, edge_index_dict, edge_attr_dict)
         P = out['patient']    # [N_pat, out_dim]
         C_emb = frozen_condition_embeddings.to(device)  # [C, out_dim]
 
-        # ??? 4) Skip if embeddings are empty ?????????????????????????????????????????????
+        #  4) Skip if embeddings are empty
         if P.size(0) == 0 or C_emb.size(0) == 0:
             continue
-
-        # ??? 5) Build ?future positives? over the evaluation horizon ?????????????????????
+        # ? NEW: score every patient on our tracked disease (plot_idx)
+        ei_all = torch.stack([
+            torch.arange(P.size(0), device=device),
+            torch.full((P.size(0),), plot_idx, device=device)
+        ], dim=0)  # [2, N_pat]
+        window_scores.append(
+            torch.sigmoid(link_head(P, C_emb, ei_all))
+                  .cpu()
+                  .numpy()
+        )
+        # 5) Build ?future positives? over the evaluation horizon
         #      exactly as in train(): gather (patient_id, cond_idx) for windows [t+1 .. t+HORIZON].
         flat_names = [
             n for sub in batch['patient'].name
@@ -853,7 +871,8 @@ def evaluate(model, link_head, cox_head, patient_classifier,loader,device,NEGATI
         mean_c,                  # mean C?index
         link_auc,                # global AUC
         pr_auc,                  # global PR?AUC
-        pr_per_cond              # PR?AUC per condition
+        pr_per_cond,              # PR?AUC per condition
+        window_scores
     )
 
 
@@ -948,6 +967,8 @@ def main():
     history = []
     EPOCHS =200
     pseudo_eps = 0.85
+    max_pr_auc = 0.5
+    plot_idx = 3 # the index of the condition for which we want the plots
     for epoch in range(1, EPOCHS + 1):
         # every 5 epochs, regenerate pseudo?labels
         if (epoch - 1) % 5 == 0:
@@ -1009,9 +1030,9 @@ def main():
             model, link_head, cox_head, patient_classifier,
             val_loader, device,
             NEGATIVE_MULTIPLIER, diag_by_win_val,
-            train_cond_embeds
+            train_cond_embeds, plot_idx = plot_idx
         )
-        avg_link, avg_cox, avg_node_ce, node_acc, cidx_list, mean_cidx, link_auc, pr_auc, pr_per_cond = val_metrics
+        avg_link, avg_cox, avg_node_ce, node_acc, cidx_list, mean_cidx, link_auc, pr_auc, pr_per_cond, val_scores = val_metrics
 
         scheduler.step(avg_link)
 
@@ -1029,8 +1050,28 @@ def main():
             "val_pr_per_cond": pr_per_cond,
             "timestamp": datetime.datetime.now().isoformat(),
         })
-        print(
-            f"[Epoch {epoch}] Train {train_loss:.4f} | ValLink {avg_link:.4f} | Cox {avg_cox:.4f} | NodeCE {avg_node_ce:.4f}")
+        print(f"[Epoch {epoch}] Train {train_loss:.4f} | ValLink {avg_link:.4f} "
+            f"Val Cox Loss: {avg_cox:.4f} |"
+            f"Node Acc: {node_acc} |"
+            f"Val C-Index: {cidx_list} |"
+            f"PR AUC per condition: {pr_per_cond}")
+
+        if max_pr_auc < pr_per_cond[plot_idx]:
+            max_pr_auc = pr_per_cond[plot_idx]
+            # val_scores is already returned by evaluate()
+            val_true_windows = [
+                [wi for (p, c) in diag_by_win_val.get(wi, []) if c == plot_idx]
+                for wi in range(len(val_graphs))
+            ]
+
+            os.makedirs("outputs", exist_ok=True)
+            plot_link_prediction_curves(
+                link_scores=val_scores,
+                diag_windows=val_true_windows,
+                disease_name=chosen[plot_idx],
+                save_path=f"outputs/val_{chosen[plot_idx].replace(' ', '_')}_epoch{epoch}.png",
+            )
+
 
     # 7) Save history
     os.makedirs("results", exist_ok=True)
@@ -1041,13 +1082,13 @@ def main():
     # 8) Final test?time inference for plotting
     test_scores = []
     true_windows = []
-    model.eval();
+    model.eval()
     link_head.eval()
     with torch.no_grad():
         # recompute final condition embeds
         eye = torch.eye(in_dims['condition'], device=device)
         h = model.input_proj['condition'](eye)
-        h = F.relu(h);
+        h = F.relu(h)
         h = F.relu(h)
         h = F.relu(model.shrink['condition'](h))
         cond_embeds = model.linear_proj['condition'](h)
@@ -1069,7 +1110,7 @@ def main():
             scores = torch.sigmoid(link_head(P, cond_embeds, ei))  # [N_pat]
             test_scores.append(scores.cpu().numpy())
             # record true diag-window(s) for disease 3 from your mapping
-            tw = [w for (p, c) in diag_by_win_test.get(wi, []) if c == idx]
+            tw = [wi for (p, c) in diag_by_win_test.get(wi, []) if c == idx]
             true_windows.append(tw)
 
     # 9) Plot & save
