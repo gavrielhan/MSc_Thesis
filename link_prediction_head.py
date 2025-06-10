@@ -84,97 +84,116 @@ class CoxHead(nn.Module):
     def cox_partial_log_likelihood(risk_scores: torch.Tensor,
                                    durations: torch.Tensor,
                                    events: torch.Tensor) -> torch.Tensor:
-        """
-        Compute dynamically-weighted negative partial log-likelihood across conditions,
-        with a fallback to uniform weights if dynamic weights are all zero.
-        """
         losses = []
+        C = risk_scores.size(1)
 
-        num_conditions = risk_scores.size(1)
-        for ci in range(num_conditions):
-            # slice out one condition
-            rs = risk_scores[:, ci]
-            du = durations[:, ci]
-            ev = events[:, ci]
+        for ci in range(C):
+            rs = risk_scores[:, ci]  # [N]
+            du = durations[:, ci]  # [N]
+            ev = events[:, ci]  # [N]
 
-            # keep only those with an event and positive duration
-            mask = (ev > 0) & (du > 0)
-            rs = rs[mask]
-            du = du[mask]
-            ev = ev[mask]
-
-            if rs.numel() == 0:
+            # 1) drop any zero/negative durations (if your data has them)
+            valid = du > 0
+            if valid.sum() == 0:
                 continue
+            rs = rs[valid]
+            du = du[valid]
+            ev = ev[valid]
 
-            # sort by descending duration
+            # 2) sort *all* by descending time
             order = torch.argsort(du, descending=True)
             rs = rs[order]
             ev = ev[order]
 
-            # partial?likelihood: logcumsumexp trick
-            log_cum = torch.logcumsumexp(rs, dim=0)
+            # 3) build log?cumulative?hazard over the full set
+            log_cum = torch.logcumsumexp(rs, dim=0)  # denominator uses everyone
+
+            # 4) only event?times contribute to numerator
+            #    (censored will get zero because ev=0)
+            #    lik_i = h_i - log(?_{j?i} e^{h_j})
             lik = (rs - log_cum) * ev
 
-            # only if there was at least one event
+            # 5) average over the #events
             n_ev = ev.sum()
             if n_ev > 0:
-                loss_ci = -lik.sum() / n_ev
-                losses.append(loss_ci)
+                losses.append(-lik.sum() / n_ev)
 
-        # if no conditions produced a loss, return zero
-        if len(losses) == 0:
-            return 0.0 * risk_scores.sum()
+        if not losses:
+            # no events at all: zero?loss
+            return torch.tensor(0.0, device=risk_scores.device)
 
-        losses = torch.stack(losses)  # shape [K]
-
-        # dynamic weights = loss magnitude
+        losses = torch.stack(losses)  # one per condition
+        # your dynamic weighting (optional)
         weights = losses.clone()
         wsum = weights.sum()
         if wsum.abs() < 1e-8:
-            # fallback to uniform weights when dynamic ones vanish
             weights = torch.ones_like(weights) / weights.numel()
         else:
             weights = weights / wsum
 
-        # final, weighted sum of condition losses
         return (losses * weights).sum()
 
 class CosineLinkPredictor(nn.Module):
-    def __init__(self, input_dim, init_scale: float = 1.0, use_bias: bool = True):
+    def __init__(self, input_dim, init_scale: float = 10.0, use_bias: bool = True):
         """
-        A link predictor that scores (p?c) by
-            logits = scale * cosine_similarity(p, c) + bias
-        so that you can train it via BCEWithLogits.
-
-        Args:
-            input_dim  (int): dimensionality of each patient/condition embed
-            init_scale (float): initial value for the learnable scale
-            use_bias   (bool): whether to include a learnable bias term
+        Cosine similarity + learnable temperature:
+          logit = scale * cos(h_p, h_c) + bias
+        so that after sigmoid you get a full [0,1] range.
         """
         super().__init__()
-        self.cos   = nn.CosineSimilarity(dim=1, eps=1e-6)
-        self.scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float))
+        self.scale = nn.Parameter(torch.tensor(init_scale))
         if use_bias:
             self.bias = nn.Parameter(torch.zeros(1))
         else:
-            self.register_buffer("bias", torch.zeros(1))
+            self.bias = None
 
     def forward(self, patient_embeds, condition_embeds, edge_index):
+        # edge_index: [2, E], first row patient idx, second row cond idx
+        src = patient_embeds[edge_index[0]]      # [E, D]
+        dst = condition_embeds[edge_index[1]]    # [E, D]
+        cos = F.cosine_similarity(src, dst, dim=1)  # [E]
+        logits = cos * self.scale
+        if self.bias is not None:
+            logits = logits + self.bias
+        return logits
+
+class TimeAwareCosineLinkPredictor(nn.Module):
+    def __init__(self, init_scale: float = 10.0, use_bias: bool = True):
+        super().__init__()
+        # cosine temperature & bias
+        self.scale = nn.Parameter(torch.tensor(init_scale))
+        self.bias  = nn.Parameter(torch.zeros(1)) if use_bias else None
+        # learned weight on time?to?event
+        self.time_coeff = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self,
+                patient_embeds:   torch.Tensor,
+                condition_embeds: torch.Tensor,
+                edge_index:       torch.Tensor,
+                tte  = None
+               ) -> torch.Tensor:
         """
-        Args:
-          patient_embeds   Tensor [N_pat, input_dim]
-          condition_embeds Tensor [N_cond, input_dim]
-          edge_index       LongTensor [2, E]  (rows: [pat_idx, cond_idx])
-
-        Returns:
-          logits           Tensor [E]
+        edge_index: [2, E]
+        tte:        [E] if provided, else None?zeros
         """
-        # gather the embeddings for each edge
-        src = patient_embeds[edge_index[0]]    # [E, input_dim]
-        dst = condition_embeds[edge_index[1]]  # [E, input_dim]
+        # if no tte passed, zero it out
+        if tte is None:
+            tte = torch.zeros(edge_index.size(1), device=patient_embeds.device)
 
-        # compute cosine similarity in [?1, 1]
-        sim = self.cos(src, dst)               # [E]
+        # basic cosine part
+        src  = patient_embeds[edge_index[0]]     # [E, D]
+        dst  = condition_embeds[edge_index[1]]   # [E, D]
+        cos  = F.cosine_similarity(src, dst, dim=1)
+        logits = cos * self.scale
 
-        # scale (and bias) turn it into unbounded logits
-        return sim * self.scale + self.bias   # [E]
+        # time boost only where tte>0
+        boost = torch.where(
+            tte > 0,
+            1.0 / (tte + 1.0),
+            torch.zeros_like(tte),
+        )
+        logits = logits + self.time_coeff * boost
+
+        if self.bias is not None:
+            logits = logits + self.bias
+        return logits
