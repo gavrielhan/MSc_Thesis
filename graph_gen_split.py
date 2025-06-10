@@ -255,7 +255,18 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
                 dst.append(ni)
         last_loc[p] = (wi, ni)
     if src:
-        het["patient", "follows", "patient"].edge_index = torch.tensor([src, dst])
+        # stack your src/dst into a single [2, E] tensor
+        ei = torch.tensor([src, dst], dtype=torch.long)
+        het["patient", "follows", "patient"].edge_index = ei
+
+        # build an edge_attr of shape [E,1], all filled with WINDOW_SIZE
+        wt = torch.full((ei.size(1), 1), float(WINDOW_SIZE), dtype=torch.float)
+        het["patient", "follows", "patient"].edge_attr = wt
+
+        # now mirror to the reverse relation
+        rev_ei = ei.flip(0)
+        het["patient", "follows_rev", "patient"].edge_index = rev_ei
+        het["patient", "follows_rev", "patient"].edge_attr = wt
     if ('patient', 'follows', 'patient') in het.edge_types:
         ei = het['patient', 'follows', 'patient'].edge_index
         assert ei.max().item() < het['patient'].x.size(0), \
