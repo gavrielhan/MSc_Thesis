@@ -5,54 +5,36 @@ import torch.nn.functional as F
 
 class LinkMLPPredictor(nn.Module):
     def __init__(self, input_dim, hidden_dim=128):
-        """
-        A 2?layer MLP with a skip (residual) connection from the first layer's input
-        into the second layer.
-
-        Args:
-            input_dim  (int): dimensionality of each patient / condition embed
-            hidden_dim (int): dimensionality of the hidden layers
-        """
         super().__init__()
-        # we'll concatenate patient + condition ? 2 * input_dim
-        self.fc1 = nn.Linear(input_dim * 2, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc_out = nn.Linear(hidden_dim, 1)
+        # now input_dim*2 (p+c) + 1 (tte)
+        self.fc1     = nn.Linear(input_dim*2 + 1, hidden_dim)
+        self.fc2     = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out  = nn.Linear(hidden_dim, 1)
 
-        # If the concatenated dimension ? hidden_dim, project it to match:
-        if input_dim * 2 != hidden_dim:
-            self.res_proj = nn.Linear(input_dim * 2, hidden_dim)
+        if input_dim*2 + 1 != hidden_dim:
+            self.res_proj = nn.Linear(input_dim*2 + 1, hidden_dim)
         else:
             self.res_proj = nn.Identity()
 
         self.act = nn.ReLU()
 
-    def forward(self, patient_embeds, condition_embeds, edge_index):
-        """
-        Args:
-          patient_embeds   Tensor [N_pat, input_dim]
-          condition_embeds Tensor [N_cond, input_dim]
-          edge_index       LongTensor [2, E]  (rows: [pat_idx, cond_idx])
+    def forward(self, patient_embeds, condition_embeds, edge_index, tte=None):
+        src = patient_embeds[edge_index[0]]    # [E, D]
+        dst = condition_embeds[edge_index[1]]  # [E, D]
+        x   = torch.cat([src, dst], dim=1)     # [E, 2D]
 
-        Returns:
-          logits           Tensor [E]
-        """
-        src = patient_embeds[edge_index[0]]  # [E, input_dim]
-        dst = condition_embeds[edge_index[1]]  # [E, input_dim]
-        x = torch.cat([src, dst], dim=1)  # [E, 2 * input_dim]
+        if tte is not None:
+            tte_feat = tte.view(-1,1).float()  # [E,1]
+            x = torch.cat([x, tte_feat], dim=1)  # [E, 2D+1]
+        else:
+            # if no tte, pad with zeros
+            zeros = torch.zeros(x.size(0), 1, device=x.device)
+            x = torch.cat([x, zeros], dim=1)
 
-        # 1) First layer
-        h1 = self.act(self.fc1(x))  # [E, hidden_dim]
-
-        # 2) Residual: project original x ? hidden_dim
-        res = self.res_proj(x)  # [E, hidden_dim]
-
-        # 3) Second layer + skip
-        h2 = self.act(self.fc2(h1) + res)  # [E, hidden_dim]
-
-        # 4) Final logit
-        return self.fc_out(h2).view(-1)  # [E]
-
+        h1  = self.act(self.fc1(x))
+        res = self.res_proj(x)
+        h2  = self.act(self.fc2(h1) + res)
+        return self.fc_out(h2).view(-1)        # [E]
 
 
 class CoxHead(nn.Module):
