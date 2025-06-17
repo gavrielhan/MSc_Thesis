@@ -12,6 +12,12 @@ from scipy.interpolate import interp1d
 from torch_geometric.data import HeteroData
 from LabData.DataLoaders.CGMLoader import CGMLoader
 from torch_geometric.utils import to_undirected
+from LabData.DataLoaders.BodyMeasuresLoader import BodyMeasuresLoader
+
+study_ids = [10,1001,1002]
+bm = BodyMeasuresLoader().get_data(study_ids=study_ids, groupby_reg='first')
+age_gender = bm.df.join(bm.df_metadata)[['RegistrationCode','age','yob']].dropna(subset=['age','yob'])
+yob_map = dict(zip(age_gender['RegistrationCode'], age_gender['yob']))
 
 # ========== CONFIG ==========
 WINDOW_SIZE = 3  # days
@@ -159,7 +165,6 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
     do_train=False -> never add has-condition; never drop
     """
     if do_train:
-        # Remove patients diagnosed before the current window `wi`
         diagnosed_before = {
             d["patient"]
             for d in diag_map
@@ -169,120 +174,112 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
         for p in diagnosed_before:
             if p in last_loc:
                 del last_loc[p]
+
     het = HeteroData()
     het["signature"].x = torch.tensor(nmf_signatures, dtype=torch.float)
     het["condition"].x = torch.eye(num_conds, dtype=torch.float)
-    het['meta'] = {}
-    het['meta']['start_date'] = str(wstart)  # store as string to avoid serialization issues
-    het['meta']['end_date'] = str(wend)
-    # collect patient embeddings & names
+
+    het['meta'] = {
+        'start_date': str(wstart),
+        'end_date':   str(wend),
+    }
+
+    # --- patient features & names ---
     feats, names = [], []
     for p in patients:
-        # get embedding at wend
         dfp = follow_dict.get(p)
         if dfp is not None:
-            dfp = dfp[dfp["Date"]<=wend]
-        emb = (dfp.sort_values("Date").filter(like="emb_").values[-1]
-               if dfp is not None and not dfp.empty
-               else base_idx.loc[p].filter(like="emb_").values)
+            dfp = dfp[dfp["Date"] <= wend]
+        if dfp is not None and not dfp.empty:
+            emb = dfp.sort_values("Date").filter(like="emb_").values[-1]
+        else:
+            emb = base_idx.loc[p].filter(like="emb_").values
         sleep = sleep_df.loc[p].values if p in sleep_df.index else avg_sleep
-        feats.append(torch.from_numpy(np.concatenate([emb,sleep])).float())
+        feats.append(torch.from_numpy(np.concatenate([emb, sleep])).float())
         names.append(p)
-    het["patient"].x = torch.stack(feats) if feats else torch.empty((0,138))
+
+    het["patient"].x    = torch.stack(feats) if feats else torch.empty((0,138))
     het["patient"].name = names
 
-    # event/duration matrix
+    # --- event / duration for Cox ---
     ev, du = [], []
     for p in names:
         ev_row, du_row = [], []
         for ci in range(num_conds):
-            # Find first diagnosis window (if any)
-            future_diags = [d["window"] for d in diag_map if
-                            d["patient"] == p and d["cond"] == ci and d["window"] >= wi]
-            if future_diags:
+            future = [d["window"] for d in diag_map
+                      if d["patient"] == p and d["cond"] == ci and d["window"] >= wi]
+            if future:
                 ev_row.append(1)
-                dur = min(future_diags) - wi
-                # Avoid zero duration which would be ignored by Cox loss
-                du_row.append(dur if dur > 0 else 1.0)
+                delta = min(future) - wi
+                du_row.append(delta if delta > 0 else 1.0)
             else:
                 ev_row.append(0)
                 du_row.append(0.0)
-
         ev.append(ev_row); du.append(du_row)
+
     het["patient"].event    = torch.tensor(ev, dtype=torch.long)
     het["patient"].duration = torch.tensor(du, dtype=torch.float)
 
-    # patient?signature edges
+    # --- patient ? signature edges ---
     eidx, wts = [], []
-    for pi,p in enumerate(names):
+    for pi, p in enumerate(names):
         for day in pd.date_range(wstart, wend).date:
-            sig = cgm_dict.get((p,day))
+            sig = cgm_dict.get((p, day))
             if sig is None: continue
-            v = align_and_rescale(sig)
-            kws = compute_weights(nmf_signatures,v)
-            for si,ww in enumerate(kws):
-                if ww>NEGATIVE_THRESHOLD:
-                    eidx.append([pi,si]); wts.append(ww)
+            v   = align_and_rescale(sig)
+            kws = compute_weights(nmf_signatures, v)
+            for si, ww in enumerate(kws):
+                if ww > NEGATIVE_THRESHOLD:
+                    eidx.append([pi, si])
+                    wts.append(ww)
     if eidx:
-        het["patient","to","signature"].edge_index = torch.tensor(eidx).T
-        het["patient","to","signature"].edge_attr  = torch.tensor(wts)
+        het["patient", "to", "signature"].edge_index = torch.tensor(eidx).T
+        het["patient", "to", "signature"].edge_attr  = torch.tensor(wts)
 
-    # patient?condition (only in train)
+    # --- patient ? condition edges (only in training) ---
     if do_train and wi in diag_by_win:
         ci_edges = []
         for p, ci, _ in diag_by_win[wi]:
-            if p in names:  # only if patient still in this window
+            if p in names:
                 ci_edges.append([names.index(p), ci])
         if ci_edges:
             het["patient", "has", "condition"].edge_index = torch.tensor(ci_edges).T
 
-    # temporal follows (keep everyone in val/test)
-    # ? Build valid follows edges, avoid stale indices
+    # --- temporal follows edges, with age attr on forward & reverse ---
+    #  (build src/dst lists exactly as before)
     src, dst = [], []
     name_to_idx = {p: i for i, p in enumerate(names)}
-
-    # ? Clean up stale last_loc entries
-    for p in list(last_loc.keys()):
-        if p not in name_to_idx:
-            del last_loc[p]
-
-    # ? Now build follows safely
     for p, ni in name_to_idx.items():
         if p in last_loc:
-            prev_wi, prev_idx = last_loc[p]
-            if prev_idx < het['patient'].x.size(0):  # Should always be true now, but safe
+            _, prev_idx = last_loc[p]
+            if prev_idx < het['patient'].x.size(0):
                 src.append(prev_idx)
                 dst.append(ni)
         last_loc[p] = (wi, ni)
+
     if src:
-        # stack your src/dst into a single [2, E] tensor
-        ei = torch.tensor([src, dst], dtype=torch.long)
-        het["patient", "follows", "patient"].edge_index = ei
+        # forward edge_index
+        ei_f = torch.tensor([src, dst], dtype=torch.long)  # [2, E]
 
-        # build an edge_attr of shape [E,1], all filled with WINDOW_SIZE
-        wt = torch.full((ei.size(1), 1), float(WINDOW_SIZE), dtype=torch.float)
-        het["patient", "follows", "patient"].edge_attr = wt
+        # build age?normalized attribute for each destination patient
+        ages = []
+        for dst_idx in dst:
+            reg = names[dst_idx]
+            yob = yob_map.get(reg, None)
+            age = (wend.year - int(yob)) if yob is not None else 0
+            age = min(max(age, 0), 100)
+            ages.append(age / 100.0)
+        wt_f = torch.tensor(ages, dtype=torch.float32).unsqueeze(1)  # [E,1]
 
-        # now mirror to the reverse relation
-        rev_ei = ei.flip(0)
-        het["patient", "follows_rev", "patient"].edge_index = rev_ei
-        het["patient", "follows_rev", "patient"].edge_attr = wt
-    if ('patient', 'follows', 'patient') in het.edge_types:
-        ei = het['patient', 'follows', 'patient'].edge_index
-        assert ei.max().item() < het['patient'].x.size(0), \
-            f"[Window {wi}] Invalid index in 'follows' edge: max={ei.max().item()} vs num_patients={het['patient'].x.size(0)}"
-    # ??? Make every relation bidirectional ???
-    for src, rel, dst in [('patient','to','signature'),
-       ('patient','has','condition'),
-       ('patient','follows','patient'),]:
-        if (src, rel, dst) in het.edge_types:
-            ei = het[src, rel, dst].edge_index
-            rev_rel = (dst, rel + '_rev', src)
-            het[rev_rel].edge_index = ei.flip(0)
+        het["patient", "follows", "_", "patient"].edge_index = ei_f
+        het["patient", "follows", "_", "patient"].edge_attr  = wt_f
 
-    het.window = wi
+        # reverse edges mirror both index & attr
+        rev_ei = ei_f.flip(0)
+        het["patient", "follows_rev", "_", "patient"].edge_index = rev_ei
+        het["patient", "follows_rev", "_", "patient"].edge_attr  = wt_f
+
     return wi, het
-
 # store last_loc per split
 build_graph.last_loc = {}
 
