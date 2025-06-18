@@ -16,7 +16,9 @@ from LabData.DataLoaders.BodyMeasuresLoader import BodyMeasuresLoader
 
 study_ids = [10,1001,1002]
 bm = BodyMeasuresLoader().get_data(study_ids=study_ids, groupby_reg='first')
-age_gender = bm.df.join(bm.df_metadata)[['RegistrationCode','age','yob']].dropna(subset=['age','yob'])
+df_meta = bm.df.join(bm.df_metadata)
+df_meta = df_meta.reset_index().rename(columns={'index':'RegistrationCode'})
+age_gender = df_meta[['RegistrationCode','age','yob']].dropna(subset=['age','yob'])
 yob_map = dict(zip(age_gender['RegistrationCode'], age_gender['yob']))
 
 # ========== CONFIG ==========
@@ -165,26 +167,25 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
     do_train=False -> never add has-condition; never drop
     """
     if do_train:
+        # remove any patients diagnosed *before* this window
         diagnosed_before = {
-            d["patient"]
-            for d in diag_map
-            if d["window"] < wi
+            d["patient"] for d in diag_map if d["window"] < wi
         }
         patients = [p for p in patients if p not in diagnosed_before]
         for p in diagnosed_before:
-            if p in last_loc:
-                del last_loc[p]
+            last_loc.pop(p, None)
 
     het = HeteroData()
+
+    # ? node features ?
     het["signature"].x = torch.tensor(nmf_signatures, dtype=torch.float)
     het["condition"].x = torch.eye(num_conds, dtype=torch.float)
 
-    het['meta'] = {
-        'start_date': str(wstart),
-        'end_date':   str(wend),
-    }
+    # graph?level metadata (not a node type!)
+    het.start_date = str(wstart)
+    het.end_date   = str(wend)
 
-    # --- patient features & names ---
+    # patient features + name list
     feats, names = [], []
     for p in patients:
         dfp = follow_dict.get(p)
@@ -195,13 +196,14 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
         else:
             emb = base_idx.loc[p].filter(like="emb_").values
         sleep = sleep_df.loc[p].values if p in sleep_df.index else avg_sleep
+
         feats.append(torch.from_numpy(np.concatenate([emb, sleep])).float())
         names.append(p)
 
     het["patient"].x    = torch.stack(feats) if feats else torch.empty((0,138))
     het["patient"].name = names
 
-    # --- event / duration for Cox ---
+    # event/duration for Cox
     ev, du = [], []
     for p in names:
         ev_row, du_row = [], []
@@ -215,12 +217,13 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
             else:
                 ev_row.append(0)
                 du_row.append(0.0)
-        ev.append(ev_row); du.append(du_row)
+        ev.append(ev_row)
+        du.append(du_row)
 
     het["patient"].event    = torch.tensor(ev, dtype=torch.long)
     het["patient"].duration = torch.tensor(du, dtype=torch.float)
 
-    # --- patient ? signature edges ---
+    # ? patient ? signature (and reverse) with your precomputed weights ?
     eidx, wts = [], []
     for pi, p in enumerate(names):
         for day in pd.date_range(wstart, wend).date:
@@ -232,53 +235,66 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
                 if ww > NEGATIVE_THRESHOLD:
                     eidx.append([pi, si])
                     wts.append(ww)
-    if eidx:
-        het["patient", "to", "signature"].edge_index = torch.tensor(eidx).T
-        het["patient", "to", "signature"].edge_attr  = torch.tensor(wts)
 
-    # --- patient ? condition edges (only in training) ---
+    if eidx:
+        sig_ei = torch.tensor(eidx).T                     # [2, E_sig]
+        sig_w  = torch.tensor(wts, dtype=torch.float).view(-1,1)  # [E_sig,1]
+
+        het["patient","to","signature"].edge_index = sig_ei
+        het["patient","to","signature"].edge_attr  = sig_w
+
+        # mirror ? signature ? patient
+        rev_sig_ei = sig_ei.flip(0)
+        het["signature","to_rev","patient"].edge_index = rev_sig_ei
+        het["signature","to_rev","patient"].edge_attr  = sig_w
+
+    # ? patient ? condition (only in training) and its reverse ?
     if do_train and wi in diag_by_win:
         ci_edges = []
         for p, ci, _ in diag_by_win[wi]:
             if p in names:
                 ci_edges.append([names.index(p), ci])
         if ci_edges:
-            het["patient", "has", "condition"].edge_index = torch.tensor(ci_edges).T
+            cond_ei = torch.tensor(ci_edges).T              # [2, E_c]
+            het["patient","has","condition"].edge_index        = cond_ei
+            het["condition","has_rev","patient"].edge_index    = cond_ei.flip(0)
 
-    # --- temporal follows edges, with age attr on forward & reverse ---
-    #  (build src/dst lists exactly as before)
-    src, dst = [], []
+    # ? temporal follows edges with *age* as normalized attr ?
+    #   (first clean out any stale last_loc)
     name_to_idx = {p: i for i, p in enumerate(names)}
+    for p in list(last_loc):
+        if p not in name_to_idx:
+            del last_loc[p]
+
+    src, dst = [], []
     for p, ni in name_to_idx.items():
         if p in last_loc:
             _, prev_idx = last_loc[p]
-            if prev_idx < het['patient'].x.size(0):
+            if prev_idx < het["patient"].x.size(0):
                 src.append(prev_idx)
                 dst.append(ni)
         last_loc[p] = (wi, ni)
 
     if src:
-        # forward edge_index
-        ei_f = torch.tensor([src, dst], dtype=torch.long)  # [2, E]
+        ei_f = torch.tensor([src, dst], dtype=torch.long)  # [2, E_f]
 
-        # build age?normalized attribute for each destination patient
+        # build age?normalized attr
         ages = []
-        for dst_idx in dst:
-            reg = names[dst_idx]
-            yob = yob_map.get(reg, None)
-            age = (wend.year - int(yob)) if yob is not None else 0
-            age = min(max(age, 0), 100)
+        for d_idx in dst:
+            reg = names[d_idx]
+            yob = yob_map.get(reg, wend.year)
+            age = max(0, min(100, wend.year - int(yob)))
             ages.append(age / 100.0)
-        wt_f = torch.tensor(ages, dtype=torch.float32).unsqueeze(1)  # [E,1]
+        wt_f = torch.tensor(ages, dtype=torch.float).view(-1,1)  # [E_f,1]
 
-        het["patient", "follows", "_", "patient"].edge_index = ei_f
-        het["patient", "follows", "_", "patient"].edge_attr  = wt_f
+        het["patient","follows","patient"].edge_index = ei_f
+        het["patient","follows","patient"].edge_attr  = wt_f
 
-        # reverse edges mirror both index & attr
+        # mirror
         rev_ei = ei_f.flip(0)
-        het["patient", "follows_rev", "_", "patient"].edge_index = rev_ei
-        het["patient", "follows_rev", "_", "patient"].edge_attr  = wt_f
-
+        het["patient","follows_rev","patient"].edge_index = rev_ei
+        het["patient","follows_rev","patient"].edge_attr  = wt_f
+    het.window = wi
     return wi, het
 # store last_loc per split
 build_graph.last_loc = {}

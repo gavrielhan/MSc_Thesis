@@ -177,8 +177,8 @@ class JointHead(nn.Module):
     def __init__(self):
         super().__init__()
         # initialize raw (unbounded) parameters at 0.0
-        self.s_link = nn.Parameter(torch.tensor(1.0))
-        self.s_cox = nn.Parameter(torch.tensor(1.0))
+        self.s_link = nn.Parameter(torch.tensor(0.0))
+        self.s_cox = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, link_loss: torch.Tensor, cox_loss: torch.Tensor) -> torch.Tensor:
         # compute positive log-variances via softplus
@@ -402,7 +402,7 @@ def build_diag_by_win(full_map, graphs):
     return m
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 1  # you can adjust this multiplier later
+NEGATIVE_MULTIPLIER = 10  # you can adjust this multiplier later
 HORIZON = 10   # how many graphs ahead to predict over
 
 
@@ -434,18 +434,13 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
         # build edge_attr for signatures
         edge_attr_dict = {}
 
-        # 1) signature edges (as before)
-        rel_sig = ('patient', 'to', 'signature')
-        if rel_sig in batch.edge_types and hasattr(batch[rel_sig], 'edge_attr'):
-            edge_attr_dict[rel_sig] = batch[rel_sig].edge_attr
-            # if you also use the reverse relation in your model:
-            edge_attr_dict[('signature', 'to_rev', 'patient')] = batch[rel_sig].edge_attr
+        # 1) signature edges
+        for rel in [('patient', 'to', 'signature'), ('signature', 'to_rev', 'patient')]:
+            if rel in batch.edge_types and hasattr(batch[rel], 'edge_attr'):
+                edge_attr_dict[rel] = batch[rel].edge_attr
 
-        # 2) temporal 'follows' edges (3-day intervals)
-        for rel in [
-            ('patient', 'follows', 'patient'),
-            ('patient', 'follows_rev', 'patient')
-        ]:
+        # 2) temporal 'follows' edges
+        for rel in [('patient', 'follows', 'patient'), ('patient', 'follows_rev', 'patient')]:
             if rel in batch.edge_types and hasattr(batch[rel], 'edge_attr'):
                 edge_attr_dict[rel] = batch[rel].edge_attr
 
@@ -548,10 +543,25 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
                 reduction="mean"
             )
 
-            # 2) pairwise ranking loss (push every pos above every neg)
-            pairwise_loss = -F.logsigmoid(
-                pos_logits.unsqueeze(1) - neg_logits.unsqueeze(0)
-            ).mean()
+            # 2) pairwise margin?ranking loss: every positive score should exceed every negative
+            N_pos = pos_logits.size(0)
+            N_neg = neg_logits.size(0)
+            if N_pos > 0 and N_neg > 0:
+                # build two [N_pos, N_neg] matrices
+                pos_mat = pos_logits.unsqueeze(1).expand(-1, N_neg)  # [N_pos, N_neg]
+                neg_mat = neg_logits.unsqueeze(0).expand(N_pos, -1)  # [N_pos, N_neg]
+                # flatten to shape [N_pos*N_neg]
+                pos_flat = pos_mat.reshape(-1)
+                neg_flat = neg_mat.reshape(-1)
+                # target = +1 means pos_flat should be larger than neg_flat
+                target = torch.ones_like(pos_flat, device=pos_flat.device)
+                pairwise_loss = F.margin_ranking_loss(
+                    pos_flat, neg_flat, target,
+                    margin=1.0, reduction="mean"
+                )
+            else:
+                # no pairs ? zero loss
+                pairwise_loss = pos_logits.sum() * 0.0
 
             # 3) final link loss = blend of both
             link_loss = 0.5 * focal_loss + 0.5 * pairwise_loss
@@ -684,7 +694,12 @@ def evaluate(
         link_logits = link_head(P, C_emb, full_ei)                     # [Np*Nc]
         risks       = cox_head(P)                                      # [Np, Nc]
         cox_logits  = risks[src_all, dst_all]                          # [Np*Nc]
-        logits_all  = BLEND_LINK * link_logits + BLEND_COX * cox_logits
+        log_var_link = F.softplus(joint_head.s_link)
+        log_var_cox = F.softplus(joint_head.s_cox)
+        inv_l = torch.exp(-log_var_link)
+        inv_c = torch.exp(-log_var_cox)
+        logits_all = link_logits * inv_l + cox_logits * inv_c
+        # (you can omit the additive 0.5*log_var terms at eval)
         probs_all   = torch.sigmoid(logits_all)                        # [Np*Nc]
 
         # save for sliding-window plot
@@ -863,9 +878,9 @@ model = HeteroGAT(
     num_heads = 8
 ).to(device)
 
-link_head = LinkMLPPredictor(input_dim=128).to(device)
+#link_head = LinkMLPPredictor(input_dim=128).to(device)
 #link_head = CosineLinkPredictor(input_dim=128, init_scale=10.0, use_bias=True).to(device)
-#link_head = TimeAwareCosineLinkPredictor(init_scale = 10.0 , use_bias = True).to(device)
+link_head = TimeAwareCosineLinkPredictor(init_scale = 10.0 , use_bias = True).to(device)
 cox_head = CoxHead(input_dim=128, num_conditions=7).to(device)
 
 USE_PSEUDO = True
@@ -1026,7 +1041,7 @@ def main():
         )
         avg_link, avg_cox, avg_node_ce, node_acc, cidx_list, mean_cidx, link_auc, pr_auc, pr_per_cond, val_scores = val_metrics
 
-        scheduler.step(avg_link)
+        scheduler.step(pr_per_cond[plot_idx])
 
         history.append({
             "epoch": epoch,
