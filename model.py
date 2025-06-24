@@ -27,6 +27,7 @@ from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 from LabData.DataLoaders.BodyMeasuresLoader import BodyMeasuresLoader
 import numpy as np
 import matplotlib.pyplot as plt
+from torch.utils.data import WeightedRandomSampler
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE_DIR)
@@ -402,12 +403,12 @@ def build_diag_by_win(full_map, graphs):
     return m
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 10  # you can adjust this multiplier later
+NEGATIVE_MULTIPLIER = 5  # you can adjust this multiplier later
 HORIZON = 10   # how many graphs ahead to predict over
 
 
 
-def train(model, link_head, cox_head, patient_classifier, loader, optimizer, device, pseudo_label_by_window):
+def train(model, link_head, cox_head, patient_classifier,loader, optimizer, device, pseudo_label_by_window):
     model.train()
     link_head.train()
     cox_head.train()
@@ -431,150 +432,117 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
             continue
 
         optimizer.zero_grad()
-        # build edge_attr for signatures
+        # build edge_attr dict
         edge_attr_dict = {}
-
-        # 1) signature edges
-        for rel in [('patient', 'to', 'signature'), ('signature', 'to_rev', 'patient')]:
-            if rel in batch.edge_types and hasattr(batch[rel], 'edge_attr'):
-                edge_attr_dict[rel] = batch[rel].edge_attr
-
-        # 2) temporal 'follows' edges
-        for rel in [('patient', 'follows', 'patient'), ('patient', 'follows_rev', 'patient')]:
+        for rel in [('patient','to','signature'), ('signature','to_rev','patient'),
+                    ('patient','follows','patient'), ('patient','follows_rev','patient')]:
             if rel in batch.edge_types and hasattr(batch[rel], 'edge_attr'):
                 edge_attr_dict[rel] = batch[rel].edge_attr
 
         # 3) Forward through GNN
         out = model(batch.x_dict, batch.edge_index_dict, edge_attr_dict)
-        for ntype,h in out.items():
-            if torch.isnan(h).any() or torch.isinf(h).any():
-                raise RuntimeError(f"[Batch {batch_idx}] NaNs in model output for '{ntype}'")
-
         P = out['patient']    # [N_pat, D]
         C = out['condition']  # [C, D]
         zero = P.sum() * 0.0
 
-        # 4) BUILD & WEIGHTED LINK LOSS (focal loss + optional focus_idx)
+        # 4) Gather true positives in horizon
         t = int(batch.window)
-        # gather true positives for focus_idx (or all if focus_idx is None)
         pos_triples = []
-        for w in range(t + 1, t + 1 + HORIZON):
-            d = w - t
+        for w in range(t+1, t+1+HORIZON):
             for (p, ci) in diag_by_win_train.get(w, []):
                 if focus_idx is None or ci == focus_idx:
-                    pos_triples.append((p, ci, d))
+                    pos_triples.append((p, ci, w - t))
 
-        # map names ? indices and filter breast?male
+        # 5) Map to indices & filter
         flat_names = [n for sub in batch['patient'].name
                       for n in (sub if isinstance(sub, list) else [sub])]
         filtered = []
         for p, ci, d in pos_triples:
             if ci == BREAST_IDX:
-                if p in flat_names and gender_map.get(p, 'female') == 'female':
-                    filtered.append((p, ci, d))
+                if p in flat_names and gender_map.get(p,'female')=='female':
+                    filtered.append((p,ci,d))
             else:
                 if p in flat_names:
-                    filtered.append((p, ci, d))
+                    filtered.append((p,ci,d))
 
         src, dst, dists = [], [], []
         for p, ci, d in filtered:
             idx = flat_names.index(p)
-            src.append(idx);
-            dst.append(ci);
-            dists.append(d)
+            src.append(idx); dst.append(ci); dists.append(d)
 
         if src:
-            # build edge_index for positives
-            pos_ei = torch.stack([
-                torch.tensor(src, device=device),
-                torch.tensor(dst, device=device)
-            ], dim=0)
+            # positives
+            pos_ei = torch.stack([torch.tensor(src, device=device),
+                                   torch.tensor(dst, device=device)], dim=0)
             tte_pos = batch['patient'].duration[pos_ei[0], pos_ei[1]]
             pos_logits = link_head(P, C, pos_ei, tte_pos)
 
-            # 1) how many negatives to mine
-            n_neg = pos_logits.size(0) * NEGATIVE_MULTIPLIER
-
-            # 2) build ALL candidate negatives for this cond
-            all_src = torch.arange(P.size(0), device=device)  # [N_pat]
-            all_dst = torch.full((P.size(0),), focus_idx, device=device)  # [N_pat]
-            all_ei = torch.stack([all_src, all_dst], dim=0)  # [2, N_pat]
-
-            # 3) score them (no grad)
+            # mine negatives
             with torch.no_grad():
+                all_src = torch.arange(P.size(0), device=device)
+                all_dst = torch.full((P.size(0),), focus_idx, device=device)
+                all_ei  = torch.stack([all_src, all_dst], dim=0)
                 tte_all = batch['patient'].duration[all_src, all_dst]
-                all_logits = link_head(P, C, all_ei, tte_all)  # [N_pat]
-
-            # 4) mask out true positives so we only sample negatives
-            #    pos_ei[:,i] gives each positive (src_i, cond_idx)
-            pos_pairs = set((int(i), int(c)) for i, c in zip(pos_ei[0], pos_ei[1]))
-            neg_mask = [(s.item(),) not in pos_pairs for s in all_src]  # bool list length N_pat
-            cand_src = all_src[neg_mask]
+                all_logits = link_head(P, C, all_ei, tte_all)
+            pos_pairs = set((int(i),int(c)) for i,c in zip(pos_ei[0],pos_ei[1]))
+            neg_mask = [(s.item(),) not in pos_pairs for s in all_src]
+            cand_src   = all_src[neg_mask]
             cand_logits = all_logits[neg_mask]
-
-            # 5) pick the top?k hardest negatives
+            n_neg = pos_logits.size(0) * NEGATIVE_MULTIPLIER
             if cand_logits.numel() >= n_neg:
-                topk_vals, topk_idx = cand_logits.topk(n_neg, largest=True)
-                neg_src = cand_src[topk_idx]
+                _, topk = cand_logits.topk(n_neg, largest=True)
+                neg_src = cand_src[topk]
             else:
                 neg_src = cand_src
-
             neg_dst = torch.full_like(neg_src, focus_idx, device=device)
-            neg_ei = torch.stack([neg_src, neg_dst], dim=0)
-
-            # 6) finally score these negatives (with grad)
+            neg_ei  = torch.stack([neg_src, neg_dst], dim=0)
             tte_neg = batch['patient'].duration[neg_ei[0], neg_ei[1]]
             neg_logits = link_head(P, C, neg_ei, tte_neg)
 
-            # 7) combine and apply focal loss
-            # logits_all: [N_pos + N_neg], labels_all: same shape
+            # --- START replacement: per-batch weighted focal + global ranking ---
+            # concatenate
             logits_all = torch.cat([pos_logits, neg_logits], dim=0)
             labels_all = torch.cat([
                 torch.ones_like(pos_logits),
                 torch.zeros_like(neg_logits)
             ], dim=0)
 
-            # 1) focal loss term (hard?example upweighting)
-            focal_loss = binary_focal_loss_with_logits(
-                logits_all,
-                labels_all,
-                alpha=0.9,
-                gamma=4.0,
-                reduction="mean"
+            # pos?weight
+            pos_count = labels_all.sum()
+            neg_count = labels_all.numel() - pos_count
+            pos_weight = torch.clamp(neg_count / (pos_count + 1e-6), max=100.0)
+
+            # focal (?=0.99, ?=2), reduction=none
+            fl = binary_focal_loss_with_logits(
+                logits_all, labels_all,
+                alpha=0.99, gamma=2.0,
+                reduction="none"
             )
+            weights = labels_all * pos_weight + (1.0 - labels_all)
+            focal_loss = (fl * weights).mean()
 
-            # 2) pairwise margin?ranking loss: every positive score should exceed every negative
-            N_pos = pos_logits.size(0)
-            N_neg = neg_logits.size(0)
-            if N_pos > 0 and N_neg > 0:
-                # build two [N_pos, N_neg] matrices
-                pos_mat = pos_logits.unsqueeze(1).expand(-1, N_neg)  # [N_pos, N_neg]
-                neg_mat = neg_logits.unsqueeze(0).expand(N_pos, -1)  # [N_pos, N_neg]
-                # flatten to shape [N_pos*N_neg]
-                pos_flat = pos_mat.reshape(-1)
-                neg_flat = neg_mat.reshape(-1)
-                # target = +1 means pos_flat should be larger than neg_flat
-                target = torch.ones_like(pos_flat, device=pos_flat.device)
-                pairwise_loss = F.margin_ranking_loss(
-                    pos_flat, neg_flat, target,
-                    margin=1.0, reduction="mean"
-                )
+            # global pairwise ranking
+            if pos_count > 0 and neg_count > 0:
+                pl = logits_all[labels_all==1]
+                nl = logits_all[labels_all==0]
+                pairwise_loss = -F.logsigmoid(
+                    pl.unsqueeze(1) - nl.unsqueeze(0)
+                ).mean()
             else:
-                # no pairs ? zero loss
-                pairwise_loss = pos_logits.sum() * 0.0
+                pairwise_loss = torch.tensor(0.0, device=logits_all.device)
 
-            # 3) final link loss = blend of both
-            link_loss = 0.5 * focal_loss + 0.5 * pairwise_loss
+            link_loss = focal_loss + pairwise_loss
+            # --- END replacement ---
         else:
             link_loss = zero.clone()
 
-        # 5) Cox loss (unchanged)
+        # 6) Cox loss
         cox_loss = zero.clone()
-        valid = 0
         if hasattr(batch['patient'],'event') and hasattr(batch['patient'],'duration'):
             ev = batch['patient'].event
             du = batch['patient'].duration
             rs = cox_head(P)
+            valid = 0
             for ci in range(C.size(0)):
                 if ev[:,ci].sum().item()>0:
                     loss_ci = CoxHead.cox_partial_log_likelihood(
@@ -585,9 +553,9 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
                     cox_loss += loss_ci
                     valid += 1
             if valid>0:
-                cox_loss = cox_loss/valid
+                cox_loss = cox_loss / valid
 
-        # 6) Pseudo-label CE (unchanged)
+        # 7) Pseudo?label CE
         node_ps = zero.clone()
         lm = pseudo_label_by_window.get(t,{})
         if lm:
@@ -597,8 +565,8 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
             logits = patient_classifier(P[idxs])
             node_ps = F.cross_entropy(logits, labs)
 
-        # 7) Total & backward
-        total = joint_head(link_loss, cox_loss) + 0.2*node_ps
+        # 8) Backward
+        total = joint_head(link_loss, cox_loss) + 0.2 * node_ps
         total.backward()
         torch.nn.utils.clip_grad_norm_(
             list(model.parameters()) +
@@ -644,7 +612,7 @@ def evaluate(
     all_risk_scores, all_durations, all_events = [], [], []
     num_batches = 0
 
-    BLEND_LINK, BLEND_COX = 0.9, 0.1
+    BLEND_LINK, BLEND_COX = 1.0, 0.0
     num_conditions = cox_head.linear.out_features
     for ci in range(num_conditions):
         per_cond_preds[ci]  = []
@@ -690,17 +658,14 @@ def evaluate(
         dst_all = torch.arange(Nc, device=device).repeat(Np)            # [Np*Nc]
         full_ei = torch.stack([src_all, dst_all], dim=0)               # [2, Np*Nc]
 
-        # 4) compute & blend logits
-        link_logits = link_head(P, C_emb, full_ei)                     # [Np*Nc]
-        risks       = cox_head(P)                                      # [Np, Nc]
-        cox_logits  = risks[src_all, dst_all]                          # [Np*Nc]
-        log_var_link = F.softplus(joint_head.s_link)
-        log_var_cox = F.softplus(joint_head.s_cox)
-        inv_l = torch.exp(-log_var_link)
-        inv_c = torch.exp(-log_var_cox)
-        logits_all = link_logits * inv_l + cox_logits * inv_c
-        # (you can omit the additive 0.5*log_var terms at eval)
-        probs_all   = torch.sigmoid(logits_all)                        # [Np*Nc]
+        # 4) compute & blend logits using the fixed evaluation weights
+        link_logits = link_head(P, C_emb, full_ei)     # [Np*Nc]
+        risks       = cox_head(P)                      # [Np, Nc]
+        cox_logits  = risks[src_all, dst_all]          # [Np*Nc]
+
+        # now blend using the constants you set
+        logits_all = BLEND_LINK * link_logits + BLEND_COX * cox_logits
+        probs_all  = torch.sigmoid(logits_all)         # [Np*Nc]
 
         # save for sliding-window plot
         window_scores.append(probs_all.view(Np, Nc).cpu().numpy())
@@ -757,8 +722,10 @@ def evaluate(
             per_cond_preds [ci].append(probs_all.cpu()[mask_ci])
             per_cond_labels[ci].append(labels_all.cpu()[mask_ci])
 
-        mn, mx = probs_all.min().item(), probs_all.max().item()
-        print(f"[Eval] probs in [{mn:.4f}, {mx:.4f}]")
+        n_pos = int(labels_all.sum().item())
+        n_all = labels_all.numel()
+
+
         # 8) balanced 1:1 BCE link loss
         pos_idx = (labels_all==1).nonzero(as_tuple=True)[0]
         neg_idx = (labels_all==0).nonzero(as_tuple=True)[0]
@@ -923,12 +890,22 @@ def main():
     diag_by_win_train = build_diag_by_win(full_diag_map, train_graphs)
     diag_by_win_val = build_diag_by_win(full_diag_map, val_graphs)
     diag_by_win_test = build_diag_by_win(full_diag_map, test_graphs)
-    pos_patients = {
-        p
-        for win, pairs in diag_by_win_val.items()
-        for (p, c) in pairs
-        if c == plot_idx
-    }
+    # --- condition?specific positive counts per window ---
+    cond = focus_idx   # e.g. 3 for diabetes
+    train_pos_counts = []
+    for wi, g in enumerate(train_graphs):
+        if ('patient','has','condition') in g.edge_types:
+            ei = g['patient','has','condition'].edge_index
+            # count only those edges where the condition == cond
+            count_cond = (ei[1] == cond).sum().item()
+        else:
+            count_cond = 0
+        train_pos_counts.append(count_cond)
+
+    # now build sample weights: every window gets at least weight=1,
+    # windows with positives get boosted by (1 + cnt)^gamma
+    gamma = 0.5   # you can tune (0.0 = uniform sampling, 1.0 = linear to count)
+    sample_weights = [(1 + cnt)**gamma for cnt in train_pos_counts]
     # 2) Compute global pos weight
     total_pos = sum(
         g[('patient', 'has', 'condition')].edge_index.size(1)
@@ -943,7 +920,12 @@ def main():
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     # 4) DataLoaders
-    train_loader = DataLoader(train_graphs, batch_size=1, shuffle=True, num_workers=4)
+    train_sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,    # so that high?weight windows can appear multiple times
+    )
+    train_loader = DataLoader(train_graphs, batch_size=1,sampler=train_sampler, num_workers=4)
     val_loader = DataLoader(val_graphs, batch_size=1, num_workers=4)
     test_loader = DataLoader(test_graphs, batch_size=1, num_workers=4)
 
