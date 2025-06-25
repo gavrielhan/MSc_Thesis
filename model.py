@@ -164,20 +164,28 @@ class HeteroGAT(nn.Module):
             ew[rel_rev] = w.flip(0)
 
         # 3) conv1 + fallback + ReLU
-        x1 = self.convs1(x0, edge_index_dict, edge_attr_dict=ew)
+        x1_raw = self.convs1(x0, edge_index_dict, edge_attr_dict=ew)
+        x1 = {}
         for n in self.metadata[0]:
-            if n not in x1 or x1[n] is None:
-                x1[n] = x0[n]
+            h_in = x0[n]
+            h = x1_raw.get(n)
+            if h is None:
+                x1[n] = h_in
+
             else:
-                x1[n] = F.relu(x1[n])
+                x1[n] = F.relu(h + h_in)
 
         # 4) conv2 + fallback + ReLU
-        x2 = self.convs2(x1, edge_index_dict, edge_attr_dict=ew)
+        x2_raw = self.convs2(x1, edge_index_dict, edge_attr_dict=ew)
+        x2 = {}
         for n in self.metadata[0]:
-            if n not in x2 or x2[n] is None:
-                x2[n] = x1[n]
+            h_in = x1[n]
+            h = x2_raw.get(n)
+            if h is None:
+                x2[n] = h_in
+
             else:
-                x2[n] = F.relu(x2[n])
+                x2[n] = F.relu(h + h_in)
 
         # 5) conv3 + fallback + ReLU
         x3 = self.convs3(x2, edge_index_dict, edge_attr_dict=ew)
@@ -426,6 +434,7 @@ def build_diag_by_win(full_map, graphs):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NEGATIVE_MULTIPLIER = 6  # you can adjust this multiplier later
 PAIRWISE_TAU = 5.0       # scale for time-weighted ranking loss
+SMOTE_MULTIPLIER = 2.0   # oversample positives beyond negatives
 HORIZON = 10   # how many graphs ahead to predict over
 
 
@@ -525,38 +534,41 @@ def train(model, link_head, cox_head, patient_classifier,loader, optimizer, devi
             # ----- SMOTE oversampling of positive patients -----
             n_pos = pos_ei.size(1)
             n_neg = neg_ei.size(1)
-            if n_pos > 0 and n_pos < n_neg:
-                n_extra = n_neg - n_pos
-                synth_pat = simple_smote(P[pos_ei[0]], n_extra)
-                P_ext = torch.cat([P, synth_pat], dim=0)
-                synth_idx = torch.arange(P.size(0), P_ext.size(0), device=device)
-                synth_ei = torch.stack([
-                    synth_idx,
-                    torch.full((n_extra,), focus_idx, device=device)
-                ], dim=0)
-                tte_extra = tte_pos[torch.randint(0, tte_pos.numel(), (n_extra,), device=device)]
-
-                pos_logits_ext = link_head(P_ext, C, synth_ei, tte_extra)
-                pos_logits = link_head(P_ext, C, pos_ei, tte_pos)
-                neg_logits = link_head(P_ext, C, neg_ei, tte_neg)
-
-                all_pos_logits = torch.cat([pos_logits, pos_logits_ext], dim=0)
-                logits_all = torch.cat([all_pos_logits, neg_logits], dim=0)
-
-                labels_all = torch.cat([
-                    torch.ones_like(pos_logits),
-                    torch.ones_like(pos_logits_ext),
-                    torch.zeros_like(neg_logits)
-                ], dim=0)
-
-                tte_pos_full = torch.cat([tte_pos, tte_extra], dim=0)
-            else:
-                logits_all = torch.cat([pos_logits, neg_logits], dim=0)
-                labels_all = torch.cat([
-                    torch.ones_like(pos_logits),
-                    torch.zeros_like(neg_logits)
-                ], dim=0)
+            if n_pos > 0:
+                target_pos = int(n_neg * SMOTE_MULTIPLIER)
                 tte_pos_full = tte_pos
+                if n_pos < target_pos:
+                    n_extra = target_pos - n_pos
+                    synth_pat = simple_smote(P[pos_ei[0]], n_extra)
+                    P_ext = torch.cat([P, synth_pat], dim=0)
+                    synth_idx = torch.arange(P.size(0), P_ext.size(0), device=device)
+                    synth_ei = torch.stack([
+                        synth_idx,
+                        torch.full((n_extra,), focus_idx, device=device)
+                    ], dim=0)
+                    tte_extra = tte_pos[torch.randint(0, tte_pos.numel(), (n_extra,), device=device)]
+
+                    pos_logits_ext = link_head(P_ext, C, synth_ei, tte_extra)
+                    pos_logits = link_head(P_ext, C, pos_ei, tte_pos)
+                    neg_logits = link_head(P_ext, C, neg_ei, tte_neg)
+
+                    all_pos_logits = torch.cat([pos_logits, pos_logits_ext], dim=0)
+                    logits_all = torch.cat([all_pos_logits, neg_logits], dim=0)
+
+                    labels_all = torch.cat([
+                        torch.ones_like(pos_logits),
+                        torch.ones_like(pos_logits_ext),
+                        torch.zeros_like(neg_logits)
+                    ], dim=0)
+
+                    tte_pos_full = torch.cat([tte_pos, tte_extra], dim=0)
+                else:
+                    logits_all = torch.cat([pos_logits, neg_logits], dim=0)
+                    labels_all = torch.cat([
+                        torch.ones_like(pos_logits),
+                        torch.zeros_like(neg_logits)
+                    ], dim=0)
+                    tte_pos_full = tte_pos
 
             # pos-weight
             pos_count = labels_all.sum()
@@ -645,6 +657,7 @@ def evaluate(
     model,
     link_head,
     cox_head,
+    joint_head,
     patient_classifier,       # unused here but kept for signature
     loader,
     device,
@@ -656,6 +669,7 @@ def evaluate(
     model.eval()
     link_head.eval()
     cox_head.eval()
+    joint_head.eval()
 
     # Accumulators
     total_link_loss = 0.0
@@ -666,7 +680,12 @@ def evaluate(
     all_risk_scores, all_durations, all_events = [], [], []
     num_batches = 0
 
-    BLEND_LINK, BLEND_COX = 1.0, 0.0
+    with torch.no_grad():
+        w_link = torch.exp(-F.softplus(joint_head.s_link)).item()
+        w_cox  = torch.exp(-F.softplus(joint_head.s_cox)).item()
+    norm = w_link + w_cox + 1e-8
+    BLEND_LINK = w_link / norm
+    BLEND_COX  = w_cox  / norm
     num_conditions = cox_head.linear.out_features
     for ci in range(num_conditions):
         per_cond_preds[ci]  = []
@@ -995,7 +1014,7 @@ def main():
     # 6) Training loop
     history = []
     EPOCHS =200
-    pseudo_eps = 0.90
+    pseudo_eps = 0.80
     max_pr_auc = 0.5
     WARMUP_EPOCHS = 8
 
@@ -1076,7 +1095,7 @@ def main():
 
         # f) validation
         val_metrics = evaluate(
-            model, link_head, cox_head, patient_classifier,
+            model, link_head, cox_head, joint_head, patient_classifier,
             val_loader, device,
             NEGATIVE_MULTIPLIER, diag_by_win_val,
             train_cond_embeds, plot_idx = plot_idx
