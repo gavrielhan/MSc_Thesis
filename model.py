@@ -28,6 +28,7 @@ from LabData.DataLoaders.BodyMeasuresLoader import BodyMeasuresLoader
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import WeightedRandomSampler
+import math
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE_DIR)
@@ -61,6 +62,27 @@ def binary_focal_loss_with_logits(
         return fl.mean()
     return fl
 
+def simple_smote(X: torch.Tensor, n_samples: int, k: int = 5) -> torch.Tensor:
+    """Minimal SMOTE implementation for tensors."""
+    N, D = X.size()
+    if n_samples <= 0 or N == 0:
+        return torch.empty((0, D), device=X.device)
+    if N == 1:
+        return X[0].unsqueeze(0).repeat(n_samples, 1)
+
+    k = min(k, N - 1)
+    if k == 0:
+        idx = torch.randint(0, N, (n_samples,), device=X.device)
+        return X[idx]
+
+    dist = torch.cdist(X, X)
+    nn_idx = dist.topk(k + 1, largest=False).indices[:, 1:]
+
+    idx = torch.randint(0, N, (n_samples,), device=X.device)
+    idx_nn = nn_idx[idx, torch.randint(0, k, (n_samples,), device=X.device)]
+    lam = torch.rand(n_samples, 1, device=X.device)
+    synth = X[idx] + lam * (X[idx_nn] - X[idx])
+    return synth
 class HeteroGAT(nn.Module):
     def __init__(
         self,
@@ -403,7 +425,7 @@ def build_diag_by_win(full_map, graphs):
     return m
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 5  # you can adjust this multiplier later
+NEGATIVE_MULTIPLIER = 10  # you can adjust this multiplier later
 HORIZON = 10   # how many graphs ahead to predict over
 
 
@@ -499,15 +521,36 @@ def train(model, link_head, cox_head, patient_classifier,loader, optimizer, devi
             tte_neg = batch['patient'].duration[neg_ei[0], neg_ei[1]]
             neg_logits = link_head(P, C, neg_ei, tte_neg)
 
-            # --- START replacement: per-batch weighted focal + global ranking ---
-            # concatenate
-            logits_all = torch.cat([pos_logits, neg_logits], dim=0)
-            labels_all = torch.cat([
-                torch.ones_like(pos_logits),
-                torch.zeros_like(neg_logits)
-            ], dim=0)
-
-            # pos?weight
+            # ----- SMOTE oversampling of positive patients -----
+            n_pos = pos_ei.size(1)
+            n_neg = neg_ei.size(1)
+            if n_pos > 0 and n_pos < n_neg:
+                n_extra = n_neg - n_pos
+                synth_pat = simple_smote(P[pos_ei[0]], n_extra)
+                P_ext = torch.cat([P, synth_pat], dim=0)
+                synth_idx = torch.arange(P.size(0), P_ext.size(0), device=device)
+                synth_ei = torch.stack([
+                    synth_idx,
+                    torch.full((n_extra,), focus_idx, device=device)
+                ], dim=0)
+                tte_extra = tte_pos.mean().repeat(n_extra)
+                pos_logits_ext = link_head(P_ext, C, synth_ei, tte_extra)
+                pos_logits = link_head(P_ext, C, pos_ei, tte_pos)
+                neg_logits = link_head(P_ext, C, neg_ei, tte_neg)
+                all_pos_logits = torch.cat([pos_logits, pos_logits_ext], dim=0)
+                labels_all = torch.cat([
+                    torch.ones_like(pos_logits),
+                    torch.ones_like(pos_logits_ext),
+                    torch.zeros_like(neg_logits)
+                ], dim=0)
+                logits_all = torch.cat([all_pos_logits, neg_logits], dim=0)
+            else:
+                logits_all = torch.cat([pos_logits, neg_logits], dim=0)
+                labels_all = torch.cat([
+                    torch.ones_like(pos_logits),
+                    torch.zeros_like(neg_logits)
+                ], dim=0)
+            # pos-weight
             pos_count = labels_all.sum()
             neg_count = labels_all.numel() - pos_count
             pos_weight = torch.clamp(neg_count / (pos_count + 1e-6), max=100.0)
@@ -515,7 +558,7 @@ def train(model, link_head, cox_head, patient_classifier,loader, optimizer, devi
             # focal (?=0.99, ?=2), reduction=none
             fl = binary_focal_loss_with_logits(
                 logits_all, labels_all,
-                alpha=0.99, gamma=2.0,
+                alpha=0.95, gamma=2.5,
                 reduction="none"
             )
             weights = labels_all * pos_weight + (1.0 - labels_all)
@@ -805,7 +848,12 @@ def evaluate(
     valid  = [c for c in c_idxs if c is not None]
     if valid:
         mean_c = sum(valid)/len(valid)
-
+    calibrators = None
+    if all_risk_scores:
+        R_np = torch.cat(all_risk_scores).numpy()
+        D_np = torch.cat(all_durations).numpy()
+        E_np = torch.cat(all_events).numpy()
+        calibrators = fit_absolute_risk_calibrator(R_np, D_np, E_np)
     return (
         avg_link,    # balanced BCE link loss
         avg_cox,     # Cox loss
@@ -817,6 +865,7 @@ def evaluate(
         pr_auc,
         pr_per_cond,
         window_scores,
+        calibrators,
     )
 
 
@@ -841,13 +890,13 @@ model = HeteroGAT(
     in_dims=in_dims,
     hidden_dim=256,
     out_dim =128,
-    dropout = 0.4,
+    dropout = 0.5,
     num_heads = 8
 ).to(device)
 
 #link_head = LinkMLPPredictor(input_dim=128).to(device)
 #link_head = CosineLinkPredictor(input_dim=128, init_scale=10.0, use_bias=True).to(device)
-link_head = TimeAwareCosineLinkPredictor(init_scale = 10.0 , use_bias = True).to(device)
+link_head = TimeAwareCosineLinkPredictor(init_scale = 15.0 , use_bias = True).to(device)
 cox_head = CoxHead(input_dim=128, num_conditions=7).to(device)
 
 USE_PSEUDO = True
@@ -904,7 +953,7 @@ def main():
 
     # now build sample weights: every window gets at least weight=1,
     # windows with positives get boosted by (1 + cnt)^gamma
-    gamma = 0.5   # you can tune (0.0 = uniform sampling, 1.0 = linear to count)
+    gamma = 0.75   # you can tune (0.0 = uniform sampling, 1.0 = linear to count)
     sample_weights = [(1 + cnt)**gamma for cnt in train_pos_counts]
     # 2) Compute global pos weight
     total_pos = sum(
@@ -1021,7 +1070,12 @@ def main():
             NEGATIVE_MULTIPLIER, diag_by_win_val,
             train_cond_embeds, plot_idx = plot_idx
         )
-        avg_link, avg_cox, avg_node_ce, node_acc, cidx_list, mean_cidx, link_auc, pr_auc, pr_per_cond, val_scores = val_metrics
+        (
+            avg_link, avg_cox, avg_node_ce, node_acc,
+            cidx_list, mean_cidx, link_auc,
+            pr_auc, pr_per_cond, val_scores,
+            calibrators,
+        ) = val_metrics
 
         scheduler.step(pr_per_cond[plot_idx])
 
@@ -1037,6 +1091,7 @@ def main():
             "val_link_auc": link_auc,
             "val_pr_auc": pr_auc,
             "val_pr_per_cond": pr_per_cond,
+            "calibrators": bool(calibrators is not None),
             "timestamp": datetime.datetime.now().isoformat(),
         })
         print(f"[Epoch {epoch}] Train {train_loss:.4f} | ValLink {avg_link:.4f} "
