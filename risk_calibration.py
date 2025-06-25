@@ -18,12 +18,24 @@ def fit_absolute_risk_calibrator(risk_scores, durations, events, times=[30, 90, 
         df = pd.DataFrame({
             'duration': durations[:, ci],
             'event': events[:, ci],
-            'risk': risk_scores[:, ci]
+            'risk': risk_scores[:, ci],
         })
 
-        cph = CoxPHFitter()
+        # Standardise risk to avoid near-zero variance which harms Cox fitting
+        mu = df['risk'].mean()
+        sigma = df['risk'].std()
+        if sigma < 1e-6:
+            sigma = 1.0  # avoid division by zero and keep some variance
+        df['risk_z'] = (df['risk'] - mu) / sigma
+
+        cph = CoxPHFitter(penalizer=0.1)
         try:
-            cph.fit(df, duration_col="duration", event_col="event", formula="risk")
+            cph.fit(
+                df[['duration', 'event', 'risk_z']],
+                duration_col="duration",
+                event_col="event",
+                formula="risk_z",
+            )
         except Exception as e:
             print(f"Skipping condition {ci} due to error: {e}")
             calibrators.append((None, None, {}))
