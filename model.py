@@ -8,7 +8,6 @@ import seaborn as sns
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
-import math
 from torch_geometric.nn import GATConv, HeteroConv, GCNConv
 from torch_geometric.nn import Linear
 from torch.nn import Module, ModuleDict
@@ -425,7 +424,8 @@ def build_diag_by_win(full_map, graphs):
     return m
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 10  # you can adjust this multiplier later
+NEGATIVE_MULTIPLIER = 6  # you can adjust this multiplier later
+PAIRWISE_TAU = 5.0       # scale for time-weighted ranking loss
 HORIZON = 10   # how many graphs ahead to predict over
 
 
@@ -506,8 +506,9 @@ def train(model, link_head, cox_head, patient_classifier,loader, optimizer, devi
                 all_ei  = torch.stack([all_src, all_dst], dim=0)
                 tte_all = batch['patient'].duration[all_src, all_dst]
                 all_logits = link_head(P, C, all_ei, tte_all)
-            pos_pairs = set((int(i),int(c)) for i,c in zip(pos_ei[0],pos_ei[1]))
-            neg_mask = [(s.item(),) not in pos_pairs for s in all_src]
+            pos_pairs = set((int(i), int(c)) for i, c in zip(pos_ei[0], pos_ei[1]))
+            # exclude already-positive (patient, condition) pairs
+            neg_mask = [(s.item(), focus_idx) not in pos_pairs for s in all_src]
             cand_src   = all_src[neg_mask]
             cand_logits = all_logits[neg_mask]
             n_neg = pos_logits.size(0) * NEGATIVE_MULTIPLIER
@@ -533,23 +534,30 @@ def train(model, link_head, cox_head, patient_classifier,loader, optimizer, devi
                     synth_idx,
                     torch.full((n_extra,), focus_idx, device=device)
                 ], dim=0)
-                tte_extra = tte_pos.mean().repeat(n_extra)
+                tte_extra = tte_pos[torch.randint(0, tte_pos.numel(), (n_extra,), device=device)]
+
                 pos_logits_ext = link_head(P_ext, C, synth_ei, tte_extra)
                 pos_logits = link_head(P_ext, C, pos_ei, tte_pos)
                 neg_logits = link_head(P_ext, C, neg_ei, tte_neg)
+
                 all_pos_logits = torch.cat([pos_logits, pos_logits_ext], dim=0)
+                logits_all = torch.cat([all_pos_logits, neg_logits], dim=0)
+
                 labels_all = torch.cat([
                     torch.ones_like(pos_logits),
                     torch.ones_like(pos_logits_ext),
                     torch.zeros_like(neg_logits)
                 ], dim=0)
-                logits_all = torch.cat([all_pos_logits, neg_logits], dim=0)
+
+                tte_pos_full = torch.cat([tte_pos, tte_extra], dim=0)
             else:
                 logits_all = torch.cat([pos_logits, neg_logits], dim=0)
                 labels_all = torch.cat([
                     torch.ones_like(pos_logits),
                     torch.zeros_like(neg_logits)
                 ], dim=0)
+                tte_pos_full = tte_pos
+
             # pos-weight
             pos_count = labels_all.sum()
             neg_count = labels_all.numel() - pos_count
@@ -564,13 +572,16 @@ def train(model, link_head, cox_head, patient_classifier,loader, optimizer, devi
             weights = labels_all * pos_weight + (1.0 - labels_all)
             focal_loss = (fl * weights).mean()
 
-            # global pairwise ranking
+            # global pairwise ranking with time weighting
             if pos_count > 0 and neg_count > 0:
-                pl = logits_all[labels_all==1]
-                nl = logits_all[labels_all==0]
-                pairwise_loss = -F.logsigmoid(
+                pl = logits_all[labels_all == 1]
+                nl = logits_all[labels_all == 0]
+                tp = tte_pos_full.unsqueeze(1)
+                tn = tte_neg.unsqueeze(0)
+                weights_pw = torch.exp(-torch.abs(tn - tp) / PAIRWISE_TAU)
+                pairwise_loss = -(weights_pw * F.logsigmoid(
                     pl.unsqueeze(1) - nl.unsqueeze(0)
-                ).mean()
+                )).mean()
             else:
                 pairwise_loss = torch.tensor(0.0, device=logits_all.device)
 
@@ -896,7 +907,7 @@ model = HeteroGAT(
 
 #link_head = LinkMLPPredictor(input_dim=128).to(device)
 #link_head = CosineLinkPredictor(input_dim=128, init_scale=10.0, use_bias=True).to(device)
-link_head = TimeAwareCosineLinkPredictor(init_scale = 15.0 , use_bias = True).to(device)
+link_head = TimeAwareCosineLinkPredictor(init_scale = 5.0 , use_bias = True).to(device)
 cox_head = CoxHead(input_dim=128, num_conditions=7).to(device)
 
 USE_PSEUDO = True
@@ -953,7 +964,7 @@ def main():
 
     # now build sample weights: every window gets at least weight=1,
     # windows with positives get boosted by (1 + cnt)^gamma
-    gamma = 0.75   # you can tune (0.0 = uniform sampling, 1.0 = linear to count)
+    gamma = 0.4   # you can tune (0.0 = uniform sampling, 1.0 = linear to count)
     sample_weights = [(1 + cnt)**gamma for cnt in train_pos_counts]
     # 2) Compute global pos weight
     total_pos = sum(
@@ -974,9 +985,9 @@ def main():
         num_samples=len(sample_weights),
         replacement=True,    # so that high?weight windows can appear multiple times
     )
-    train_loader = DataLoader(train_graphs, batch_size=1,sampler=train_sampler, num_workers=4)
-    val_loader = DataLoader(val_graphs, batch_size=1, num_workers=4)
-    test_loader = DataLoader(test_graphs, batch_size=1, num_workers=4)
+    train_loader = DataLoader(train_graphs, batch_size=1,sampler=train_sampler, num_workers=0)
+    val_loader = DataLoader(val_graphs, batch_size=1, num_workers=0)
+    test_loader = DataLoader(test_graphs, batch_size=1, num_workers=0)
 
     # 5) Prepare a placeholder for pseudo?labels
     pseudo_label_by_window = {wi: {} for wi in range(len(train_graphs))}
@@ -986,7 +997,7 @@ def main():
     EPOCHS =200
     pseudo_eps = 0.90
     max_pr_auc = 0.5
-    WARMUP_EPOCHS = 5
+    WARMUP_EPOCHS = 8
 
     for epoch in range(1, EPOCHS + 1):
         #  warm-up phase
