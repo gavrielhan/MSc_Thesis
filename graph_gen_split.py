@@ -96,6 +96,14 @@ sleep_df   = sleep_df.loc[sleep_df.index.isin(valid_patients)]
 grouped = df_cgm.groupby(["RegistrationCode","Date"])["GlucoseValue"].apply(lambda x: x.values)
 cgm_dict = grouped.to_dict()
 
+# Build a per-patient queue of all available CGM dates:
+from collections import defaultdict
+pending_signals = defaultdict(list)
+for (p, day) in cgm_dict.keys():
+    pending_signals[p].append(day)
+for p in pending_signals:
+    pending_signals[p].sort()
+
 # index follow-ups
 emb_follow["Date"] = pd.to_datetime(emb_follow["Date"]).dt.date
 follow_dict = dict(tuple(emb_follow.groupby("RegistrationCode")))
@@ -223,30 +231,47 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
     het["patient"].event    = torch.tensor(ev, dtype=torch.long)
     het["patient"].duration = torch.tensor(du, dtype=torch.float)
 
-    # ? patient ? signature (and reverse) with your precomputed weights ?
+    # --- patient ? signature, but only one 'signal' per patient per window ---
     eidx, wts = [], []
     for pi, p in enumerate(names):
-        for day in pd.date_range(wstart, wend).date:
-            sig = cgm_dict.get((p, day))
-            if sig is None: continue
-            v   = align_and_rescale(sig)
-            kws = compute_weights(nmf_signatures, v)
-            for si, ww in enumerate(kws):
-                if ww > NEGATIVE_THRESHOLD:
-                    eidx.append([pi, si])
-                    wts.append(ww)
+        # find the first pending signal date within this window
+        days = [d for d in pending_signals[p] if wstart <= d <= wend]
+        if not days:
+            continue
+        day = days[0]
+        # consume it (push any extras to later windows)
+        pending_signals[p].remove(day)
+
+        # compute the NMF weights for that single day
+        sig = cgm_dict[(p, day)]
+        v = align_and_rescale(sig)
+        kws = compute_weights(nmf_signatures, v)
+        for si, ww in enumerate(kws):
+            if ww > NEGATIVE_THRESHOLD:
+                eidx.append([pi, si])
+                wts.append(ww)
 
     if eidx:
-        sig_ei = torch.tensor(eidx).T                     # [2, E_sig]
-        sig_w  = torch.tensor(wts, dtype=torch.float).view(-1,1)  # [E_sig,1]
+        sig_ei = torch.tensor(eidx).T  # [2, E]
+        wts = torch.tensor(wts, dtype=torch.float)
+        # normalize so each patient's sum = 1
+        # note: since eidx groups many patients together,
+        # we need to divide each wts[e] by the sum of its patient?block
+        # here?s a quick way:
+        patient_idxs = sig_ei[0].tolist()
+        sums = defaultdict(float)
+        for e, pi in enumerate(patient_idxs):
+            sums[pi] += wts[e].item()
+        norm_wts = [wts[e] / (sums[pi] + 1e-9) for e, pi in enumerate(patient_idxs)]
+        sig_w = torch.stack(norm_wts).view(-1, 1)  # [E,1]
 
-        het["patient","to","signature"].edge_index = sig_ei
-        het["patient","to","signature"].edge_attr  = sig_w
+        het["patient", "to", "signature"].edge_index = sig_ei
+        het["patient", "to", "signature"].edge_attr = sig_w
 
-        # mirror ? signature ? patient
+        # mirror it on the reverse edge:
         rev_sig_ei = sig_ei.flip(0)
-        het["signature","to_rev","patient"].edge_index = rev_sig_ei
-        het["signature","to_rev","patient"].edge_attr  = sig_w
+        het["signature", "to_rev", "patient"].edge_index = rev_sig_ei
+        het["signature", "to_rev", "patient"].edge_attr = sig_w
 
     # ? patient ? condition (only in training) and its reverse ?
     if do_train and wi in diag_by_win:
