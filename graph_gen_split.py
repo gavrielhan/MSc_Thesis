@@ -17,8 +17,40 @@ from LabData.DataLoaders.BodyMeasuresLoader import BodyMeasuresLoader
 study_ids = [10,1001,1002]
 bm = BodyMeasuresLoader().get_data(study_ids=study_ids, groupby_reg='first')
 df_meta = bm.df.join(bm.df_metadata)
-df_meta = df_meta.reset_index().rename(columns={'index':'RegistrationCode'})
-age_gender = df_meta[['RegistrationCode','age','yob']].dropna(subset=['age','yob'])
+df_meta = df_meta.reset_index().rename(columns={'index': 'RegistrationCode'})
+
+# demographic columns
+sex_col = next((c for c in df_meta.columns if 'sex' in c.lower() or 'gender' in c.lower()), None)
+bmi_col = next((c for c in df_meta.columns if 'bmi' in c.lower()), None)
+
+# drop patients with missing sex information
+if sex_col:
+    n_missing_sex = df_meta[sex_col].isna().sum()
+    if n_missing_sex:
+        print(f"Excluding {n_missing_sex} patients due to missing sex")
+    df_meta = df_meta.dropna(subset=[sex_col])
+    sex_map = (
+        df_meta.set_index('RegistrationCode')[sex_col]
+        .astype('category')
+        .cat.codes
+        .to_dict()
+    )
+else:
+    sex_map = {}
+
+# bmi: fill missing with median and report how many were imputed
+if bmi_col:
+    bmi_series = df_meta.set_index('RegistrationCode')[bmi_col].astype(float)
+    bmi_median = bmi_series.median(skipna=True)
+    n_infer = bmi_series.isna().sum()
+    if n_infer:
+        print(f"Inferred BMI for {n_infer} patients using median {bmi_median:.2f}")
+    bmi_series = bmi_series.fillna(bmi_median)
+    bmi_map = bmi_series.to_dict()
+else:
+    bmi_map = {}
+
+age_gender = df_meta[['RegistrationCode', 'age', 'yob']].dropna(subset=['age', 'yob'])
 yob_map = dict(zip(age_gender['RegistrationCode'], age_gender['yob']))
 
 # ========== CONFIG ==========
@@ -29,6 +61,9 @@ DIAG_JSON_PATH = "diagnosis_mapping.json"
 OUTPUT_DIR = "split"
 random.seed(42)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# toggle demographic vs. precomputed patient embeddings
+age_sex_bmi = True
 
 # ========== UTILS ==========
 def start_pulse_timer(message="running", delay=1800, interval=1800):
@@ -72,25 +107,45 @@ df_cgm["Date"] = pd.to_datetime(df_cgm["Date"]).dt.date
 nmf_signatures = np.load("nmf_cgm_signatures.npy")
 num_signatures = nmf_signatures.shape[0]
 
-# embeddings
-emb_base = pd.read_csv("filtered_patient_embeddings.csv")
-emb_follow= pd.read_csv("followup_filtered_patient_embeddings.csv")
-sleep_df  = (pd.read_csv("filtered_sleep_embeddings.csv")
-               .set_index("RegistrationCode")
-               .groupby("RegistrationCode").mean())
-avg_sleep = sleep_df.mean(axis=0).values
+if age_sex_bmi:
+    # only sleep embeddings are loaded; demographics will be derived later
+    sleep_df = (
+        pd.read_csv("filtered_sleep_embeddings.csv")
+          .set_index("RegistrationCode")
+          .groupby("RegistrationCode").mean()
+    )
+    avg_sleep = sleep_df.mean(axis=0).values
+    patient_dim = 128
+else:
+    # precomputed patient embeddings
+    emb_base = pd.read_csv("filtered_patient_embeddings.csv")
+    emb_follow = pd.read_csv("followup_filtered_patient_embeddings.csv")
+    sleep_df = (
+        pd.read_csv("filtered_sleep_embeddings.csv")
+          .set_index("RegistrationCode")
+          .groupby("RegistrationCode").mean()
+    )
+    avg_sleep = sleep_df.mean(axis=0).values
+    patient_dim = len([c for c in emb_base.columns if c.startswith("emb_")])
+sleep_dim = sleep_df.shape[1]
 
 # valid patients intersection
-p_cgm  = df_cgm["RegistrationCode"].unique()
-p_base = emb_base["RegistrationCode"].unique()
-valid_patients = np.intersect1d(p_cgm, p_base)
+p_cgm = df_cgm["RegistrationCode"].unique()
+if age_sex_bmi:
+    p_src = df_meta["RegistrationCode"].unique()
+else:
+    p_src = emb_base["RegistrationCode"].unique()
+valid_patients = np.intersect1d(p_cgm, p_src)
 
 # filter down
 df_fb = df_fb[df_fb["RegistrationCode"].isin(valid_patients)]
 df_cgm = df_cgm[df_cgm["RegistrationCode"].isin(valid_patients)]
-emb_base   = emb_base[emb_base["RegistrationCode"].isin(valid_patients)]
-emb_follow = emb_follow[emb_follow["RegistrationCode"].isin(valid_patients)]
-sleep_df   = sleep_df.loc[sleep_df.index.isin(valid_patients)]
+sleep_df = sleep_df.loc[sleep_df.index.isin(valid_patients)]
+if age_sex_bmi:
+    df_meta = df_meta[df_meta["RegistrationCode"].isin(valid_patients)]
+else:
+    emb_base   = emb_base[emb_base["RegistrationCode"].isin(valid_patients)]
+    emb_follow = emb_follow[emb_follow["RegistrationCode"].isin(valid_patients)]
 
 # group CGM by (patient, date)
 grouped = df_cgm.groupby(["RegistrationCode","Date"])["GlucoseValue"].apply(lambda x: x.values)
@@ -104,10 +159,10 @@ for (p, day) in cgm_dict.keys():
 for p in pending_signals:
     pending_signals[p].sort()
 
-# index follow-ups
-emb_follow["Date"] = pd.to_datetime(emb_follow["Date"]).dt.date
-follow_dict = dict(tuple(emb_follow.groupby("RegistrationCode")))
-base_idx    = emb_base.set_index("RegistrationCode")
+if not age_sex_bmi:
+    emb_follow["Date"] = pd.to_datetime(emb_follow["Date"]).dt.date
+    follow_dict = dict(tuple(emb_follow.groupby("RegistrationCode")))
+    base_idx = emb_base.set_index("RegistrationCode")
 
 # chosen conditions
 chosen = ["Essential hypertension", "Other specified conditions associated with the spine (intervertebral disc displacement)",
@@ -196,19 +251,32 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
     # patient features + name list
     feats, names = [], []
     for p in patients:
-        dfp = follow_dict.get(p)
-        if dfp is not None:
-            dfp = dfp[dfp["Date"] <= wend]
-        if dfp is not None and not dfp.empty:
-            emb = dfp.sort_values("Date").filter(like="emb_").values[-1]
+        if age_sex_bmi:
+            age = wend.year - int(yob_map.get(p, wend.year))
+            sex = sex_map.get(p, 0)
+            bmi = bmi_map.get(p, 0.0)
+
+            demo = np.array([age, sex, bmi], dtype=float)
+            demo = np.nan_to_num(demo, nan=0.0, posinf=0.0, neginf=0.0)
+            x_old = np.linspace(0, 1, len(demo))
+            x_new = np.linspace(0, 1, 128)
+            emb = np.interp(x_new, x_old, demo)
+            emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
         else:
-            emb = base_idx.loc[p].filter(like="emb_").values
+            dfp = follow_dict.get(p)
+            if dfp is not None:
+                dfp = dfp[dfp["Date"] <= wend]
+            if dfp is not None and not dfp.empty:
+                emb = dfp.sort_values("Date").filter(like="emb_").values[-1]
+            else:
+                emb = base_idx.loc[p].filter(like="emb_").values
+
         sleep = sleep_df.loc[p].values if p in sleep_df.index else avg_sleep
 
         feats.append(torch.from_numpy(np.concatenate([emb, sleep])).float())
         names.append(p)
 
-    het["patient"].x    = torch.stack(feats) if feats else torch.empty((0,138))
+    het["patient"].x    = torch.stack(feats) if feats else torch.empty((0, patient_dim + sleep_dim))
     het["patient"].name = names
 
     # event/duration for Cox
