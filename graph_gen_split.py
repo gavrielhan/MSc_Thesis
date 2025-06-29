@@ -72,6 +72,7 @@ df_cgm["Date"] = pd.to_datetime(df_cgm["Date"]).dt.date
 nmf_signatures = np.load("nmf_cgm_signatures.npy")
 num_signatures = nmf_signatures.shape[0]
 
+
 # embeddings
 emb_base = pd.read_csv("filtered_patient_embeddings.csv")
 emb_follow= pd.read_csv("followup_filtered_patient_embeddings.csv")
