@@ -1224,7 +1224,7 @@ def main():
     plot_link_prediction_curves(
         link_scores=test_scores,
         diag_windows=true_windows,
-        disease_name=chosen[3],
+        disease_name=chosen[focus_idx],
         save_path="outputs/diabetes_curves.png"
     )
 
