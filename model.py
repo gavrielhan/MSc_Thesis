@@ -82,126 +82,111 @@ def simple_smote(X: torch.Tensor, n_samples: int, k: int = 5) -> torch.Tensor:
     lam = torch.rand(n_samples, 1, device=X.device)
     synth = X[idx] + lam * (X[idx_nn] - X[idx])
     return synth
+
+
 class HeteroGAT(nn.Module):
     def __init__(
         self,
         metadata,
         in_dims,
-        hidden_dim: int = 128,
-        out_dim:   int = 128,
-        num_heads: int = 4,
-        dropout:   float = 0.3
+        hidden_dim: int = 64,
+        out_dim:   int = 64,
+        num_heads: int = 2,
+        dropout:   float = 0.5
     ):
         super().__init__()
         self.metadata = metadata  # (node_types, edge_types)
+        self.hidden_dim = hidden_dim
 
-        # Input projections for each node type
+        # 1) input projections
         self.input_proj = nn.ModuleDict({
             n: Linear(in_dims[n], hidden_dim) for n in metadata[0]
         })
-        self.hidden_dim = hidden_dim
+        self.shrink = nn.ModuleDict({
+            n: nn.Identity() for n in metadata[0]
+        })
 
+        # 2) build two hetero?conv layers
         def make_layer(in_d, out_d):
             convs = {}
             for et in metadata[1]:
-                if et in [('patient','to','signature'),
-                          ('signature','to_rev','patient')]:
-                    # GAT with built-in edge_attr support (edge_dim=1)
+                if et in [
+                    ('patient','to','signature'),
+                    ('signature','to_rev','patient')
+                ]:
                     convs[et] = GATConv(
-                        in_channels=(in_d, in_d),
-                        out_channels=out_d // num_heads,
+                        (in_d, in_d),
+                        out_d // num_heads,
                         heads=num_heads,
                         dropout=dropout,
                         add_self_loops=False,
                         edge_dim=1,
                     )
-                elif et == ('patient','follows','patient') or et == ('patient','follows_rev','patient'):
-                    convs[et] = GATConv(
-                        in_channels=(in_d, in_d),
-                        out_channels=out_d // num_heads,
-                        heads=num_heads,
-                        dropout=dropout,
-                        add_self_loops=False,
-                        edge_dim=1,
-                    )
+                elif et in [
+                    ('patient','follows','patient'),
+                    ('patient','follows_rev','patient')
+                ]:
+                    # simpler aggregator for temporal links
+                    convs[et] = GCNConv(in_d, out_d)
                 else:
-                    # all other relations (including condition has/has_rev)
                     convs[et] = GATConv(
-                        in_channels=(in_d, in_d),
-                        out_channels=out_d // num_heads,
+                        (in_d, in_d),
+                        out_d // num_heads,
                         heads=num_heads,
                         dropout=dropout,
                         add_self_loops=False,
                     )
             return HeteroConv(convs, aggr='sum')
 
-        # Three hetero?layers
-        self.convs1 = make_layer(hidden_dim, hidden_dim)
-        self.convs2 = make_layer(hidden_dim, hidden_dim)
-        self.convs3 = make_layer(hidden_dim, out_dim)
+        self.conv1 = make_layer(hidden_dim, hidden_dim)
+        self.conv2 = make_layer(hidden_dim, out_dim)
 
-        # Final projections
+        # 3) final node?type projections
         self.linear_proj = nn.ModuleDict({
-            n: Linear(out_dim, out_dim)
-            for n in metadata[0]
-        })
-        self.shrink = nn.ModuleDict({
-            n: Linear(hidden_dim, out_dim)
-            for n in metadata[0]
+            n: Linear(out_dim, out_dim) for n in metadata[0]
         })
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict=None):
-        # 1) Input proj
-        x0 = {n: self.input_proj[n](x) for n, x in x_dict.items()}
+        # embed inputs
+        x0 = {n: self.input_proj[n](x) for n,x in x_dict.items()}
 
-        # 2) Build the 1?dim edge_attr dict for signature edges
+        # prepare edge?attrs only for signature relations
         ew = {}
-        rel_fwd = ('patient','to','signature')
-        rel_rev = ('signature','to_rev','patient')
-        if edge_attr_dict and rel_fwd in edge_attr_dict:
-            w = edge_attr_dict[rel_fwd].float().view(-1,1)  # cast to float32
-            ew[rel_fwd] = w
-            ew[rel_rev] = w.flip(0)
+        fwd = ('patient','to','signature')
+        rev = ('signature','to_rev','patient')
+        if edge_attr_dict and fwd in edge_attr_dict:
+            w = edge_attr_dict[fwd].view(-1,1).float()
+            ew[fwd] = w
+            ew[rev] = w.flip(0)
 
-        # 3) conv1 + fallback + ReLU
-        x1_raw = self.convs1(x0, edge_index_dict, edge_attr_dict=ew)
+        # --- first hetero conv + residual + ReLU ---
+        x1_raw = self.conv1(x0, edge_index_dict, edge_attr_dict=ew)
         x1 = {}
         for n in self.metadata[0]:
-            h_in = x0[n]
-            h = x1_raw.get(n)
-            if h is None:
-                x1[n] = h_in
-
+            h0 = x0[n]
+            h1 = x1_raw.get(n)
+            if h1 is None:
+                x1[n] = h0
             else:
-                x1[n] = F.relu(h + h_in)
+                x1[n] = F.relu(h1 + h0)
 
-        # 4) conv2 + fallback + ReLU
-        x2_raw = self.convs2(x1, edge_index_dict, edge_attr_dict=ew)
+        # --- second hetero conv + residual + ReLU ---
+        x2_raw = self.conv2(x1, edge_index_dict, edge_attr_dict=ew)
         x2 = {}
         for n in self.metadata[0]:
-            h_in = x1[n]
-            h = x2_raw.get(n)
-            if h is None:
-                x2[n] = h_in
-
+            h1 = x1[n]
+            h2 = x2_raw.get(n)
+            if h2 is None:
+                x2[n] = h1
             else:
-                x2[n] = F.relu(h + h_in)
+                x2[n] = F.relu(h2 + h1)
 
-        # 5) conv3 + fallback + ReLU
-        x3 = self.convs3(x2, edge_index_dict, edge_attr_dict=ew)
-        for n in self.metadata[0]:
-            h = x3.get(n, x2[n])
-            h = F.relu(h)
+        # --- final projections ---
+        out = {}
+        for n, h in x2.items():
+            out[n] = self.linear_proj[n](h)
+        return out
 
-            # **NEW**: if for any node?type we still have 256 dims,
-            # shrink it down to 128 before going to linear_proj
-            if h.size(1) == self.hidden_dim:
-                h = F.relu(self.shrink[n](h))
-
-            x3[n] = h
-
-            # final projections (now guaranteed to be 128?128 everywhere)
-        return {n: self.linear_proj[n](h) for n, h in x3.items()}
 
 class JointHead(nn.Module):
     def __init__(self):
@@ -436,6 +421,7 @@ NEGATIVE_MULTIPLIER = 6  # you can adjust this multiplier later
 PAIRWISE_TAU = 5.0       # scale for time-weighted ranking loss
 SMOTE_MULTIPLIER = 2.0   # oversample positives beyond negatives
 HORIZON = 10   # how many graphs ahead to predict over
+CONTRASTIVE_WEIGHT = 0.2
 
 
 
@@ -597,7 +583,20 @@ def train(model, link_head, cox_head, patient_classifier,loader, optimizer, devi
             else:
                 pairwise_loss = torch.tensor(0.0, device=logits_all.device)
 
-            link_loss = focal_loss + pairwise_loss
+            # optional contrastive loss between diabetes positives and negatives
+            contrastive_loss = torch.tensor(0.0, device=logits_all.device)
+            if pos_ei.numel() > 0 and neg_ei.numel() > 0:
+                pos_pat = P[pos_ei[0]]
+                neg_pat = P[neg_ei[0]]
+                cond_anchor = C[focus_idx].unsqueeze(0)
+                anc = cond_anchor.expand(pos_pat.size(0) * neg_pat.size(0), -1)
+                pos_rep = pos_pat.repeat_interleave(neg_pat.size(0), dim=0)
+                neg_rep = neg_pat.repeat(pos_pat.size(0), 1)
+                contrastive_loss = F.triplet_margin_loss(
+                    anc, pos_rep, neg_rep, margin=1.0
+                )
+
+            link_loss = focal_loss + pairwise_loss + CONTRASTIVE_WEIGHT * contrastive_loss
             # --- END replacement ---
         else:
             link_loss = zero.clone()
@@ -918,22 +917,22 @@ metadata = (
 model = HeteroGAT(
     metadata=metadata,
     in_dims=in_dims,
-    hidden_dim=256,
-    out_dim =128,
+    hidden_dim=64,
+    out_dim =64,
     dropout = 0.5,
-    num_heads = 8
+    num_heads = 2
 ).to(device)
 
 #link_head = LinkMLPPredictor(input_dim=128).to(device)
 #link_head = CosineLinkPredictor(input_dim=128, init_scale=10.0, use_bias=True).to(device)
 link_head = TimeAwareCosineLinkPredictor(init_scale = 5.0 , use_bias = True).to(device)
-cox_head = CoxHead(input_dim=128, num_conditions=7).to(device)
+cox_head = CoxHead(input_dim=64, num_conditions=7).to(device)
 
 USE_PSEUDO = True
 
 joint_head = JointHead().to(device)
 patient_classifier = nn.Linear(
-    128,               # same as your final patient embedding dim (e.g. 128)
+    64,               # same as your final patient embedding dim (e.g. 128)
     7         # output one score per condition
 ).to(device)
 
@@ -951,7 +950,7 @@ optimizer = torch.optim.Adam(
 
 
 def main():
-    plot_idx = 3
+    plot_idx = focus_idx
     mp.set_start_method("spawn", force=True)
     torch.multiprocessing.set_sharing_strategy("file_system")
     global train_graphs, val_graphs, test_graphs
