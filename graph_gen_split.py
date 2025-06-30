@@ -230,6 +230,7 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
     do_train=True  -> add has-condition edges and drop after diag
     do_train=False -> never add has-condition; never drop
     """
+    prev_names = build_graph.last_names.get(id(last_loc))
     if do_train:
         # remove any patients diagnosed *before* this window
         diagnosed_before = {
@@ -314,10 +315,13 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
         sig = cgm_dict[(p, day)]
         v = align_and_rescale(sig)
         kws = compute_weights(nmf_signatures, v)
-        for si, ww in enumerate(kws):
-            if ww > NEGATIVE_THRESHOLD:
-                eidx.append([pi, si])
-                wts.append(ww)
+        pos = [(si, float(ww)) for si, ww in enumerate(kws) if ww > NEGATIVE_THRESHOLD]
+        if not pos:
+            best = int(np.argmax(kws))
+            pos = [(best, float(kws[best]))]
+        for si, ww in pos:
+            eidx.append([pi, si])
+            wts.append(ww)
 
     if eidx:
         sig_ei = torch.tensor(eidx).T  # [2, E]
@@ -363,7 +367,12 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
     for p, ni in name_to_idx.items():
         if p in last_loc:
             _, prev_idx = last_loc[p]
-            if prev_idx < het["patient"].x.size(0):
+            if (
+                    prev_names
+                    and prev_idx < len(prev_names)
+                    and prev_names[prev_idx] == p
+                    and prev_idx < het["patient"].x.size(0)
+            ):
                 src.append(prev_idx)
                 dst.append(ni)
         last_loc[p] = (wi, ni)
@@ -387,11 +396,12 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
         rev_ei = ei_f.flip(0)
         het["patient","follows_rev","patient"].edge_index = rev_ei
         het["patient","follows_rev","patient"].edge_attr  = wt_f
+    build_graph.last_names[id(last_loc)] = names
     het.window = wi
     return wi, het
 # store last_loc per split
 build_graph.last_loc = {}
-
+build_graph.last_names = {}
 # ========== RUN ==========
 print("Building and splitting?")
 # ===== Define the patient splits =====
@@ -410,6 +420,7 @@ test_set  = shuffled_patients[n_train + n_val :]
 pulse = start_pulse_timer("Still building?", delay=1800)
 # --- TRAIN ---
 build_graph.last_loc = {}
+build_graph.last_names = {}
 train_graphs = []
 split_last_locs = {
     "train": {},
@@ -433,6 +444,7 @@ for wi, (wstart, wend) in enumerate(window_ranges):
 
 # --- VAL ---
 build_graph.last_loc = {}
+build_graph.last_names = {}
 val_graphs = []
 for wi, (wstart, wend) in enumerate(window_ranges):
     print(f"[VALID]   Window {wi}: {wstart} ? {wend}")
@@ -450,6 +462,7 @@ for wi, (wstart, wend) in enumerate(window_ranges):
 
 # --- TEST ---
 build_graph.last_loc = {}
+build_graph.last_names = {}
 test_graphs = []
 for wi, (wstart, wend) in enumerate(window_ranges):
     print(f"[TEST]    Window {wi}: {wstart} ? {wend}")
