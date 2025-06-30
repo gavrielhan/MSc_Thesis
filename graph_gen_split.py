@@ -393,7 +393,7 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
                 if prev_names and prev_idx < len(prev_names)
                 else None
             )
-            if prev_name == p:
+            if prev_name == p and prev_idx < len(names):
                 src.append(prev_idx)
                 dst.append(ni)
             elif prev_name is not None:
