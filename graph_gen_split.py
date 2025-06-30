@@ -327,15 +327,27 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
         sig_ei = torch.tensor(eidx).T  # [2, E]
         wts = torch.tensor(wts, dtype=torch.float)
         # normalize so each patient's sum = 1
-        # note: since eidx groups many patients together,
-        # we need to divide each wts[e] by the sum of its patient?block
-        # here?s a quick way:
         patient_idxs = sig_ei[0].tolist()
         sums = defaultdict(float)
         for e, pi in enumerate(patient_idxs):
             sums[pi] += wts[e].item()
         norm_wts = [wts[e] / (sums[pi] + 1e-9) for e, pi in enumerate(patient_idxs)]
         sig_w = torch.stack(norm_wts).view(-1, 1)  # [E,1]
+        # sanity check: weights per patient must sum to ~1
+        # sanity check: weights per patient must sum to ~1 and remain positive
+        totals = defaultdict(float)
+        for (pi, _), w in zip(eidx, sig_w):
+            val = w.item()
+            if val <= 0:
+                raise ValueError(
+                    f"Zero weight encountered for patient index {pi}"
+                )
+            totals[pi] += val
+        for pi, total in totals.items():
+            if not np.isclose(total, 1.0, atol=1e-5):
+                raise ValueError(
+                    f"Signature weights for patient index {pi} sum to {total}, expected 1"
+                )
 
         het["patient", "to", "signature"].edge_index = sig_ei
         het["patient", "to", "signature"].edge_attr = sig_w
@@ -345,6 +357,15 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
         het["signature", "to_rev", "patient"].edge_index = rev_sig_ei
         het["signature", "to_rev", "patient"].edge_attr = sig_w
 
+        # ensure reverse edges also sum to 1 for each patient
+        totals_rev = defaultdict(float)
+        for (_, pi), w in zip(rev_sig_ei.T.tolist(), sig_w):
+            totals_rev[pi] += w.item()
+        for pi, total in totals_rev.items():
+            if not np.isclose(total, 1.0, atol=1e-5):
+                raise ValueError(
+                    f"Reverse signature weights for patient index {pi} sum to {total}, expected 1"
+                )
     # ? patient ? condition (only in training) and its reverse ?
     if do_train and wi in diag_by_win:
         ci_edges = []
@@ -367,14 +388,22 @@ def build_graph(wi, wstart, wend, patients, do_train, last_loc):
     for p, ni in name_to_idx.items():
         if p in last_loc:
             _, prev_idx = last_loc[p]
-            if (
-                    prev_names
-                    and prev_idx < len(prev_names)
-                    and prev_names[prev_idx] == p
-                    and prev_idx < het["patient"].x.size(0)
-            ):
+            prev_name = (
+                prev_names[prev_idx]
+                if prev_names and prev_idx < len(prev_names)
+                else None
+            )
+            if prev_name == p:
                 src.append(prev_idx)
                 dst.append(ni)
+            elif prev_name is not None:
+                # if the previous name still exists in this window, this is a real mismatch
+                if prev_name in name_to_idx:
+                    raise ValueError(
+                        f"Patient follow mismatch for {p} at window {wi}: index {prev_idx} "
+                        f"maps to {prev_name}"
+                    )
+                # otherwise that patient was removed (e.g. diagnosed); just skip the edge
         last_loc[p] = (wi, ni)
 
     if src:
