@@ -417,13 +417,139 @@ def build_diag_by_win(full_map, graphs):
     return m
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 6  # you can adjust this multiplier later
+NEGATIVE_MULTIPLIER = 10  # you can adjust this multiplier later
 PAIRWISE_TAU = 5.0       # scale for time-weighted ranking loss
-SMOTE_MULTIPLIER = 2.0   # oversample positives beyond negatives
+SMOTE_MULTIPLIER = 5.0   # oversample positives beyond negatives
 HORIZON = 10   # how many graphs ahead to predict over
 CONTRASTIVE_WEIGHT = 0.2
 
+# --- Advanced Loss and Regularization Utilities ---
+import numpy as np
 
+def smooth_labels(labels, smoothing=0.1):
+    return labels * (1 - smoothing) + 0.5 * smoothing
+
+def mixup(x, y, alpha=0.2):
+    if alpha <= 0:
+        return x, y
+    lam = np.random.beta(alpha, alpha)
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    mixed_y = lam * y + (1 - lam) * y[index]
+    return mixed_x, mixed_y
+
+def get_class_balanced_weight(labels, beta=0.9999):
+    n_pos = labels.sum().item()
+    n_neg = labels.numel() - n_pos
+    effective_num_pos = 1.0 - beta ** n_pos
+    effective_num_neg = 1.0 - beta ** n_neg
+    w_pos = (1.0 - beta) / (effective_num_pos + 1e-8)
+    w_neg = (1.0 - beta) / (effective_num_neg + 1e-8)
+    return w_pos, w_neg
+
+def differentiable_ap_loss(logits, labels, delta=1.0):
+    pos_mask = labels == 1
+    neg_mask = labels == 0
+    pos_logits = logits[pos_mask]
+    neg_logits = logits[neg_mask]
+    if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+        return torch.tensor(0.0, device=logits.device)
+    diff = neg_logits.unsqueeze(0) - pos_logits.unsqueeze(1)
+    loss = torch.nn.functional.relu(1 + diff / delta)
+    return loss.mean()
+
+def dynamic_negative_sampling(logits, labels, n_pos, n_neg=None):
+    pos_idx = (labels == 1).nonzero(as_tuple=True)[0]
+    neg_idx = (labels == 0).nonzero(as_tuple=True)[0]
+    if n_neg is None:
+        n_neg = n_pos * 5
+    if neg_idx.numel() > n_neg:
+        neg_scores = logits[neg_idx]
+        _, topk = torch.topk(neg_scores, n_neg, largest=True)
+        neg_idx = neg_idx[topk]
+    sample_idx = torch.cat([pos_idx, neg_idx])
+    return sample_idx
+
+def compute_total_loss(
+    logits, labels,
+    loss_weights=None,
+    smoothing=0.1,
+    mixup_alpha=0.2,
+    cb_beta=0.9999,
+    ap_delta=1.0,
+    focal_alpha=0.95,
+    focal_gamma=2.5,
+    device=None
+):
+    labels_smooth = smooth_labels(labels, smoothing)
+    if mixup_alpha > 0:
+        logits, labels_smooth = mixup(logits.unsqueeze(1), labels_smooth.unsqueeze(1), mixup_alpha)
+        logits = logits.squeeze(1)
+        labels_smooth = labels_smooth.squeeze(1)
+    w_pos, w_neg = get_class_balanced_weight(labels, beta=cb_beta)
+    weights = labels * w_pos + (1 - labels) * w_neg
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels_smooth, reduction='none')
+    prob = torch.sigmoid(logits)
+    p_t = prob * labels + (1 - prob) * (1 - labels)
+    alpha_t = focal_alpha * labels + (1 - focal_alpha) * (1 - labels)
+    focal = alpha_t * (1 - p_t).pow(focal_gamma) * bce
+    focal_loss = (focal * weights).mean()
+    ap_loss = differentiable_ap_loss(logits, labels, delta=ap_delta)
+    total = 0.0
+    if loss_weights is None:
+        loss_weights = {'focal': 0.0, 'ap': 1.0}
+    total += loss_weights.get('focal', 1.0) * focal_loss
+    total += loss_weights.get('ap', 1.0) * ap_loss
+    return total, {'focal': focal_loss.item(), 'ap': ap_loss.item()}
+
+def advanced_link_loss(
+    P, C, link_head, pos_ei, neg_ei, device,
+    loss_weights=None,
+    smoothing=0.1,
+    mixup_alpha=0.2,
+    cb_beta=0.9999,
+    ap_delta=1.0,
+    focal_alpha=0.95,
+    focal_gamma=2.5,
+    smote_multiplier=2.0
+):
+    pos_logits = link_head(P, C, pos_ei)
+    neg_logits = link_head(P, C, neg_ei)
+    logits = torch.cat([pos_logits, neg_logits], dim=0)
+    labels = torch.cat([torch.ones_like(pos_logits), torch.zeros_like(neg_logits)], dim=0)
+    n_pos = pos_logits.size(0)
+    n_neg = neg_logits.size(0)
+    # SMOTE oversampling
+    if n_pos > 0 and smote_multiplier > 1.0:
+        target_pos = int(n_neg * smote_multiplier)
+        if n_pos < target_pos:
+            n_extra = target_pos - n_pos
+            synth_pat = simple_smote(P[pos_ei[0]], n_extra)
+            synth_ei = torch.stack([
+                torch.arange(P.size(0), P.size(0) + n_extra, device=device),
+                torch.full((n_extra,), pos_ei[1][0], device=device)
+            ], dim=0)
+            synth_logits = link_head(torch.cat([P, synth_pat], dim=0), C, synth_ei)
+            logits = torch.cat([logits, synth_logits], dim=0)
+            labels = torch.cat([labels, torch.ones_like(synth_logits)], dim=0)
+    # Dynamic negative sampling
+    sample_idx = dynamic_negative_sampling(logits, labels, n_pos)
+    logits = logits[sample_idx]
+    labels = labels[sample_idx]
+    # Compute loss
+    total_loss, loss_dict = compute_total_loss(
+        logits, labels,
+        loss_weights=loss_weights,
+        smoothing=smoothing,
+        mixup_alpha=mixup_alpha,
+        cb_beta=cb_beta,
+        ap_delta=ap_delta,
+        focal_alpha=focal_alpha,
+        focal_gamma=focal_gamma,
+        device=device
+    )
+    return total_loss, loss_dict
 
 def train(model, link_head, cox_head, patient_classifier,loader, optimizer, device, pseudo_label_by_window):
     model.train()
@@ -492,9 +618,7 @@ def train(model, link_head, cox_head, patient_classifier,loader, optimizer, devi
             pos_ei = torch.stack([torch.tensor(src, device=device),
                                    torch.tensor(dst, device=device)], dim=0)
             tte_pos = batch['patient'].duration[pos_ei[0], pos_ei[1]]
-            pos_logits = link_head(P, C, pos_ei, tte_pos)
-
-            # mine negatives
+            # negatives
             with torch.no_grad():
                 all_src = torch.arange(P.size(0), device=device)
                 all_dst = torch.full((P.size(0),), focus_idx, device=device)
@@ -502,11 +626,10 @@ def train(model, link_head, cox_head, patient_classifier,loader, optimizer, devi
                 tte_all = batch['patient'].duration[all_src, all_dst]
                 all_logits = link_head(P, C, all_ei, tte_all)
             pos_pairs = set((int(i), int(c)) for i, c in zip(pos_ei[0], pos_ei[1]))
-            # exclude already-positive (patient, condition) pairs
             neg_mask = [(s.item(), focus_idx) not in pos_pairs for s in all_src]
             cand_src   = all_src[neg_mask]
             cand_logits = all_logits[neg_mask]
-            n_neg = pos_logits.size(0) * NEGATIVE_MULTIPLIER
+            n_neg = pos_ei.size(1) * NEGATIVE_MULTIPLIER
             if cand_logits.numel() >= n_neg:
                 _, topk = cand_logits.topk(n_neg, largest=True)
                 neg_src = cand_src[topk]
@@ -515,89 +638,18 @@ def train(model, link_head, cox_head, patient_classifier,loader, optimizer, devi
             neg_dst = torch.full_like(neg_src, focus_idx, device=device)
             neg_ei  = torch.stack([neg_src, neg_dst], dim=0)
             tte_neg = batch['patient'].duration[neg_ei[0], neg_ei[1]]
-            neg_logits = link_head(P, C, neg_ei, tte_neg)
-
-            # ----- SMOTE oversampling of positive patients -----
-            n_pos = pos_ei.size(1)
-            n_neg = neg_ei.size(1)
-            if n_pos > 0:
-                target_pos = int(n_neg * SMOTE_MULTIPLIER)
-                tte_pos_full = tte_pos
-                if n_pos < target_pos:
-                    n_extra = target_pos - n_pos
-                    synth_pat = simple_smote(P[pos_ei[0]], n_extra)
-                    P_ext = torch.cat([P, synth_pat], dim=0)
-                    synth_idx = torch.arange(P.size(0), P_ext.size(0), device=device)
-                    synth_ei = torch.stack([
-                        synth_idx,
-                        torch.full((n_extra,), focus_idx, device=device)
-                    ], dim=0)
-                    tte_extra = tte_pos[torch.randint(0, tte_pos.numel(), (n_extra,), device=device)]
-
-                    pos_logits_ext = link_head(P_ext, C, synth_ei, tte_extra)
-                    pos_logits = link_head(P_ext, C, pos_ei, tte_pos)
-                    neg_logits = link_head(P_ext, C, neg_ei, tte_neg)
-
-                    all_pos_logits = torch.cat([pos_logits, pos_logits_ext], dim=0)
-                    logits_all = torch.cat([all_pos_logits, neg_logits], dim=0)
-
-                    labels_all = torch.cat([
-                        torch.ones_like(pos_logits),
-                        torch.ones_like(pos_logits_ext),
-                        torch.zeros_like(neg_logits)
-                    ], dim=0)
-
-                    tte_pos_full = torch.cat([tte_pos, tte_extra], dim=0)
-                else:
-                    logits_all = torch.cat([pos_logits, neg_logits], dim=0)
-                    labels_all = torch.cat([
-                        torch.ones_like(pos_logits),
-                        torch.zeros_like(neg_logits)
-                    ], dim=0)
-                    tte_pos_full = tte_pos
-
-            # pos-weight
-            pos_count = labels_all.sum()
-            neg_count = labels_all.numel() - pos_count
-            pos_weight = torch.clamp(neg_count / (pos_count + 1e-6), max=100.0)
-
-            # focal (?=0.99, ?=2), reduction=none
-            fl = binary_focal_loss_with_logits(
-                logits_all, labels_all,
-                alpha=0.95, gamma=2.5,
-                reduction="none"
+            # --- Use advanced_link_loss ---
+            link_loss, loss_dict = advanced_link_loss(
+                P, C, link_head, pos_ei, neg_ei, device,
+                loss_weights={'focal': 1.0, 'ap': 1.0},
+                smoothing=0.1,
+                mixup_alpha=0.2,
+                cb_beta=0.9999,
+                ap_delta=1.0,
+                focal_alpha=0.95,
+                focal_gamma=2.5,
+                smote_multiplier=SMOTE_MULTIPLIER
             )
-            weights = labels_all * pos_weight + (1.0 - labels_all)
-            focal_loss = (fl * weights).mean()
-
-            # global pairwise ranking with time weighting
-            if pos_count > 0 and neg_count > 0:
-                pl = logits_all[labels_all == 1]
-                nl = logits_all[labels_all == 0]
-                tp = tte_pos_full.unsqueeze(1)
-                tn = tte_neg.unsqueeze(0)
-                weights_pw = torch.exp(-torch.abs(tn - tp) / PAIRWISE_TAU)
-                pairwise_loss = -(weights_pw * F.logsigmoid(
-                    pl.unsqueeze(1) - nl.unsqueeze(0)
-                )).mean()
-            else:
-                pairwise_loss = torch.tensor(0.0, device=logits_all.device)
-
-            # optional contrastive loss between diabetes positives and negatives
-            contrastive_loss = torch.tensor(0.0, device=logits_all.device)
-            if pos_ei.numel() > 0 and neg_ei.numel() > 0:
-                pos_pat = P[pos_ei[0]]
-                neg_pat = P[neg_ei[0]]
-                cond_anchor = C[focus_idx].unsqueeze(0)
-                anc = cond_anchor.expand(pos_pat.size(0) * neg_pat.size(0), -1)
-                pos_rep = pos_pat.repeat_interleave(neg_pat.size(0), dim=0)
-                neg_rep = neg_pat.repeat(pos_pat.size(0), 1)
-                contrastive_loss = F.triplet_margin_loss(
-                    anc, pos_rep, neg_rep, margin=1.0
-                )
-
-            link_loss = focal_loss + pairwise_loss + CONTRASTIVE_WEIGHT * contrastive_loss
-            # --- END replacement ---
         else:
             link_loss = zero.clone()
 
@@ -966,6 +1018,7 @@ optimizer = torch.optim.Adam(
 #scheduler = StepLR(optimizer, step_size=10, gamma=0.5)
 
 
+
 def main():
     plot_idx = focus_idx
     mp.set_start_method("spawn", force=True)
@@ -997,10 +1050,10 @@ def main():
             count_cond = 0
         train_pos_counts.append(count_cond)
 
-    # now build sample weights: every window gets at least weight=1,
-    # windows with positives get boosted by (1 + cnt)^gamma
-    gamma = 0.4   # you can tune (0.0 = uniform sampling, 1.0 = linear to count)
-    sample_weights = [(1 + cnt)**gamma for cnt in train_pos_counts]
+    # Oversample windows with at least one positive diabetes case
+    POS_WINDOW_WEIGHT = 20.0  # Aggressive upweighting for positive windows
+    NEG_WINDOW_WEIGHT = 1.0   # Weight for windows with zero positives
+    sample_weights = [POS_WINDOW_WEIGHT if cnt > 0 else NEG_WINDOW_WEIGHT for cnt in train_pos_counts]
     # 2) Compute global pos weight
     total_pos = sum(
         g[('patient', 'has', 'condition')].edge_index.size(1)
@@ -1018,7 +1071,7 @@ def main():
     train_sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(sample_weights),
-        replacement=True,    # so that high?weight windows can appear multiple times
+        replacement=True,    # so that high-weight windows can appear multiple times
     )
     train_loader = DataLoader(train_graphs, batch_size=1,sampler=train_sampler, num_workers=0)
     val_loader = DataLoader(val_graphs, batch_size=1, num_workers=0)
