@@ -674,8 +674,8 @@ def evaluate(
     total_link_loss = 0.0
     total_cox_loss  = 0.0
     window_scores  = []
-    all_link_preds, all_link_labels = [], []
-    per_cond_preds,  per_cond_labels = {}, {}
+    # store the maximum predicted probability for each (patient, condition)
+    patient_cond_max = defaultdict(float)
     all_risk_scores, all_durations, all_events = [], [], []
     num_batches = 0
 
@@ -686,9 +686,6 @@ def evaluate(
     BLEND_LINK = w_link / norm
     BLEND_COX  = w_cox  / norm
     num_conditions = cox_head.linear.out_features
-    for ci in range(num_conditions):
-        per_cond_preds[ci]  = []
-        per_cond_labels[ci] = []
 
     for window_idx, batch in enumerate(tqdm(loader, desc="Evaluating")):
         batch = batch.to(device)
@@ -786,16 +783,20 @@ def evaluate(
             flat_pos = pos_ei[0]*Nc + pos_ei[1]
             labels_all[flat_pos] = 1.0
 
-        # 7) collect for PR?AUC
-        all_link_preds .append(probs_all.cpu())
-        all_link_labels.append(labels_all.cpu())
-        for ci in range(num_conditions):
-            mask_ci = (dst_all.cpu()==ci)
-            per_cond_preds [ci].append(probs_all.cpu()[mask_ci])
-            per_cond_labels[ci].append(labels_all.cpu()[mask_ci])
+        # 7) update patient-level maximum scores
+        prob_matrix = probs_all.view(Np, Nc)
+        if focus_idx is not None:
+            cond_range = [focus_idx]
+        else:
+            cond_range = range(num_conditions)
+        for i, pname in enumerate(flat_names):
+            for ci in cond_range:
+                score = prob_matrix[i, ci].item()
+                key = (pname, ci)
+                if score > patient_cond_max.get(key, 0.0):
+                    patient_cond_max[key] = score
 
-        n_pos = int(labels_all.sum().item())
-        n_all = labels_all.numel()
+
 
 
         # 8) balanced 1:1 BCE link loss
@@ -837,9 +838,19 @@ def evaluate(
     avg_link = total_link_loss / max(1, num_batches)
     avg_cox  = total_cox_loss  / max(1, num_batches)
 
-    if all_link_preds:
-        y_true  = torch.cat(all_link_labels).numpy()
-        y_score = torch.cat(all_link_preds) .numpy()
+    # --- Patient level AUC calculations ---
+    pos_pairs = set()
+    for pairs in diag_by_win_map.values():
+        pos_pairs.update(pairs)
+
+    y_true, y_score = [], []
+    for (p, ci), score in patient_cond_max.items():
+        if focus_idx is not None and ci != focus_idx:
+            continue
+        y_score.append(score)
+        y_true.append(1 if (p, ci) in pos_pairs else 0)
+
+    if len(set(y_true)) > 1:
         link_auc = roc_auc_score(y_true, y_score)
         pr_auc   = average_precision_score(y_true, y_score)
     else:
@@ -847,10 +858,16 @@ def evaluate(
 
     pr_per_cond = []
     for ci in range(num_conditions):
-        if per_cond_preds[ci]:
-            y_t = torch.cat(per_cond_labels[ci]).numpy()
-            y_s = torch.cat(per_cond_preds [ci]).numpy()
-            pr_per_cond.append(average_precision_score(y_t, y_s))
+        if focus_idx is not None and ci != focus_idx:
+            pr_per_cond.append(None)
+            continue
+        ys, yt = [], []
+        for (p, c), score in patient_cond_max.items():
+            if c == ci:
+                ys.append(score)
+                yt.append(1 if (p, c) in pos_pairs else 0)
+        if yt and sum(yt) > 0:
+            pr_per_cond.append(average_precision_score(yt, ys))
         else:
             pr_per_cond.append(None)
 
