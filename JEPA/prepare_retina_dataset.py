@@ -1,0 +1,90 @@
+import os
+import csv
+import glob
+from datetime import datetime
+from typing import List, Tuple
+from PIL import Image
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+
+# Directory containing all patient subdirectories with OD/OS images
+EYES_ROOT = "/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Data/10K/aws_lab_files/eyes/"
+MANIFEST_CSV = "retina_manifest.csv"
+
+# 1. Index all retina image pairs and create a manifest CSV
+def create_retina_manifest(eyes_root: str, manifest_csv: str):
+    rows = []
+    for subdir in sorted(os.listdir(eyes_root)):
+        subdir_path = os.path.join(eyes_root, subdir)
+        if not os.path.isdir(subdir_path):
+            continue
+        # Expect subdir name: <patient_code>_<date>
+        try:
+            patient_code, date_str = subdir.split("_", 1)
+        except ValueError:
+            print(f"Skipping malformed directory: {subdir}")
+            continue
+        # Find OD and OS images
+        od_path = glob.glob(os.path.join(subdir_path, "*OD*.jpg"))
+        os_path = glob.glob(os.path.join(subdir_path, "*OS*.jpg"))
+        if not od_path or not os_path:
+            print(f"Missing OD/OS in {subdir}")
+            continue
+        # Use first match for each
+        od_path = od_path[0]
+        os_path = os_path[0]
+        rows.append({
+            "patient_code": patient_code,
+            "date": date_str,
+            "od_path": od_path,
+            "os_path": os_path
+        })
+    # Write CSV
+    with open(manifest_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["patient_code", "date", "od_path", "os_path"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    print(f"Wrote manifest with {len(rows)} entries to {manifest_csv}")
+
+# 2. PyTorch Dataset for retina images
+class RetinaDataset(Dataset):
+    def __init__(self, manifest_csv: str, transform=None):
+        self.entries = []
+        with open(manifest_csv, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                self.entries.append(row)
+        self.transform = transform or transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+        ])
+    def __len__(self):
+        return len(self.entries)
+    def __getitem__(self, idx):
+        entry = self.entries[idx]
+        od_img = Image.open(entry["od_path"]).convert("RGB")
+        os_img = Image.open(entry["os_path"]).convert("RGB")
+        od_tensor = self.transform(od_img)
+        os_tensor = self.transform(os_img)
+        return {
+            "od": od_tensor,
+            "os": os_tensor,
+            "patient_code": entry["patient_code"],
+            "date": entry["date"]
+        }
+
+# 3. Main: generate manifest and test dataset
+if __name__ == "__main__":
+    # Step 1: Create manifest
+    create_retina_manifest(EYES_ROOT, MANIFEST_CSV)
+    # Step 2: Load dataset and show a batch
+    dataset = RetinaDataset(MANIFEST_CSV)
+    loader = DataLoader(dataset, batch_size=4, shuffle=True)
+    batch = next(iter(loader))
+    print("Batch keys:", batch.keys())
+    print("OD batch shape:", batch["od"].shape)
+    print("OS batch shape:", batch["os"].shape)
+    print("Patient codes:", batch["patient_code"])
+    print("Dates:", batch["date"]) 
