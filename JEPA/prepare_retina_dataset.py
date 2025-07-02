@@ -7,6 +7,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+import pandas as pd
 
 # Directory containing all patient subdirectories with OD/OS images
 EYES_ROOT = "/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Data/10K/aws_lab_files/eyes/"
@@ -77,11 +78,48 @@ class RetinaDataset(Dataset):
             "date": entry["date"]
         }
 
+def create_diagnosis_csv(
+    baseline_csv="/net/mraid20/export/genie/LabData/Data/10K/for_review/baseline_conditions_all.csv",
+    followup_csv="/net/mraid20/export/genie/LabData/Data/10K/for_review/follow_up_conditions_all.csv",
+    output_csv="retina_patient_diagnosis.csv"
+):
+    """
+    Extracts and orders diagnosis info from baseline and follow-up CSVs.
+    Output columns: RegistrationCode, baseline (yes/no), disease, date
+    Each row: one disease per patient per date.
+    """
+    # Load data
+    df_base = pd.read_csv(baseline_csv)
+    df_follow = pd.read_csv(followup_csv)
+
+    # Baseline: research_stage == 'baseline'
+    base_rows = df_base[df_base['research_stage'] == 'baseline'][[
+        'RegistrationCode', 'english_name', 'Date']].copy()
+    base_rows['baseline'] = 'yes'
+    base_rows = base_rows.rename(columns={'english_name': 'disease', 'Date': 'date'})
+
+    # Follow-up: research_stage != 'baseline'
+    follow_rows = df_follow[df_follow['research_stage'] != 'baseline'][[
+        'RegistrationCode', 'english_name', 'Date']].copy()
+    follow_rows['baseline'] = 'no'
+    follow_rows = follow_rows.rename(columns={'english_name': 'disease', 'Date': 'date'})
+
+    # Concat and sort
+    all_rows = pd.concat([base_rows, follow_rows], ignore_index=True)
+    all_rows = all_rows.drop_duplicates(subset=['RegistrationCode', 'disease', 'date'])
+    all_rows = all_rows.sort_values(['RegistrationCode', 'baseline', 'disease', 'date'])
+
+    # Write to CSV
+    all_rows[['RegistrationCode', 'baseline', 'disease', 'date']].to_csv(output_csv, index=False)
+    print(f"Wrote diagnosis info to {output_csv}")
+
 # 3. Main: generate manifest and test dataset
 if __name__ == "__main__":
     # Step 1: Create manifest
     create_retina_manifest(EYES_ROOT, MANIFEST_CSV)
-    # Step 2: Load dataset and show a batch
+    # Step 2: Create diagnosis CSV
+    create_diagnosis_csv()
+    # Step 3: Load dataset and show a batch
     dataset = RetinaDataset(MANIFEST_CSV)
     loader = DataLoader(dataset, batch_size=4, shuffle=True)
     batch = next(iter(loader))
