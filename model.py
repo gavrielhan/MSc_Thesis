@@ -498,7 +498,7 @@ def compute_total_loss(
     ap_loss = differentiable_ap_loss(logits, labels, delta=ap_delta)
     total = 0.0
     if loss_weights is None:
-        loss_weights = {'focal': 0.0, 'ap': 1.0}
+        loss_weights = {'focal': 1.0, 'ap': 1.0}
     total += loss_weights.get('focal', 1.0) * focal_loss
     total += loss_weights.get('ap', 1.0) * ap_loss
     return total, {'focal': focal_loss.item(), 'ap': ap_loss.item()}
