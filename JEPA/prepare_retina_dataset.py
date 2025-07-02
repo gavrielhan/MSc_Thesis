@@ -25,6 +25,8 @@ def create_retina_manifest(eyes_root: str, manifest_csv: str):
         except ValueError:
             print(f"Skipping malformed directory: {subdir}")
             continue
+        # Add '10K_' prefix and rename to RegistrationCode
+        registration_code = f"10K_{patient_code}"
         # Find OD and OS images
         od_path = glob.glob(os.path.join(subdir_path, "*OD*.jpg"))
         os_path = glob.glob(os.path.join(subdir_path, "*OS*.jpg"))
@@ -35,14 +37,14 @@ def create_retina_manifest(eyes_root: str, manifest_csv: str):
         od_path = od_path[0]
         os_path = os_path[0]
         rows.append({
-            "patient_code": patient_code,
+            "RegistrationCode": registration_code,
             "date": date_str,
             "od_path": od_path,
             "os_path": os_path
         })
     # Write CSV
     with open(manifest_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["patient_code", "date", "od_path", "os_path"])
+        writer = csv.DictWriter(f, fieldnames=["RegistrationCode", "date", "od_path", "os_path"])
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -71,7 +73,7 @@ class RetinaDataset(Dataset):
         return {
             "od": od_tensor,
             "os": os_tensor,
-            "patient_code": entry["patient_code"],
+            "RegistrationCode": entry["RegistrationCode"],
             "date": entry["date"]
         }
 
@@ -86,5 +88,5 @@ if __name__ == "__main__":
     print("Batch keys:", batch.keys())
     print("OD batch shape:", batch["od"].shape)
     print("OS batch shape:", batch["os"].shape)
-    print("Patient codes:", batch["patient_code"])
+    print("Patient codes:", batch["RegistrationCode"])
     print("Dates:", batch["date"]) 
