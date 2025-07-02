@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from sklearn.utils.class_weight import compute_class_weight
 from JEPA.ijepa.src.datasets.retina import RetinaDataset
+from ijepa.src.models.vision_transformer import vit_base  # Use ViT-Base as default backbone
 
 # --- CONFIG ---
 MANIFEST = "retina_manifest.csv"
@@ -23,6 +24,9 @@ LR = 1e-4
 NUM_WORKERS = 4
 IMG_SIZE = 224
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+VIT_PATCH_SIZE = 16
+VIT_EMBED_DIM = 768  # for vit_base
+PRETRAINED_CKPT = None  # Set path to pretrained checkpoint if available
 
 # --- TRANSFORMS ---
 transform = transforms.Compose([
@@ -49,21 +53,40 @@ train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_wo
 val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
 # --- MODEL ---
-from JEPA.ijepa.src.models.ijepa import ijeparch
-# Load pretrained I-JEPA backbone (ViT-H/14 or similar)
-backbone = ijeparch(pretrained=True)
+# Instantiate ViT backbone for 6-channel input
+backbone = vit_base(patch_size=VIT_PATCH_SIZE, img_size=IMG_SIZE, in_chans=6)
+
+# Optionally load pretrained weights (if available)
+if PRETRAINED_CKPT is not None and os.path.isfile(PRETRAINED_CKPT):
+    state_dict = torch.load(PRETRAINED_CKPT, map_location=DEVICE)
+    # If in_chans != 3, you may need to adapt the first conv layer weights
+    if backbone.patch_embed.proj.weight.shape[1] != 3:
+        # Average or repeat weights for extra channels
+        w = state_dict['patch_embed.proj.weight']
+        if w.shape[1] == 3 and backbone.patch_embed.proj.weight.shape[1] == 6:
+            # Repeat weights for 6 channels
+            w6 = w.repeat(1, 2, 1, 1)[:, :6]
+            state_dict['patch_embed.proj.weight'] = w6
+    backbone.load_state_dict(state_dict, strict=False)
+    print(f"Loaded pretrained weights from {PRETRAINED_CKPT}")
+
 backbone.eval()
 for p in backbone.parameters():
     p.requires_grad = False
-# Add a trainable classification head
+
+# Add a trainable classification head using the [CLS] token
 class RetinaClassifier(nn.Module):
     def __init__(self, backbone, num_classes):
         super().__init__()
         self.backbone = backbone
-        self.head = nn.Linear(backbone.embed_dim, num_classes)
+        self.head = nn.Linear(VIT_EMBED_DIM, num_classes)
     def forward(self, x):
-        feats = self.backbone(x)
-        return self.head(feats)
+        # ViT returns (B, N+1, D); [CLS] token is at position 0
+        feats = self.backbone(x)  # (B, N+1, D)
+        if isinstance(feats, tuple):
+            feats = feats[0]
+        cls_token = feats[:, 0]  # (B, D)
+        return self.head(cls_token)
 model = RetinaClassifier(backbone, len(DISEASES)).to(DEVICE)
 
 # --- LOSS & OPTIMIZER ---
