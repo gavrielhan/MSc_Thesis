@@ -15,8 +15,8 @@ from ijepa.src.models.vision_transformer import vit_base  # Use ViT-Base as defa
 import numpy as np
 
 # --- CONFIG ---
-MANIFEST = "retina_manifest.csv"
-DIAGNOSIS = "retina_patient_diagnosis.csv"
+MANIFEST = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/retina_manifest.csv"
+DIAGNOSIS = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/retina_patient_diagnosis.csv"
 DISEASES = [
     "Obesity",  # cardiovascular
     "Essential hypertension",    # hypertension
@@ -36,17 +36,17 @@ PRETRAINED_CKPT = None  # Set path to pretrained checkpoint if available
 transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize([0.5]*6, [0.5]*6)  # 6 channels (OD+OS)
+    transforms.Normalize([0.5]*3, [0.5]*3)  # 3 channels per eye
 ])
 
 # --- DATASET & DATALOADER ---
-dataset = RetinaDataset(MANIFEST, DIAGNOSIS, DISEASES, transform=transform)
-# Compute class weights for imbalance
+# Use the new future-diagnosis CSV as the only input
+FUTURE_CSV = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/retina_future_diagnosis.csv"
+dataset = RetinaDataset(FUTURE_CSV, transform=transform)
+# Compute class weights for imbalance (per disease)
 labels = [label for _, label, *_ in dataset]
-print("Unique labels in dataset:", set(labels))
-print("Expected classes:", np.arange(len(DISEASES)))
-print("Number of samples:", len(labels))
-class_weights = compute_class_weight('balanced', classes=np.arange(len(DISEASES)), y=labels)
+import numpy as np
+class_weights = compute_class_weight('balanced', classes=np.arange(2), y=labels)
 class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
 
 # Split train/val
@@ -145,5 +145,5 @@ if __name__ == "__main__":
         print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
         if val_acc > best_acc:
             best_acc = val_acc
-            torch.save(model.state_dict(), "best_retina_classifier.pt")
+            torch.save(model.state_dict(), "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/best_retina_classifier.pt")
     print("Training complete. Best val acc:", best_acc) 
