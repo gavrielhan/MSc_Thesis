@@ -1,6 +1,9 @@
 # Fine-tune I-JEPA on retina images for disease classification (cardiovascular, hypertension, diabetes)
 # This script should be run from the JEPA directory, not inside ijepa
-import os
+# --- Add I-JEPA src to sys.path so 'src' imports work ---
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "ijepa")))
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,12 +12,13 @@ from torchvision import transforms
 from sklearn.utils.class_weight import compute_class_weight
 from ijepa.src.datasets.retina import RetinaDataset
 from ijepa.src.models.vision_transformer import vit_base  # Use ViT-Base as default backbone
+import numpy as np
 
 # --- CONFIG ---
 MANIFEST = "retina_manifest.csv"
 DIAGNOSIS = "retina_patient_diagnosis.csv"
 DISEASES = [
-    "Coronary atherosclerosis",  # cardiovascular
+    "Obesity",  # cardiovascular
     "Essential hypertension",    # hypertension
     "Diabetes mellitus, type unspecified"  # diabetes
 ]
@@ -39,7 +43,10 @@ transform = transforms.Compose([
 dataset = RetinaDataset(MANIFEST, DIAGNOSIS, DISEASES, transform=transform)
 # Compute class weights for imbalance
 labels = [label for _, label, *_ in dataset]
-class_weights = compute_class_weight('balanced', classes=list(range(len(DISEASES))), y=labels)
+print("Unique labels in dataset:", set(labels))
+print("Expected classes:", np.arange(len(DISEASES)))
+print("Number of samples:", len(labels))
+class_weights = compute_class_weight('balanced', classes=np.arange(len(DISEASES)), y=labels)
 class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
 
 # Split train/val

@@ -28,6 +28,11 @@ def create_retina_manifest(eyes_root: str, manifest_csv: str):
             continue
         # Add '10K_' prefix and rename to RegistrationCode
         registration_code = f"10K_{patient_code}"
+        # Normalize date to ISO format (YYYY-MM-DD) using pandas
+        try:
+            norm_date = pd.to_datetime(date_str, errors='coerce').strftime('%Y-%m-%d')
+        except Exception:
+            norm_date = date_str
         # Find OD and OS images
         od_path = glob.glob(os.path.join(subdir_path, "*OD*.jpg"))
         os_path = glob.glob(os.path.join(subdir_path, "*OS*.jpg"))
@@ -39,7 +44,7 @@ def create_retina_manifest(eyes_root: str, manifest_csv: str):
         os_path = os_path[0]
         rows.append({
             "RegistrationCode": registration_code,
-            "date": date_str,
+            "date": norm_date,
             "od_path": od_path,
             "os_path": os_path
         })
@@ -108,10 +113,67 @@ def create_diagnosis_csv(
     all_rows = pd.concat([base_rows, follow_rows], ignore_index=True)
     all_rows = all_rows.drop_duplicates(subset=['RegistrationCode', 'disease', 'date'])
     all_rows = all_rows.sort_values(['RegistrationCode', 'baseline', 'disease', 'date'])
-
+    # Normalize date to ISO format (YYYY-MM-DD) for all rows
+    all_rows['date'] = pd.to_datetime(all_rows['date'], errors='coerce').dt.strftime('%Y-%m-%d')
     # Write to CSV
     all_rows[['RegistrationCode', 'baseline', 'disease', 'date']].to_csv(output_csv, index=False)
     print(f"Wrote diagnosis info to {output_csv}")
+
+def create_future_diagnosis_csv(
+    manifest_csv="retina_manifest.csv",
+    diagnosis_csv="retina_patient_diagnosis.csv",
+    output_csv="retina_future_diagnosis.csv",
+    diseases=None
+):
+    """
+    For each patient and each disease, for each image, label as 1 if there is a diagnosis date for that disease after the image date, else 0.
+    Overlap only by RegistrationCode, not by exact date.
+    Output columns: RegistrationCode, date, od_path, os_path, disease, label, diagnosis_date (if any future diagnosis exists).
+    """
+    if diseases is None:
+        diseases = [
+            "Obesity",
+            "Essential hypertension",
+            "Diabetes mellitus, type unspecified"
+        ]
+    manifest = pd.read_csv(manifest_csv)
+    diagnosis = pd.read_csv(diagnosis_csv)
+    # Ensure date columns are datetime
+    manifest['date'] = pd.to_datetime(manifest['date'], errors='coerce')
+    diagnosis['date'] = pd.to_datetime(diagnosis['date'], errors='coerce')
+    # For each patient and disease, get all diagnosis dates
+    diag_grouped = diagnosis[diagnosis['disease'].isin(diseases)].groupby(['RegistrationCode','disease'])['date'].apply(list).reset_index()
+    # Build a lookup: (RegistrationCode, disease) -> list of diagnosis_dates
+    diag_lookup = {(row['RegistrationCode'], row['disease']): row['date'] for _, row in diag_grouped.iterrows()}
+    # For each image, for each disease, assign label
+    rows = []
+    for _, img in manifest.iterrows():
+        reg = img['RegistrationCode']
+        img_date = img['date']
+        for disease in diseases:
+            diag_dates = diag_lookup.get((reg, disease), [])
+            # Find any diagnosis date after the image date
+            future_diag_dates = [d for d in diag_dates if not pd.isnull(d) and img_date < d]
+            if pd.isnull(img_date):
+                continue
+            if future_diag_dates:
+                label = 1
+                diagnosis_date = min(future_diag_dates).strftime('%Y-%m-%d')
+            else:
+                label = 0
+                diagnosis_date = ''
+            rows.append({
+                'RegistrationCode': reg,
+                'date': img_date.strftime('%Y-%m-%d'),
+                'od_path': img['od_path'],
+                'os_path': img['os_path'],
+                'disease': disease,
+                'label': label,
+                'diagnosis_date': diagnosis_date
+            })
+    out_df = pd.DataFrame(rows)
+    out_df.to_csv(output_csv, index=False)
+    print(f"Wrote future diagnosis prediction CSV to {output_csv} with {len(out_df)} rows.")
 
 # 3. Main: generate manifest and test dataset
 if __name__ == "__main__":
@@ -119,7 +181,9 @@ if __name__ == "__main__":
     create_retina_manifest(EYES_ROOT, MANIFEST_CSV)
     # Step 2: Create diagnosis CSV
     create_diagnosis_csv()
-    # Step 3: Load dataset and show a batch
+    # Step 3: Create future diagnosis prediction CSV
+    create_future_diagnosis_csv()
+    # Step 4: Load dataset and show a batch
     dataset = RetinaDataset(MANIFEST_CSV)
     loader = DataLoader(dataset, batch_size=4, shuffle=True)
     batch = next(iter(loader))
