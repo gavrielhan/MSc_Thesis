@@ -11,10 +11,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from sklearn.utils.class_weight import compute_class_weight
-print("debug2")
 from ijepa.src.datasets.retina import RetinaDataset
-from ijepa.src.models.vision_transformer import vit_base  # Use ViT-Base as default backbone
-print("debug3")
+from ijepa.src.models.vision_transformer import vit_huge  # Use ViT-H/14 as backbone
+print("debug2")
 import numpy as np
 import pandas as pd
 
