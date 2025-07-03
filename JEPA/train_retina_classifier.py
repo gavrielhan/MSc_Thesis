@@ -16,6 +16,7 @@ from ijepa.src.models.vision_transformer import vit_huge  # Use ViT-H/14 as back
 print("debug2")
 import numpy as np
 import pandas as pd
+import collections
 
 # --- CONFIG ---
 MANIFEST = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/retina_manifest.csv"
@@ -25,11 +26,11 @@ DISEASES = [
     "Essential hypertension",    # hypertension
     "Diabetes mellitus, type unspecified"  # diabetes
 ]
-BATCH_SIZE = 32
+BATCH_SIZE = 4
 EPOCHS = 20
 LR = 1e-4
 NUM_WORKERS = 4
-IMG_SIZE = 224
+IMG_SIZE = (224, 224)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 VIT_PATCH_SIZE = 14
 VIT_EMBED_DIM = 1280  # for vit_huge
@@ -38,7 +39,7 @@ TRIAL = True  # Set to True for a quick test run with 1000 images (at least 100 
 
 # --- TRANSFORMS ---
 transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.Resize(IMG_SIZE),
     transforms.ToTensor(),
     transforms.Normalize([0.5]*3, [0.5]*3)  # 3 channels per eye
 ])
@@ -53,10 +54,24 @@ df = pd.read_csv(FUTURE_CSV)
 print("Label distribution in CSV:")
 print(df['label'].value_counts())
 
+# Print disease distribution for positive samples (label==1)
+if 'disease' in df.columns:
+    pos_diseases = df[df['label'] == 1]['disease']
+    disease_counts = collections.Counter(pos_diseases)
+    print("Disease distribution among positive samples (label==1):")
+    for disease, count in disease_counts.items():
+        print(f"  {disease}: {count}")
+else:
+    print("No 'disease' column found in CSV; cannot print disease distribution for positives.")
+
 if TRIAL:
-    # Sample 1000 images, at least 100 positives (label==1)
-    pos_indices = [i for i, (_, label, *_ ) in enumerate(dataset) if label == 1]
-    neg_indices = [i for i, (_, label, *_ ) in enumerate(dataset) if label == 0]
+    # Sample 1000 images, at least 100 positives (label==1 and disease==Essential hypertension)
+    if 'disease' in df.columns:
+        pos_indices = [i for i, row in df.iterrows() if row['label'] == 1 and row['disease'] == 'Essential hypertension']
+        neg_indices = [i for i, row in df.iterrows() if row['label'] == 0]
+    else:
+        pos_indices = [i for i, (_, label, *_ ) in enumerate(dataset) if label == 1]
+        neg_indices = [i for i, (_, label, *_ ) in enumerate(dataset) if label == 0]
     n_pos = min(100, len(pos_indices))
     n_neg = 1000 - n_pos
     np.random.seed(42)
@@ -66,7 +81,7 @@ if TRIAL:
     np.random.shuffle(trial_indices)
     from torch.utils.data import Subset
     dataset = Subset(dataset, trial_indices)
-    print(f"TRIAL MODE: Using {len(dataset)} samples ({n_pos} positives, {n_neg} negatives)")
+    print(f"TRIAL MODE: Using {len(dataset)} samples ({n_pos} hypertension positives, {n_neg} negatives)")
 
 # Compute class weights for imbalance (per disease)
 labels = [label for _, label, *_ in dataset]
@@ -112,11 +127,11 @@ if PRETRAINED_CKPT is not None and os.path.isfile(PRETRAINED_CKPT):
 else:
     print("No pretrained checkpoint found or specified.")
 
-backbone.eval()
-for p in backbone.parameters():
-    p.requires_grad = False
-
 # Add a trainable classification head using the [CLS] token
+if TRIAL:
+    num_classes = 2
+else:
+    num_classes = len(DISEASES)
 class RetinaClassifier(nn.Module):
     def __init__(self, backbone, num_classes):
         super().__init__()
@@ -128,7 +143,7 @@ class RetinaClassifier(nn.Module):
             feats = feats[0]
         cls_token = feats[:, 0]
         return self.head(cls_token)
-model = RetinaClassifier(backbone, len(DISEASES)).to(DEVICE)
+model = RetinaClassifier(backbone, num_classes).to(DEVICE)
 
 # --- LOSS & OPTIMIZER ---
 criterion = nn.CrossEntropyLoss(weight=class_weights)

@@ -92,6 +92,7 @@ def create_diagnosis_csv(
     Extracts and orders diagnosis info from baseline and follow-up CSVs.
     Output columns: RegistrationCode, baseline (yes/no), disease, date
     Each row: one disease per patient per date.
+    Uses 'created_at' as the diagnosis date.
     """
     # Load data
     df_base = pd.read_csv(baseline_csv)
@@ -99,15 +100,15 @@ def create_diagnosis_csv(
 
     # Baseline: research_stage == 'baseline'
     base_rows = df_base[df_base['research_stage'] == 'baseline'][[
-        'RegistrationCode', 'english_name', 'Date']].copy()
+        'RegistrationCode', 'english_name', 'created_at']].copy()
     base_rows['baseline'] = 'yes'
-    base_rows = base_rows.rename(columns={'english_name': 'disease', 'Date': 'date'})
+    base_rows = base_rows.rename(columns={'english_name': 'disease', 'created_at': 'date'})
 
     # Follow-up: research_stage != 'baseline'
     follow_rows = df_follow[df_follow['research_stage'] != 'baseline'][[
-        'RegistrationCode', 'english_name', 'Date']].copy()
+        'RegistrationCode', 'english_name', 'created_at']].copy()
     follow_rows['baseline'] = 'no'
-    follow_rows = follow_rows.rename(columns={'english_name': 'disease', 'Date': 'date'})
+    follow_rows = follow_rows.rename(columns={'english_name': 'disease', 'created_at': 'date'})
 
     # Concat and sort
     all_rows = pd.concat([base_rows, follow_rows], ignore_index=True)
@@ -138,6 +139,9 @@ def create_future_diagnosis_csv(
         ]
     manifest = pd.read_csv(manifest_csv)
     diagnosis = pd.read_csv(diagnosis_csv)
+    # Debug: print unique disease names
+    print("Unique diseases in diagnosis CSV:", diagnosis['disease'].unique())
+    print("Diseases being searched for:", diseases)
     # Ensure date columns are datetime
     manifest['date'] = pd.to_datetime(manifest['date'], errors='coerce')
     diagnosis['date'] = pd.to_datetime(diagnosis['date'], errors='coerce')
@@ -147,16 +151,21 @@ def create_future_diagnosis_csv(
     diag_lookup = {(row['RegistrationCode'], row['disease']): row['date'] for _, row in diag_grouped.iterrows()}
     # For each image, for each disease, assign label
     rows = []
+    found_any_positive = False
     for _, img in manifest.iterrows():
         reg = img['RegistrationCode']
         img_date = img['date']
         for disease in diseases:
             diag_dates = diag_lookup.get((reg, disease), [])
-            # Find any diagnosis date after the image date
+            # Debug: print sample image and diagnosis dates
+            if len(rows) < 5:
+                print(f"Sample: reg={reg}, disease={disease}, img_date={img_date}, diag_dates={diag_dates}")
             future_diag_dates = [d for d in diag_dates if not pd.isnull(d) and img_date < d]
             if pd.isnull(img_date):
                 continue
             if future_diag_dates:
+                print(f"Found future diagnosis for {reg}, {disease} at {future_diag_dates}")
+                found_any_positive = True
                 label = 1
                 diagnosis_date = min(future_diag_dates).strftime('%Y-%m-%d')
             else:
@@ -171,6 +180,8 @@ def create_future_diagnosis_csv(
                 'label': label,
                 'diagnosis_date': diagnosis_date
             })
+    if not found_any_positive:
+        print("WARNING: No positive (label=1) samples found! Check your data and logic.")
     out_df = pd.DataFrame(rows)
     out_df.to_csv(output_csv, index=False)
     print(f"Wrote future diagnosis prediction CSV to {output_csv} with {len(out_df)} rows.")
