@@ -17,6 +17,12 @@ print("debug2")
 import numpy as np
 import pandas as pd
 import collections
+import shutil
+
+# Set custom temp directory to avoid filling up system TMPDIR
+os.environ['TMPDIR'] = '/home/gavrielh/temp'
+os.environ['TEMP'] = '/home/gavrielh/temp'
+os.environ['TMP'] = '/home/gavrielh/temp'
 
 # --- CONFIG ---
 MANIFEST = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/retina_manifest.csv"
@@ -26,10 +32,10 @@ DISEASES = [
     "Essential hypertension",    # hypertension
     "Diabetes mellitus, type unspecified"  # diabetes
 ]
-BATCH_SIZE = 4
+BATCH_SIZE = 1
 EPOCHS = 20
 LR = 1e-4
-NUM_WORKERS = 4
+NUM_WORKERS = 0
 IMG_SIZE = (224, 224)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 VIT_PATCH_SIZE = 14
@@ -64,24 +70,43 @@ if 'disease' in df.columns:
 else:
     print("No 'disease' column found in CSV; cannot print disease distribution for positives.")
 
+# Compute class weights for imbalance (per disease)
+labels = [label for _, label, *_ in dataset]
+print("Unique labels in dataset after trial/sample:", set(labels))
+print("Number of samples after trial/sample:", len(labels))
+
 if TRIAL:
-    # Sample 1000 images, at least 100 positives (label==1 and disease==Essential hypertension)
+    # Sample exactly 150 positives (hypertension) and 550 negatives for a total of 700 samples
     if 'disease' in df.columns:
         pos_indices = [i for i, row in df.iterrows() if row['label'] == 1 and row['disease'] == 'Essential hypertension']
         neg_indices = [i for i, row in df.iterrows() if row['label'] == 0]
     else:
         pos_indices = [i for i, (_, label, *_ ) in enumerate(dataset) if label == 1]
         neg_indices = [i for i, (_, label, *_ ) in enumerate(dataset) if label == 0]
-    n_pos = min(100, len(pos_indices))
-    n_neg = 1000 - n_pos
+    print(f"Available positives (hypertension): {len(pos_indices)}")
+    print(f"Available negatives: {len(neg_indices)}")
+    n_pos = min(150, len(pos_indices))
+    n_neg = min(700 - n_pos, len(neg_indices))
     np.random.seed(42)
     pos_sample = np.random.choice(pos_indices, n_pos, replace=False) if n_pos > 0 else []
     neg_sample = np.random.choice(neg_indices, n_neg, replace=False) if n_neg > 0 else []
     trial_indices = np.concatenate([pos_sample, neg_sample])
     np.random.shuffle(trial_indices)
+    print(f"Sampled positives: {len(pos_sample)}")
+    print(f"Sampled negatives: {len(neg_sample)}")
+    print(f"Total samples: {len(trial_indices)}")
+    if len(trial_indices) < 700:
+        print(f"WARNING: Only {len(trial_indices)} samples available (requested 700). Using all available samples.")
     from torch.utils.data import Subset
     dataset = Subset(dataset, trial_indices)
-    print(f"TRIAL MODE: Using {len(dataset)} samples ({n_pos} hypertension positives, {n_neg} negatives)")
+    # For stratified split, get labels for the sampled indices
+    if 'disease' in df.columns:
+        trial_labels = [df.iloc[i]['label'] for i in trial_indices]
+    else:
+        trial_labels = [dataset[i][1] for i in range(len(dataset))]
+    print(f"TRIAL MODE: Using {len(trial_indices)} samples ({len(pos_sample)} hypertension positives, {len(neg_sample)} negatives)")
+else:
+    trial_labels = labels
 
 # Compute class weights for imbalance (per disease)
 labels = [label for _, label, *_ in dataset]
@@ -94,17 +119,17 @@ class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
 # Split train/val with stratification to maintain class proportions
 from sklearn.model_selection import train_test_split
 indices = list(range(len(dataset)))
-train_idx, val_idx = train_test_split(indices, test_size=0.2, stratify=labels, random_state=42)
+train_idx, val_idx = train_test_split(indices, test_size=0.2, stratify=trial_labels, random_state=42)
 from torch.utils.data import Subset
 train_set = Subset(dataset, train_idx)
 val_set = Subset(dataset, val_idx)
-print("Train label distribution:", np.bincount([labels[i] for i in train_idx]))
-print("Val label distribution:", np.bincount([labels[i] for i in val_idx]))
+print("Train label distribution:", np.bincount([trial_labels[i] for i in train_idx]))
+print("Val label distribution:", np.bincount([trial_labels[i] for i in val_idx]))
 train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
 val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
 # --- AMP SCALER ---
-scaler = torch.cuda.amp.GradScaler() if DEVICE.type == 'cuda' else None
+scaler = torch.amp.GradScaler('cuda') if DEVICE.type == 'cuda' else None
 
 # --- MODEL ---
 # Instantiate ViT-H/14 backbone for 6-channel input
@@ -146,7 +171,40 @@ class RetinaClassifier(nn.Module):
 model = RetinaClassifier(backbone, num_classes).to(DEVICE)
 
 # --- LOSS & OPTIMIZER ---
-criterion = nn.CrossEntropyLoss(weight=class_weights)
+# Use Focal Loss with class weights for class imbalance
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.95, gamma=2, weight=None, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.weight = weight
+        self.reduction = reduction
+    def forward(self, logits, targets):
+        ce_loss = nn.functional.cross_entropy(logits, targets, reduction='none', weight=self.weight)
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        else:
+            return focal_loss.sum()
+
+# Calculate class weights based on inverse frequency
+if TRIAL:
+    # For trial mode, use the balanced dataset
+    n_neg_trial = 1000  # from trial sampling
+    n_pos_trial = 370  # from trial sampling
+    pos_weight = n_neg_trial / n_pos_trial  # 550/150 = 3.67
+else:
+    # For full dataset, use actual frequencies
+    pos_weight = len(neg_indices) / len(pos_indices) if len(pos_indices) > 0 else 1.0
+
+class_weights = torch.tensor([1.0, pos_weight], dtype=torch.float32, device=DEVICE)
+print(f"Using class weights: [1.0, {pos_weight:.2f}]")
+
+# Default: use FocalLoss with class weights
+criterion = FocalLoss(alpha=0.90, gamma=2, weight=class_weights)
+# To use label smoothing instead, comment the above and uncomment below:
+# criterion = nn.CrossEntropyLoss(label_smoothing=0.2, weight=class_weights)
 optimizer = optim.Adam(model.parameters(), lr=LR)
 
 # --- TRAINING LOOP ---
@@ -157,7 +215,7 @@ def train_one_epoch(model, loader, optimizer, criterion):
         imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
         optimizer.zero_grad()
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 logits = model(imgs)
                 loss = criterion(logits, labels)
             scaler.scale(loss).backward()
@@ -182,7 +240,7 @@ def evaluate(model, loader, criterion):
         for imgs, labels, *_ in loader:
             imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
             if scaler is not None:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     logits = model(imgs)
                     loss = criterion(logits, labels)
             else:
@@ -194,18 +252,44 @@ def evaluate(model, loader, criterion):
             total += imgs.size(0)
             all_labels.extend(labels.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
+            # Debug prints for first batch
+            if len(all_labels) <= imgs.size(0):
+                print("Sample logits (softmax):", logits[:10].softmax(1).cpu().detach().numpy())
+                print("Sample predictions:", preds[:10].cpu().detach().numpy())
+                print("Sample labels:", labels[:10].cpu().detach().numpy())
     from sklearn.metrics import classification_report
-    print(classification_report(all_labels, all_preds, target_names=["No Future Dx", "Future Dx"]))
+    print(classification_report(all_labels, all_preds, target_names=["No Future Dx", "Future Dx"], zero_division=0))
     return total_loss / total, correct / total
+
+def check_tempdir_size(tempdir, max_gb=160):
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(tempdir):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            try:
+                total += os.path.getsize(fp)
+            except Exception:
+                pass
+    total_gb = total / (1024 ** 3)
+    if total_gb > max_gb:
+        print(f"ERROR: {tempdir} exceeds {max_gb}GB ({total_gb:.2f}GB used). Exiting for safety.")
+        sys.exit(1)
 
 # --- MAIN ---
 if __name__ == "__main__":
     best_acc = 0
     for epoch in range(EPOCHS):
+        check_tempdir_size('/home/gavrielh/temp', max_gb=160)
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion)
         val_loss, val_acc = evaluate(model, val_loader, criterion)
         print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
         if val_acc > best_acc:
             best_acc = val_acc
-            torch.save(model.state_dict(), "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/best_retina_classifier.pt")
-    print("Training complete. Best val acc:", best_acc) 
+            #torch.save(model.state_dict(), "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/best_retina_classifier.pt")
+    print("Training complete. Best val acc:", best_acc)
+    # Clean up temp directory after training
+    try:
+        shutil.rmtree('/home/gavrielh/temp')
+        print('Cleaned up /home/gavrielh/temp')
+    except Exception as e:
+        print(f'Could not clean up /home/gavrielh/temp: {e}')
