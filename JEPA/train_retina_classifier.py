@@ -180,135 +180,146 @@ if CHECK:
     roc_aucs = []
     for IMG_SIZE_CUR in sizes:
         print(f"\n[CHECK MODE] Running for image size {IMG_SIZE_CUR}x{IMG_SIZE_CUR} ...")
-        # Update transform for this size
-        transform_cur = transforms.Compose([
-            transforms.Resize((IMG_SIZE_CUR, IMG_SIZE_CUR)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5]*3, [0.5]*3)
-        ])
-        # Re-instantiate backbone for this size
-        backbone = vit_huge(patch_size=VIT_PATCH_SIZE, img_size=(IMG_SIZE_CUR, IMG_SIZE_CUR), in_chans=6)
-        if PRETRAINED_CKPT is not None and os.path.isfile(PRETRAINED_CKPT):
-            state_dict = torch.load(PRETRAINED_CKPT, map_location=DEVICE)
-            if hasattr(backbone, 'patch_embed') and hasattr(backbone.patch_embed, 'proj'):
-                w = state_dict.get('patch_embed.proj.weight', None)
-                if w is not None and w.shape[1] == 3 and backbone.patch_embed.proj.weight.shape[1] == 6:
-                    w6 = w.repeat(1, 2, 1, 1)[:, :6]
-                    state_dict['patch_embed.proj.weight'] = w6
-            try:
-                backbone.load_state_dict(state_dict, strict=False)
-                print(f"Loaded pretrained weights from {PRETRAINED_CKPT}")
-            except Exception as e:
-                print(f"Error loading checkpoint: {e}")
-        else:
-            print("No pretrained checkpoint found or specified.")
-        backbone = backbone.to(DEVICE)
-        backbone.eval()
-        PREVALENT_CSV = os.path.join(BASE_DIR, "retina_prevalent_future_diagnosis.csv")
-        df = pd.read_csv(PREVALENT_CSV)
-        # Select 800 true negatives (both prevalent and future == 0) and 200 positives for the selected label
-        neg_indices = df.index[(df[f'prevalent_{DISEASE_TO_TRAIN}'] == 0) & (df[f'future_{DISEASE_TO_TRAIN}'] == 0)].tolist()
-        pos_indices = df.index[df[LABEL_COL] == 1].tolist()
-        np.random.shuffle(neg_indices)
-        np.random.shuffle(pos_indices)
-        neg_indices_800 = neg_indices[:800]
-        pos_indices_200 = pos_indices[:200]
-        check_indices = np.concatenate([neg_indices_800, pos_indices_200])
-        check_df = df.loc[check_indices]
-        check_labels = np.array([0]*800 + [1]*200)
-        check_dataset = RetinaFineTuneDataset(check_df, LABEL_COL, transform=transform_cur)
-        check_loader = DataLoader(check_dataset, batch_size=32, shuffle=False, num_workers=NUM_WORKERS)
-        # Extract embeddings
-        all_embeds = []
-        with torch.no_grad():
-            for imgs, _ in check_loader:
-                imgs = imgs.to(DEVICE)
-                feats = backbone(imgs)
-                if isinstance(feats, tuple):
-                    feats = feats[0]
-                cls_token = feats[:, 0].cpu().numpy()
-                all_embeds.append(cls_token)
-        all_embeds = np.concatenate(all_embeds, axis=0)
-        print(f"Length of embeddings: {len(all_embeds)} (shape: {all_embeds.shape})")
-        # KNN classification (full set: 800 neg, 200 pos)
-        from sklearn.neighbors import KNeighborsClassifier
-        from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, roc_curve
-        knn = KNeighborsClassifier(n_neighbors=5)
-        knn.fit(all_embeds, check_labels)
-        pred_probs = knn.predict_proba(all_embeds)[:, 1]
-        roc_auc = roc_auc_score(check_labels, pred_probs)
-        precision, recall, _ = precision_recall_curve(check_labels, pred_probs)
-        pr_auc = auc(recall, precision)
-        pr_aucs.append(pr_auc)
-        roc_aucs.append(roc_auc)
-        print(f"KNN ROC AUC (800N/200P): {roc_auc:.3f}")
-        print(f"KNN PR AUC (800N/200P): {pr_auc:.3f}")
-        # PCA plot: 200 positives vs 200 negatives (balanced)
-        from sklearn.decomposition import PCA
-        import matplotlib.pyplot as plt
-        neg_indices_200 = neg_indices[:200]
-        pos_indices_200 = pos_indices[:200]
-        pca_indices_balanced = np.concatenate([neg_indices_200, pos_indices_200])
-        pca_labels_balanced = np.array([0]*200 + [1]*200)
-        mask_balanced = np.isin(check_indices, pca_indices_balanced)
-        embeds_balanced = all_embeds[mask_balanced]
-        knn_bal = KNeighborsClassifier(n_neighbors=5)
-        knn_bal.fit(embeds_balanced, pca_labels_balanced)
-        pred_probs_bal = knn_bal.predict_proba(embeds_balanced)[:, 1]
-        roc_auc_bal = roc_auc_score(pca_labels_balanced, pred_probs_bal)
-        precision_bal, recall_bal, _ = precision_recall_curve(pca_labels_balanced, pred_probs_bal)
-        pr_auc_bal = auc(recall_bal, precision_bal)
-        pca = PCA(n_components=2)
-        pca_embeds_bal = pca.fit_transform(embeds_balanced)
-        plt.figure(figsize=(6, 5))
-        for label, name, color in zip([0, 1], ['negative', 'positive'], ['blue', 'red']):
-            plt.scatter(pca_embeds_bal[pca_labels_balanced == label, 0], pca_embeds_bal[pca_labels_balanced == label, 1], label=name, alpha=0.6, s=20, c=color)
-        plt.title(f'PCA: 200 negative vs 200 positive ({LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR})\nKNN ROC AUC={roc_auc_bal:.2f}, PR AUC={pr_auc_bal:.2f}')
-        plt.xlabel('PC1')
-        plt.ylabel('PC2')
-        plt.legend()
-        plt.tight_layout()
-        pca_200n_200p_path = os.path.join(IMAGES_DIR, f'pca_200n_200p_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
-        plt.savefig(pca_200n_200p_path)
-        print(f"Saved PCA plot (200N/200P) as '{pca_200n_200p_path}'")
-        # PCA plot: 800 negatives vs 200 positives (full set)
-        pca = PCA(n_components=2)
-        pca_embeds_full = pca.fit_transform(all_embeds)
-        plt.figure(figsize=(6, 5))
-        for label, name, color in zip([0, 1], ['negative', 'positive'], ['blue', 'red']):
-            plt.scatter(pca_embeds_full[check_labels == label, 0], pca_embeds_full[check_labels == label, 1], label=name, alpha=0.6, s=20, c=color)
-        plt.title(f'PCA: 800 negative vs 200 positive ({LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR})\nKNN ROC AUC={roc_auc:.2f}, PR AUC={pr_auc:.2f}')
-        plt.xlabel('PC1')
-        plt.ylabel('PC2')
-        plt.legend()
-        plt.tight_layout()
-        pca_800n_200p_path = os.path.join(IMAGES_DIR, f'pca_800n_200p_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
-        plt.savefig(pca_800n_200p_path)
-        print(f"Saved PCA plot (800N/200P) as '{pca_800n_200p_path}'")
-        # Plot ROC and PR curves (full set)
-        fpr, tpr, _ = roc_curve(check_labels, pred_probs)
-        plt.figure()
-        plt.plot(fpr, tpr, label=f'ROC AUC = {roc_auc:.2f}')
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title(f'KNN ROC Curve (Embeddings) - {LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR}')
-        plt.legend()
-        roc_curve_path = os.path.join(IMAGES_DIR, f'knn_roc_curve_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
-        plt.savefig(roc_curve_path)
-        plt.figure()
-        plt.plot(recall, precision, label=f'PR AUC = {pr_auc:.2f}')
-        plt.xlabel('Recall')
-        plt.ylabel('Precision')
-        plt.title(f'KNN Precision-Recall Curve (Embeddings) - {LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR}')
-        plt.legend()
-        pr_curve_path = os.path.join(IMAGES_DIR, f'knn_pr_curve_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
-        plt.savefig(pr_curve_path)
-        print(f"Saved KNN ROC and PR curves as '{roc_curve_path}' and '{pr_curve_path}'")
+        # Use batch size 1 for large images
+        batch_size_cur = 1 if IMG_SIZE_CUR >= 560 else 32
+        try:
+            # Update transform for this size
+            transform_cur = transforms.Compose([
+                transforms.Resize((IMG_SIZE_CUR, IMG_SIZE_CUR)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5]*3, [0.5]*3)
+            ])
+            # Re-instantiate backbone for this size
+            backbone = vit_huge(patch_size=VIT_PATCH_SIZE, img_size=(IMG_SIZE_CUR, IMG_SIZE_CUR), in_chans=6)
+            if PRETRAINED_CKPT is not None and os.path.isfile(PRETRAINED_CKPT):
+                state_dict = torch.load(PRETRAINED_CKPT, map_location=DEVICE)
+                if hasattr(backbone, 'patch_embed') and hasattr(backbone.patch_embed, 'proj'):
+                    w = state_dict.get('patch_embed.proj.weight', None)
+                    if w is not None and w.shape[1] == 3 and backbone.patch_embed.proj.weight.shape[1] == 6:
+                        w6 = w.repeat(1, 2, 1, 1)[:, :6]
+                        state_dict['patch_embed.proj.weight'] = w6
+                try:
+                    backbone.load_state_dict(state_dict, strict=False)
+                    print(f"Loaded pretrained weights from {PRETRAINED_CKPT}")
+                except Exception as e:
+                    print(f"Error loading checkpoint: {e}")
+            else:
+                print("No pretrained checkpoint found or specified.")
+            backbone = backbone.to(DEVICE)
+            backbone.eval()
+            PREVALENT_CSV = os.path.join(BASE_DIR, "retina_prevalent_future_diagnosis.csv")
+            df = pd.read_csv(PREVALENT_CSV)
+            # Select 800 true negatives (both prevalent and future == 0) and 200 positives for the selected label
+            neg_indices = df.index[(df[f'prevalent_{DISEASE_TO_TRAIN}'] == 0) & (df[f'future_{DISEASE_TO_TRAIN}'] == 0)].tolist()
+            pos_indices = df.index[df[LABEL_COL] == 1].tolist()
+            np.random.shuffle(neg_indices)
+            np.random.shuffle(pos_indices)
+            neg_indices_800 = neg_indices[:800]
+            pos_indices_200 = pos_indices[:200]
+            check_indices = np.concatenate([neg_indices_800, pos_indices_200])
+            check_df = df.loc[check_indices]
+            check_labels = np.array([0]*800 + [1]*200)
+            check_dataset = RetinaFineTuneDataset(check_df, LABEL_COL, transform=transform_cur)
+            check_loader = DataLoader(check_dataset, batch_size=batch_size_cur, shuffle=False, num_workers=NUM_WORKERS)
+            # Extract embeddings
+            all_embeds = []
+            with torch.no_grad():
+                for imgs, _ in check_loader:
+                    imgs = imgs.to(DEVICE)
+                    feats = backbone(imgs)
+                    if isinstance(feats, tuple):
+                        feats = feats[0]
+                    cls_token = feats[:, 0].cpu().numpy()
+                    all_embeds.append(cls_token)
+            all_embeds = np.concatenate(all_embeds, axis=0)
+            print(f"Length of embeddings: {len(all_embeds)} (shape: {all_embeds.shape})")
+            # KNN classification (full set: 800 neg, 200 pos)
+            from sklearn.neighbors import KNeighborsClassifier
+            from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, roc_curve
+            knn = KNeighborsClassifier(n_neighbors=5)
+            knn.fit(all_embeds, check_labels)
+            pred_probs = knn.predict_proba(all_embeds)[:, 1]
+            roc_auc = roc_auc_score(check_labels, pred_probs)
+            precision, recall, _ = precision_recall_curve(check_labels, pred_probs)
+            pr_auc = auc(recall, precision)
+            pr_aucs.append(pr_auc)
+            roc_aucs.append(roc_auc)
+            print(f"KNN ROC AUC (800N/200P): {roc_auc:.3f}")
+            print(f"KNN PR AUC (800N/200P): {pr_auc:.3f}")
+            # PCA plot: 200 positives vs 200 negatives (balanced)
+            from sklearn.decomposition import PCA
+            import matplotlib.pyplot as plt
+            neg_indices_200 = neg_indices[:200]
+            pos_indices_200 = pos_indices[:200]
+            pca_indices_balanced = np.concatenate([neg_indices_200, pos_indices_200])
+            pca_labels_balanced = np.array([0]*200 + [1]*200)
+            mask_balanced = np.isin(check_indices, pca_indices_balanced)
+            embeds_balanced = all_embeds[mask_balanced]
+            knn_bal = KNeighborsClassifier(n_neighbors=5)
+            knn_bal.fit(embeds_balanced, pca_labels_balanced)
+            pred_probs_bal = knn_bal.predict_proba(embeds_balanced)[:, 1]
+            roc_auc_bal = roc_auc_score(pca_labels_balanced, pred_probs_bal)
+            precision_bal, recall_bal, _ = precision_recall_curve(pca_labels_balanced, pred_probs_bal)
+            pr_auc_bal = auc(recall_bal, precision_bal)
+            pca = PCA(n_components=2)
+            pca_embeds_bal = pca.fit_transform(embeds_balanced)
+            plt.figure(figsize=(6, 5))
+            for label, name, color in zip([0, 1], ['negative', 'positive'], ['blue', 'red']):
+                plt.scatter(pca_embeds_bal[pca_labels_balanced == label, 0], pca_embeds_bal[pca_labels_balanced == label, 1], label=name, alpha=0.6, s=20, c=color)
+            plt.title(f'PCA: 200 negative vs 200 positive ({LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR})\nKNN ROC AUC={roc_auc_bal:.2f}, PR AUC={pr_auc_bal:.2f}')
+            plt.xlabel('PC1')
+            plt.ylabel('PC2')
+            plt.legend()
+            plt.tight_layout()
+            pca_200n_200p_path = os.path.join(IMAGES_DIR, f'pca_200n_200p_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
+            plt.savefig(pca_200n_200p_path)
+            print(f"Saved PCA plot (200N/200P) as '{pca_200n_200p_path}'")
+            # PCA plot: 800 negatives vs 200 positives (full set)
+            pca = PCA(n_components=2)
+            pca_embeds_full = pca.fit_transform(all_embeds)
+            plt.figure(figsize=(6, 5))
+            for label, name, color in zip([0, 1], ['negative', 'positive'], ['blue', 'red']):
+                plt.scatter(pca_embeds_full[check_labels == label, 0], pca_embeds_full[check_labels == label, 1], label=name, alpha=0.6, s=20, c=color)
+            plt.title(f'PCA: 800 negative vs 200 positive ({LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR})\nKNN ROC AUC={roc_auc:.2f}, PR AUC={pr_auc:.2f}')
+            plt.xlabel('PC1')
+            plt.ylabel('PC2')
+            plt.legend()
+            plt.tight_layout()
+            pca_800n_200p_path = os.path.join(IMAGES_DIR, f'pca_800n_200p_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
+            plt.savefig(pca_800n_200p_path)
+            print(f"Saved PCA plot (800N/200P) as '{pca_800n_200p_path}'")
+            # Plot ROC and PR curves (full set)
+            fpr, tpr, _ = roc_curve(check_labels, pred_probs)
+            plt.figure()
+            plt.plot(fpr, tpr, label=f'ROC AUC = {roc_auc:.2f}')
+            plt.xlabel('False Positive Rate')
+            plt.ylabel('True Positive Rate')
+            plt.title(f'KNN ROC Curve (Embeddings) - {LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR}')
+            plt.legend()
+            roc_curve_path = os.path.join(IMAGES_DIR, f'knn_roc_curve_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
+            plt.savefig(roc_curve_path)
+            plt.figure()
+            plt.plot(recall, precision, label=f'PR AUC = {pr_auc:.2f}')
+            plt.xlabel('Recall')
+            plt.ylabel('Precision')
+            plt.title(f'KNN Precision-Recall Curve (Embeddings) - {LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR}')
+            plt.legend()
+            pr_curve_path = os.path.join(IMAGES_DIR, f'knn_pr_curve_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
+            plt.savefig(pr_curve_path)
+            print(f"Saved KNN ROC and PR curves as '{roc_curve_path}' and '{pr_curve_path}'")
+        except RuntimeError as e:
+            import torch
+            if 'out of memory' in str(e):
+                print(f'CUDA OOM at size {IMG_SIZE_CUR}, skipping...')
+                torch.cuda.empty_cache()
+                continue
+            else:
+                raise
     # After all sizes, plot PR AUC and ROC AUC vs. image size
     import matplotlib.pyplot as plt
     plt.figure(figsize=(8, 6))
-    plt.plot(sizes, pr_aucs, 'o-r', label='PR AUC')
-    plt.plot(sizes, roc_aucs, 'o-b', label='ROC AUC')
+    plt.plot(sizes[:len(pr_aucs)], pr_aucs, 'o-r', label='PR AUC')
+    plt.plot(sizes[:len(roc_aucs)], roc_aucs, 'o-b', label='ROC AUC')
     plt.xlabel('Image Size (pixels)')
     plt.ylabel('AUC')
     plt.title(f'PR AUC and ROC AUC vs. Image Size ({LABEL_COL})')
