@@ -8,7 +8,7 @@ print("debug1")
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from sklearn.utils.class_weight import compute_class_weight
 from ijepa.src.datasets.retina import RetinaDataset
@@ -18,6 +18,30 @@ import numpy as np
 import pandas as pd
 import collections
 import shutil
+from sklearn.metrics import precision_recall_curve, auc
+import matplotlib.pyplot as plt
+from PIL import Image
+
+# Custom Dataset for fine-tuning
+class RetinaFineTuneDataset(Dataset):
+    def __init__(self, df, transform=None):
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        od_img = Image.open(row['od_path']).convert('RGB')
+        os_img = Image.open(row['os_path']).convert('RGB')
+        if self.transform:
+            od_img = self.transform(od_img)
+            os_img = self.transform(os_img)
+        img = torch.cat([od_img, os_img], dim=0)
+        label = int(row['prevalent_hypertension'])
+        future_flag = int(row['future_hypertension'])
+        return img, label, future_flag
 
 # Set custom temp directory to avoid filling up system TMPDIR
 os.environ['TMPDIR'] = '/home/gavrielh/temp'
@@ -43,6 +67,13 @@ VIT_EMBED_DIM = 1280  # for vit_huge
 PRETRAINED_CKPT = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN22K-vit.h.14-900e.pth.tar"
 TRIAL = True  # Set to True for a quick test run with 1000 images (at least 100 positives)
 
+# Set the desired number of samples for each group in one place
+N_POS_PREVALENT = 161
+N_POS_FUTURE_TRAIN = 200
+N_POS_FUTURE_TEST = 170
+N_NEG = 800 - N_POS_PREVALENT - N_POS_FUTURE_TRAIN
+TRIAL_PERCENT = 1.0  # Use 20% of each group in TRIAL mode
+
 # --- TRANSFORMS ---
 transform = transforms.Compose([
     transforms.Resize(IMG_SIZE),
@@ -52,81 +83,74 @@ transform = transforms.Compose([
 
 # --- DATASET & DATALOADER ---
 print("Loading data")
-FUTURE_CSV = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/retina_future_diagnosis.csv"
-dataset = RetinaDataset(FUTURE_CSV, transform=transform)
+PREVALENT_CSV = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/retina_prevalent_future_diagnosis.csv"
+df = pd.read_csv(PREVALENT_CSV)
+print("Label distribution in CSV (prevalent_hypertension):")
+print(df['prevalent_hypertension'].value_counts())
+print("Label distribution in CSV (future_hypertension):")
+print(df['future_hypertension'].value_counts())
 
-# Print label distribution in the CSV
-df = pd.read_csv(FUTURE_CSV)
-print("Label distribution in CSV:")
-print(df['label'].value_counts())
-
-# Print disease distribution for positive samples (label==1)
-if 'disease' in df.columns:
-    pos_diseases = df[df['label'] == 1]['disease']
-    disease_counts = collections.Counter(pos_diseases)
-    print("Disease distribution among positive samples (label==1):")
-    for disease, count in disease_counts.items():
-        print(f"  {disease}: {count}")
-else:
-    print("No 'disease' column found in CSV; cannot print disease distribution for positives.")
-
-# Compute class weights for imbalance (per disease)
-labels = [label for _, label, *_ in dataset]
-print("Unique labels in dataset after trial/sample:", set(labels))
-print("Number of samples after trial/sample:", len(labels))
-
+# For training: positives = prevalent_hypertension==1, negatives = prevalent_hypertension==0
 if TRIAL:
-    # Sample exactly 150 positives (hypertension) and 550 negatives for a total of 700 samples
-    if 'disease' in df.columns:
-        pos_indices = [i for i, row in df.iterrows() if row['label'] == 1 and row['disease'] == 'Essential hypertension']
-        neg_indices = [i for i, row in df.iterrows() if row['label'] == 0]
-    else:
-        pos_indices = [i for i, (_, label, *_ ) in enumerate(dataset) if label == 1]
-        neg_indices = [i for i, (_, label, *_ ) in enumerate(dataset) if label == 0]
-    print(f"Available positives (hypertension): {len(pos_indices)}")
-    print(f"Available negatives: {len(neg_indices)}")
-    n_pos = min(150, len(pos_indices))
-    n_neg = min(700 - n_pos, len(neg_indices))
-    np.random.seed(42)
-    pos_sample = np.random.choice(pos_indices, n_pos, replace=False) if n_pos > 0 else []
-    neg_sample = np.random.choice(neg_indices, n_neg, replace=False) if n_neg > 0 else []
-    trial_indices = np.concatenate([pos_sample, neg_sample])
-    np.random.shuffle(trial_indices)
-    print(f"Sampled positives: {len(pos_sample)}")
-    print(f"Sampled negatives: {len(neg_sample)}")
-    print(f"Total samples: {len(trial_indices)}")
-    if len(trial_indices) < 700:
-        print(f"WARNING: Only {len(trial_indices)} samples available (requested 700). Using all available samples.")
-    from torch.utils.data import Subset
-    dataset = Subset(dataset, trial_indices)
-    # For stratified split, get labels for the sampled indices
-    if 'disease' in df.columns:
-        trial_labels = [df.iloc[i]['label'] for i in trial_indices]
-    else:
-        trial_labels = [dataset[i][1] for i in range(len(dataset))]
-    print(f"TRIAL MODE: Using {len(trial_indices)} samples ({len(pos_sample)} hypertension positives, {len(neg_sample)} negatives)")
+    # Reduce numbers by TRIAL_PERCENT
+    n_pos_prevalent = max(1, int(N_POS_PREVALENT * TRIAL_PERCENT))
+    n_pos_future_train = max(1, int(N_POS_FUTURE_TRAIN * TRIAL_PERCENT))
+    n_pos_future_test = max(1, int(N_POS_FUTURE_TEST * TRIAL_PERCENT))
+    n_neg = max(1, int(N_NEG * TRIAL_PERCENT))
 else:
-    trial_labels = labels
+    n_pos_prevalent = N_POS_PREVALENT
+    n_pos_future_train = N_POS_FUTURE_TRAIN
+    n_pos_future_test = N_POS_FUTURE_TEST
+    n_neg = N_NEG
 
-# Compute class weights for imbalance (per disease)
-labels = [label for _, label, *_ in dataset]
-print("Unique labels in dataset after trial/sample:", set(labels))
-print("Number of samples after trial/sample:", len(labels))
-import numpy as np
-class_weights = compute_class_weight('balanced', classes=np.arange(2), y=labels)
-class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
+future_indices = df.index[df['future_hypertension'] == 1].tolist()
+np.random.seed(42)
+np.random.shuffle(future_indices)
+future_train_indices = future_indices[:n_pos_future_train]
+future_test_indices = future_indices[n_pos_future_train:n_pos_future_train + n_pos_future_test]
+# Remove these from the general pool
+remaining_indices = list(set(df.index) - set(future_train_indices) - set(future_test_indices))
+# Sample the rest as before
+pos_indices = df.index[df['prevalent_hypertension'] == 1].tolist()
+neg_indices = df.index[df['prevalent_hypertension'] == 0].tolist()
+# Remove any overlap with future_train/test
+pos_indices = list(set(pos_indices) - set(future_train_indices) - set(future_test_indices))
+neg_indices = list(set(neg_indices) - set(future_train_indices) - set(future_test_indices))
+# Sample
+n_pos_prevalent = min(n_pos_prevalent, len(pos_indices))
+n_neg = min(n_neg, len(neg_indices))
+pos_sample = np.random.choice(pos_indices, n_pos_prevalent, replace=False) if n_pos_prevalent > 0 else []
+neg_sample = np.random.choice(neg_indices, n_neg, replace=False) if n_neg > 0 else []
+train_indices = np.concatenate([future_train_indices, pos_sample, neg_sample])
+np.random.shuffle(train_indices)
+test_indices = np.array(future_test_indices)
+print(f"TRAIN: {len(train_indices)} (future hypertension: {len(future_train_indices)}, prevalent: {len(pos_sample)}, negatives: {len(neg_sample)})")
+print(f"TEST: {len(test_indices)} (future hypertension)")
+# Prepare datasets
+train_df = df.loc[train_indices]
+test_df = df.loc[test_indices]
+
+# Create custom datasets
+train_dataset = RetinaFineTuneDataset(train_df, transform=transform)
+test_dataset = RetinaFineTuneDataset(test_df, transform=transform)
 
 # Split train/val with stratification to maintain class proportions
 from sklearn.model_selection import train_test_split
-indices = list(range(len(dataset)))
-train_idx, val_idx = train_test_split(indices, test_size=0.2, stratify=trial_labels, random_state=42)
+train_labels = train_df['prevalent_hypertension'].tolist()
+train_idx, val_idx = train_test_split(list(range(len(train_dataset))), test_size=0.2, stratify=train_labels, random_state=42)
 from torch.utils.data import Subset
-train_set = Subset(dataset, train_idx)
-val_set = Subset(dataset, val_idx)
-print("Train label distribution:", np.bincount([trial_labels[i] for i in train_idx]))
-print("Val label distribution:", np.bincount([trial_labels[i] for i in val_idx]))
+train_set = Subset(train_dataset, train_idx)
+val_set = Subset(train_dataset, val_idx)
+print("Train label distribution:", np.bincount([train_labels[i] for i in train_idx]))
+print("Val label distribution:", np.bincount([train_labels[i] for i in val_idx]))
 train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
 val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+# Compute class weights for imbalance
+train_labels = [train_dataset[i][1] for i in range(len(train_dataset))]
+class_weights = compute_class_weight('balanced', classes=np.arange(2), y=train_labels)
+class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
 
 # --- AMP SCALER ---
 scaler = torch.amp.GradScaler('cuda') if DEVICE.type == 'cuda' else None
@@ -188,22 +212,10 @@ class FocalLoss(nn.Module):
         else:
             return focal_loss.sum()
 
-# Calculate class weights based on inverse frequency
-if TRIAL:
-    # For trial mode, use the balanced dataset
-    n_neg_trial = 1000  # from trial sampling
-    n_pos_trial = 370  # from trial sampling
-    pos_weight = n_neg_trial / n_pos_trial  # 550/150 = 3.67
-else:
-    # For full dataset, use actual frequencies
-    pos_weight = len(neg_indices) / len(pos_indices) if len(pos_indices) > 0 else 1.0
-
-class_weights = torch.tensor([1.0, pos_weight], dtype=torch.float32, device=DEVICE)
-print(f"Using class weights: [1.0, {pos_weight:.2f}]")
-
 # Default: use FocalLoss with class weights
-criterion = FocalLoss(alpha=0.90, gamma=2, weight=class_weights)
+# criterion = FocalLoss(alpha=0.90, gamma=2, weight=class_weights)
 # To use label smoothing instead, comment the above and uncomment below:
+criterion = nn.CrossEntropyLoss(weight=class_weights)
 # criterion = nn.CrossEntropyLoss(label_smoothing=0.2, weight=class_weights)
 optimizer = optim.Adam(model.parameters(), lr=LR)
 
@@ -218,6 +230,8 @@ def train_one_epoch(model, loader, optimizer, criterion):
             with torch.amp.autocast('cuda'):
                 logits = model(imgs)
                 loss = criterion(logits, labels)
+                # Debug prints
+                print(f"[TRAIN] Batch: Loss={loss.item()} | Logits={logits.detach().cpu().numpy()} | Labels={labels.detach().cpu().numpy()}")
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -226,6 +240,8 @@ def train_one_epoch(model, loader, optimizer, criterion):
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
+            # Debug prints
+            print(f"[TRAIN] Batch: Loss={loss.item()} | Logits={logits.detach().cpu().numpy()} | Labels={labels.detach().cpu().numpy()}")
         total_loss += loss.item() * imgs.size(0)
         preds = logits.argmax(1)
         correct += (preds == labels).sum().item()
@@ -243,9 +259,13 @@ def evaluate(model, loader, criterion):
                 with torch.amp.autocast('cuda'):
                     logits = model(imgs)
                     loss = criterion(logits, labels)
+                    # Debug prints
+                    print(f"[VAL] Batch: Loss={loss.item()} | Logits={logits.detach().cpu().numpy()} | Labels={labels.detach().cpu().numpy()}")
             else:
                 logits = model(imgs)
                 loss = criterion(logits, labels)
+                # Debug prints
+                print(f"[VAL] Batch: Loss={loss.item()} | Logits={logits.detach().cpu().numpy()} | Labels={labels.detach().cpu().numpy()}")
             total_loss += loss.item() * imgs.size(0)
             preds = logits.argmax(1)
             correct += (preds == labels).sum().item()
@@ -293,3 +313,33 @@ if __name__ == "__main__":
         print('Cleaned up /home/gavrielh/temp')
     except Exception as e:
         print(f'Could not clean up /home/gavrielh/temp: {e}')
+
+# --- Evaluation loop ---
+all_test_logits = []
+all_test_labels = []
+for batch in test_loader:  # Use test_loader for future hypertension evaluation
+    imgs = batch[0].to(DEVICE)
+    labels = batch[1].to(DEVICE)  # prevalent_hypertension labels
+    with torch.no_grad():
+        logits = model(imgs)
+        all_test_logits.append(logits.cpu().numpy())
+        all_test_labels.append(labels.cpu().numpy())
+test_logits = np.concatenate(all_test_logits, axis=0)  # shape: (num_samples, 2)
+test_labels = np.concatenate(all_test_labels, axis=0)
+
+# --- After evaluation, compute PR AUC for future hypertension in test set ---
+import torch
+probs = torch.softmax(torch.tensor(test_logits), dim=1).numpy()
+future_mask = test_df['future_hypertension'] == 1
+future_labels = np.array(test_labels)[future_mask]
+future_probs = probs[future_mask, 1]
+precision, recall, _ = precision_recall_curve(future_labels, future_probs)
+pr_auc = auc(recall, precision)
+plt.figure()
+plt.plot(recall, precision, label=f'PR AUC = {pr_auc:.2f}')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Precision-Recall curve (Future Hypertension)')
+plt.legend()
+plt.savefig('pr_auc_future_hypertension.png')
+print(f"Saved PR AUC curve for future hypertension to pr_auc_future_hypertension.png (AUC={pr_auc:.3f})")
