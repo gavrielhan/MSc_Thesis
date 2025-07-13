@@ -13,6 +13,8 @@ from torchvision import transforms
 from sklearn.utils.class_weight import compute_class_weight
 from ijepa.src.datasets.retina import RetinaDataset
 from ijepa.src.models.vision_transformer import vit_huge  # Use ViT-H/14 as backbone
+# LoRA imports
+from peft import get_peft_model, LoraConfig, TaskType
 print("debug2")
 import numpy as np
 import pandas as pd
@@ -21,11 +23,37 @@ import shutil
 from sklearn.metrics import precision_recall_curve, auc
 import matplotlib.pyplot as plt
 from PIL import Image
+from sklearn.metrics import classification_report, confusion_matrix
+import math
+
+# --- MAIN MODE FLAG ---
+CHECK = True  # Set to True to run the embedding/knn check and exit
+
+# Class-Balanced Loss based on Effective Number of Samples
+class ClassBalancedLoss(nn.Module):
+    def __init__(self, beta, samples_per_cls, loss_type='softmax', device='cpu'):
+        super().__init__()
+        self.beta = beta
+        self.samples_per_cls = samples_per_cls
+        self.loss_type = loss_type
+        self.device = device
+        effective_num = 1.0 - np.power(self.beta, self.samples_per_cls)
+        weights = (1.0 - self.beta) / np.array(effective_num)
+        weights = weights / np.sum(weights) * len(self.samples_per_cls)
+        self.class_weights = torch.tensor(weights, dtype=torch.float32, device=self.device)
+        print(f"ClassBalancedLoss: effective_num={effective_num}, weights={weights}")
+
+    def forward(self, logits, labels):
+        if self.loss_type == 'softmax':
+            return nn.functional.cross_entropy(logits, labels, weight=self.class_weights)
+        else:
+            raise NotImplementedError("Only softmax (cross-entropy) supported.")
 
 # Custom Dataset for fine-tuning
 class RetinaFineTuneDataset(Dataset):
-    def __init__(self, df, transform=None):
+    def __init__(self, df, label_col, transform=None):
         self.df = df.reset_index(drop=True)
+        self.label_col = label_col
         self.transform = transform
 
     def __len__(self):
@@ -39,9 +67,8 @@ class RetinaFineTuneDataset(Dataset):
             od_img = self.transform(od_img)
             os_img = self.transform(os_img)
         img = torch.cat([od_img, os_img], dim=0)
-        label = int(row['prevalent_hypertension'])
-        future_flag = int(row['future_hypertension'])
-        return img, label, future_flag
+        label = int(row[self.label_col])
+        return img, label
 
 # Set custom temp directory to avoid filling up system TMPDIR
 os.environ['TMPDIR'] = '/home/gavrielh/temp'
@@ -49,13 +76,19 @@ os.environ['TEMP'] = '/home/gavrielh/temp'
 os.environ['TMP'] = '/home/gavrielh/temp'
 
 # --- CONFIG ---
-MANIFEST = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/retina_manifest.csv"
-DIAGNOSIS = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/retina_patient_diagnosis.csv"
+# Set base directory for all file paths
+BASE_DIR = os.path.expanduser("~/PycharmProjects/MSc_Thesis/JEPA")
+MANIFEST = os.path.join(BASE_DIR, "retina_manifest.csv")
+DIAGNOSIS = os.path.join(BASE_DIR, "retina_patient_diagnosis.csv")
 DISEASES = [
     "Obesity",  # cardiovascular
     "Essential hypertension",    # hypertension
     "Diabetes mellitus, type unspecified"  # diabetes
 ]
+# --- NEW: Disease and label type selection ---
+DISEASE_TO_TRAIN = "Essential hypertension"  # Change as needed
+LABEL_TYPE = "future"  # 'prevalent' or 'future'
+LABEL_COL = f"{LABEL_TYPE}_{DISEASE_TO_TRAIN}"
 BATCH_SIZE = 1
 EPOCHS = 20
 LR = 1e-4
@@ -64,15 +97,15 @@ IMG_SIZE = (224, 224)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 VIT_PATCH_SIZE = 14
 VIT_EMBED_DIM = 1280  # for vit_huge
-PRETRAINED_CKPT = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN22K-vit.h.14-900e.pth.tar"
-TRIAL = True  # Set to True for a quick test run with 1000 images (at least 100 positives)
+PRETRAINED_CKPT = os.path.join(BASE_DIR, "pretrained_IN/IN22K-vit.h.14-900e.pth.tar")
+# LoRA config flag
+USE_LORA = True  # Set to False to disable LoRA
 
 # Set the desired number of samples for each group in one place
 N_POS_PREVALENT = 161
 N_POS_FUTURE_TRAIN = 200
 N_POS_FUTURE_TEST = 170
 N_NEG = 800 - N_POS_PREVALENT - N_POS_FUTURE_TRAIN
-TRIAL_PERCENT = 1.0  # Use 20% of each group in TRIAL mode
 
 # --- TRANSFORMS ---
 transform = transforms.Compose([
@@ -80,80 +113,6 @@ transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize([0.5]*3, [0.5]*3)  # 3 channels per eye
 ])
-
-# --- DATASET & DATALOADER ---
-print("Loading data")
-PREVALENT_CSV = "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/retina_prevalent_future_diagnosis.csv"
-df = pd.read_csv(PREVALENT_CSV)
-print("Label distribution in CSV (prevalent_hypertension):")
-print(df['prevalent_hypertension'].value_counts())
-print("Label distribution in CSV (future_hypertension):")
-print(df['future_hypertension'].value_counts())
-
-# For training: positives = prevalent_hypertension==1, negatives = prevalent_hypertension==0
-if TRIAL:
-    # Reduce numbers by TRIAL_PERCENT
-    n_pos_prevalent = max(1, int(N_POS_PREVALENT * TRIAL_PERCENT))
-    n_pos_future_train = max(1, int(N_POS_FUTURE_TRAIN * TRIAL_PERCENT))
-    n_pos_future_test = max(1, int(N_POS_FUTURE_TEST * TRIAL_PERCENT))
-    n_neg = max(1, int(N_NEG * TRIAL_PERCENT))
-else:
-    n_pos_prevalent = N_POS_PREVALENT
-    n_pos_future_train = N_POS_FUTURE_TRAIN
-    n_pos_future_test = N_POS_FUTURE_TEST
-    n_neg = N_NEG
-
-future_indices = df.index[df['future_hypertension'] == 1].tolist()
-np.random.seed(42)
-np.random.shuffle(future_indices)
-future_train_indices = future_indices[:n_pos_future_train]
-future_test_indices = future_indices[n_pos_future_train:n_pos_future_train + n_pos_future_test]
-# Remove these from the general pool
-remaining_indices = list(set(df.index) - set(future_train_indices) - set(future_test_indices))
-# Sample the rest as before
-pos_indices = df.index[df['prevalent_hypertension'] == 1].tolist()
-neg_indices = df.index[df['prevalent_hypertension'] == 0].tolist()
-# Remove any overlap with future_train/test
-pos_indices = list(set(pos_indices) - set(future_train_indices) - set(future_test_indices))
-neg_indices = list(set(neg_indices) - set(future_train_indices) - set(future_test_indices))
-# Sample
-n_pos_prevalent = min(n_pos_prevalent, len(pos_indices))
-n_neg = min(n_neg, len(neg_indices))
-pos_sample = np.random.choice(pos_indices, n_pos_prevalent, replace=False) if n_pos_prevalent > 0 else []
-neg_sample = np.random.choice(neg_indices, n_neg, replace=False) if n_neg > 0 else []
-train_indices = np.concatenate([future_train_indices, pos_sample, neg_sample])
-np.random.shuffle(train_indices)
-test_indices = np.array(future_test_indices)
-print(f"TRAIN: {len(train_indices)} (future hypertension: {len(future_train_indices)}, prevalent: {len(pos_sample)}, negatives: {len(neg_sample)})")
-print(f"TEST: {len(test_indices)} (future hypertension)")
-# Prepare datasets
-train_df = df.loc[train_indices]
-test_df = df.loc[test_indices]
-
-# Create custom datasets
-train_dataset = RetinaFineTuneDataset(train_df, transform=transform)
-test_dataset = RetinaFineTuneDataset(test_df, transform=transform)
-
-# Split train/val with stratification to maintain class proportions
-from sklearn.model_selection import train_test_split
-train_labels = train_df['prevalent_hypertension'].tolist()
-train_idx, val_idx = train_test_split(list(range(len(train_dataset))), test_size=0.2, stratify=train_labels, random_state=42)
-from torch.utils.data import Subset
-train_set = Subset(train_dataset, train_idx)
-val_set = Subset(train_dataset, val_idx)
-print("Train label distribution:", np.bincount([train_labels[i] for i in train_idx]))
-print("Val label distribution:", np.bincount([train_labels[i] for i in val_idx]))
-train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
-val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
-
-# Compute class weights for imbalance
-train_labels = [train_dataset[i][1] for i in range(len(train_dataset))]
-class_weights = compute_class_weight('balanced', classes=np.arange(2), y=train_labels)
-class_weights = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
-
-# --- AMP SCALER ---
-scaler = torch.amp.GradScaler('cuda') if DEVICE.type == 'cuda' else None
 
 # --- MODEL ---
 # Instantiate ViT-H/14 backbone for 6-channel input
@@ -176,11 +135,27 @@ if PRETRAINED_CKPT is not None and os.path.isfile(PRETRAINED_CKPT):
 else:
     print("No pretrained checkpoint found or specified.")
 
+# LoRA injection (after loading weights)
+if not CHECK and USE_LORA:
+    lora_config = LoraConfig(
+        r=8,  # LoRA rank
+        lora_alpha=16,  # LoRA scaling
+        target_modules=["attn.qkv", "attn.proj"],  # Target ViT attention layers
+        lora_dropout=0.1,
+        bias="none",
+        task_type=TaskType.FEATURE_EXTRACTION,
+    )
+    backbone = get_peft_model(backbone, lora_config)
+    # Freeze all non-LoRA parameters
+    for name, param in backbone.named_parameters():
+        if "lora_" not in name:
+            param.requires_grad = False
+    print("LoRA enabled: Only LoRA and head parameters will be trainable.")
+elif not CHECK:
+    print("LoRA disabled: All backbone parameters will be trainable.")
+
 # Add a trainable classification head using the [CLS] token
-if TRIAL:
-    num_classes = 2
-else:
-    num_classes = len(DISEASES)
+num_classes = 2
 class RetinaClassifier(nn.Module):
     def __init__(self, backbone, num_classes):
         super().__init__()
@@ -192,120 +167,358 @@ class RetinaClassifier(nn.Module):
             feats = feats[0]
         cls_token = feats[:, 0]
         return self.head(cls_token)
-model = RetinaClassifier(backbone, num_classes).to(DEVICE)
 
-# --- LOSS & OPTIMIZER ---
-# Use Focal Loss with class weights for class imbalance
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.95, gamma=2, weight=None, reduction='mean'):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.weight = weight
-        self.reduction = reduction
-    def forward(self, logits, targets):
-        ce_loss = nn.functional.cross_entropy(logits, targets, reduction='none', weight=self.weight)
-        pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        else:
-            return focal_loss.sum()
-
-# Default: use FocalLoss with class weights
-# criterion = FocalLoss(alpha=0.90, gamma=2, weight=class_weights)
-# To use label smoothing instead, comment the above and uncomment below:
-criterion = nn.CrossEntropyLoss(weight=class_weights)
-# criterion = nn.CrossEntropyLoss(label_smoothing=0.2, weight=class_weights)
-optimizer = optim.Adam(model.parameters(), lr=LR)
-
-# --- TRAINING LOOP ---
-def train_one_epoch(model, loader, optimizer, criterion):
-    model.train()
-    total_loss, correct, total = 0, 0, 0
-    for imgs, labels, *_ in loader:
-        imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
-        optimizer.zero_grad()
-        if scaler is not None:
-            with torch.amp.autocast('cuda'):
-                logits = model(imgs)
-                loss = criterion(logits, labels)
-                # Debug prints
-                print(f"[TRAIN] Batch: Loss={loss.item()} | Logits={logits.detach().cpu().numpy()} | Labels={labels.detach().cpu().numpy()}")
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            logits = model(imgs)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-            # Debug prints
-            print(f"[TRAIN] Batch: Loss={loss.item()} | Logits={logits.detach().cpu().numpy()} | Labels={labels.detach().cpu().numpy()}")
-        total_loss += loss.item() * imgs.size(0)
-        preds = logits.argmax(1)
-        correct += (preds == labels).sum().item()
-        total += imgs.size(0)
-    return total_loss / total, correct / total
-
-def evaluate(model, loader, criterion):
-    model.eval()
-    total_loss, correct, total = 0, 0, 0
-    all_labels, all_preds = [], []
+# --- MAIN CHECK MODE ---
+if CHECK:
+    print(f"[CHECK MODE] Extracting embeddings and evaluating with KNN for {LABEL_COL}...")
+    PREVALENT_CSV = os.path.join(BASE_DIR, "retina_prevalent_future_diagnosis.csv")
+    df = pd.read_csv(PREVALENT_CSV)
+    # Select 800 true negatives (both prevalent and future == 0) and 200 positives for the selected label
+    neg_indices = df.index[(df[f'prevalent_{DISEASE_TO_TRAIN}'] == 0) & (df[f'future_{DISEASE_TO_TRAIN}'] == 0)].tolist()
+    pos_indices = df.index[df[LABEL_COL] == 1].tolist()
+    np.random.shuffle(neg_indices)
+    np.random.shuffle(pos_indices)
+    neg_indices_800 = neg_indices[:800]
+    pos_indices_200 = pos_indices[:200]
+    check_indices = np.concatenate([neg_indices_800, pos_indices_200])
+    check_df = df.loc[check_indices]
+    check_labels = np.array([0]*800 + [1]*200)
+    check_dataset = RetinaFineTuneDataset(check_df, LABEL_COL, transform=transform)
+    check_loader = DataLoader(check_dataset, batch_size=32, shuffle=False, num_workers=NUM_WORKERS)
+    # Extract embeddings
+    backbone = backbone.to(DEVICE)
+    backbone.eval()
+    all_embeds = []
     with torch.no_grad():
+        for imgs, _ in check_loader:
+            imgs = imgs.to(DEVICE)
+            feats = backbone(imgs)
+            if isinstance(feats, tuple):
+                feats = feats[0]
+            cls_token = feats[:, 0].cpu().numpy()
+            all_embeds.append(cls_token)
+    all_embeds = np.concatenate(all_embeds, axis=0)
+    print(f"Length of embeddings: {len(all_embeds)} (shape: {all_embeds.shape})")
+    # KNN classification (full set: 800 neg, 200 pos)
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, roc_curve
+    knn = KNeighborsClassifier(n_neighbors=5)
+    knn.fit(all_embeds, check_labels)
+    pred_probs = knn.predict_proba(all_embeds)[:, 1]
+    roc_auc = roc_auc_score(check_labels, pred_probs)
+    precision, recall, _ = precision_recall_curve(check_labels, pred_probs)
+    pr_auc = auc(recall, precision)
+    print(f"KNN ROC AUC (800N/200P): {roc_auc:.3f}")
+    print(f"KNN PR AUC (800N/200P): {pr_auc:.3f}")
+    # PCA plot: 200 positives vs 200 negatives (balanced)
+    from sklearn.decomposition import PCA
+    import matplotlib.pyplot as plt
+    neg_indices_200 = neg_indices[:200]
+    pos_indices_200 = pos_indices[:200]
+    pca_indices_balanced = np.concatenate([neg_indices_200, pos_indices_200])
+    pca_labels_balanced = np.array([0]*200 + [1]*200)
+    mask_balanced = np.isin(check_indices, pca_indices_balanced)
+    embeds_balanced = all_embeds[mask_balanced]
+    knn_bal = KNeighborsClassifier(n_neighbors=5)
+    knn_bal.fit(embeds_balanced, pca_labels_balanced)
+    pred_probs_bal = knn_bal.predict_proba(embeds_balanced)[:, 1]
+    roc_auc_bal = roc_auc_score(pca_labels_balanced, pred_probs_bal)
+    precision_bal, recall_bal, _ = precision_recall_curve(pca_labels_balanced, pred_probs_bal)
+    pr_auc_bal = auc(recall_bal, precision_bal)
+    print(f"KNN ROC AUC (200N/200P): {roc_auc_bal:.3f}")
+    print(f"KNN PR AUC (200N/200P): {pr_auc_bal:.3f}")
+    pca = PCA(n_components=2)
+    pca_embeds_bal = pca.fit_transform(embeds_balanced)
+    plt.figure(figsize=(6, 5))
+    for label, name, color in zip([0, 1], ['negative', 'positive'], ['blue', 'red']):
+        plt.scatter(pca_embeds_bal[pca_labels_balanced == label, 0], pca_embeds_bal[pca_labels_balanced == label, 1], label=name, alpha=0.6, s=20, c=color)
+    plt.title(f'PCA: 200 negative vs 200 positive ({LABEL_COL})\nKNN ROC AUC={roc_auc_bal:.2f}, PR AUC={pr_auc_bal:.2f}')
+    plt.xlabel('PC1')
+    plt.ylabel('PC2')
+    plt.legend()
+    plt.tight_layout()
+    # Save PCA and curve figures in BASE_DIR
+    pca_200n_200p_path = os.path.join(BASE_DIR, f'pca_200n_200p_{LABEL_COL.replace(" ", "_")}.png')
+    plt.savefig(pca_200n_200p_path)
+    print(f"Saved PCA plot (200N/200P) as '{pca_200n_200p_path}'")
+    # PCA plot: 800 negatives vs 200 positives (full set)
+    pca = PCA(n_components=2)
+    pca_embeds_full = pca.fit_transform(all_embeds)
+    plt.figure(figsize=(6, 5))
+    for label, name, color in zip([0, 1], ['negative', 'positive'], ['blue', 'red']):
+        plt.scatter(pca_embeds_full[check_labels == label, 0], pca_embeds_full[check_labels == label, 1], label=name, alpha=0.6, s=20, c=color)
+    plt.title(f'PCA: 800 negative vs 200 positive ({LABEL_COL})\nKNN ROC AUC={roc_auc:.2f}, PR AUC={pr_auc:.2f}')
+    plt.xlabel('PC1')
+    plt.ylabel('PC2')
+    plt.legend()
+    plt.tight_layout()
+    pca_800n_200p_path = os.path.join(BASE_DIR, f'pca_800n_200p_{LABEL_COL.replace(" ", "_")}.png')
+    plt.savefig(pca_800n_200p_path)
+    print(f"Saved PCA plot (800N/200P) as '{pca_800n_200p_path}'")
+    # Plot ROC and PR curves (full set)
+    fpr, tpr, _ = roc_curve(check_labels, pred_probs)
+    plt.figure()
+    plt.plot(fpr, tpr, label=f'ROC AUC = {roc_auc:.2f}')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'KNN ROC Curve (Embeddings) - {LABEL_COL}')
+    plt.legend()
+    roc_curve_path = os.path.join(BASE_DIR, f'knn_roc_curve_{LABEL_COL.replace(" ", "_")}.png')
+    plt.savefig(roc_curve_path)
+    plt.figure()
+    plt.plot(recall, precision, label=f'PR AUC = {pr_auc:.2f}')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title(f'KNN Precision-Recall Curve (Embeddings) - {LABEL_COL}')
+    plt.legend()
+    pr_curve_path = os.path.join(BASE_DIR, f'knn_pr_curve_{LABEL_COL.replace(" ", "_")}.png')
+    plt.savefig(pr_curve_path)
+    print(f"Saved KNN ROC and PR curves as '{roc_curve_path}' and '{pr_curve_path}'")
+    import sys
+    sys.exit(0)
+
+if not CHECK:
+    # --- DATASET & DATALOADER ---
+    print("Loading data")
+    PREVALENT_CSV = os.path.join(BASE_DIR, "retina_prevalent_future_diagnosis.csv")
+    df = pd.read_csv(PREVALENT_CSV)
+    print(f"Label distribution in CSV ({LABEL_COL}):")
+    print(df[LABEL_COL].value_counts())
+    # Select indices for positives and true negatives
+    pos_indices = df.index[df[LABEL_COL] == 1].tolist()
+    neg_indices = df.index[(df[f'prevalent_{DISEASE_TO_TRAIN}'] == 0) & (df[f'future_{DISEASE_TO_TRAIN}'] == 0)].tolist()
+    np.random.shuffle(pos_indices)
+    np.random.shuffle(neg_indices)
+    n_pos = min(N_POS_FUTURE_TRAIN, len(pos_indices))
+    n_neg = min(N_NEG, len(neg_indices))
+    pos_sample = np.random.choice(pos_indices, n_pos, replace=False) if n_pos > 0 else []
+    neg_sample = np.random.choice(neg_indices, n_neg, replace=False) if n_neg > 0 else []
+    train_indices = np.concatenate([pos_sample, neg_sample])
+    np.random.shuffle(train_indices)
+    # Validation and test splits (20% for val, rest for test)
+    n_val_pos = int(n_pos * 0.2)
+    n_val_neg = int(n_neg * 0.2)
+    val_pos = pos_indices[n_pos:n_pos + n_val_pos]
+    val_neg = neg_indices[n_neg:n_neg + n_val_neg]
+    val_indices = np.concatenate([val_pos, val_neg])
+    np.random.shuffle(val_indices)
+    test_pos = pos_indices[n_pos + n_val_pos:]
+    test_neg = neg_indices[n_neg + n_val_neg:]
+    test_indices = np.concatenate([test_pos, test_neg])
+    np.random.shuffle(test_indices)
+    train_df = df.loc[train_indices]
+    val_df = df.loc[val_indices]
+    test_df = df.loc[test_indices]
+    print(f'Train set label distribution ({LABEL_COL}):', train_df[LABEL_COL].value_counts())
+    print(f'Val set label distribution ({LABEL_COL}):', val_df[LABEL_COL].value_counts())
+    print(f'Test set label distribution ({LABEL_COL}):', test_df[LABEL_COL].value_counts())
+    # Create custom datasets
+    train_dataset = RetinaFineTuneDataset(train_df, LABEL_COL, transform=transform)
+    val_dataset = RetinaFineTuneDataset(val_df, LABEL_COL, transform=transform)
+    test_dataset = RetinaFineTuneDataset(test_df, LABEL_COL, transform=transform)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    # Compute class-balanced weights
+    train_labels = [train_dataset[i][1] for i in range(len(train_dataset))]
+    samples_per_cls = [np.sum(np.array(train_labels) == i) for i in range(2)]
+    CB_BETA = 0.999  # Typical value for large datasets
+    criterion = ClassBalancedLoss(beta=CB_BETA, samples_per_cls=samples_per_cls, device=DEVICE)
+    # Update optimizer to only use trainable parameters
+    model = RetinaClassifier(backbone, num_classes).to(DEVICE)
+    def print_trainable_parameters(model):
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        print(f"Trainable params: {trainable} / {total} ({100 * trainable / total:.2f}%)")
+    print_trainable_parameters(model)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
+    scaler = torch.amp.GradScaler() if DEVICE.type == 'cuda' else None
+
+    # --- TRAINING LOOP ---
+    def train_one_epoch(model, loader, optimizer, criterion):
+        model.train()
+        total_loss, correct, total = 0, 0, 0
         for imgs, labels, *_ in loader:
             imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad()
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
                     logits = model(imgs)
                     loss = criterion(logits, labels)
-                    # Debug prints
-                    print(f"[VAL] Batch: Loss={loss.item()} | Logits={logits.detach().cpu().numpy()} | Labels={labels.detach().cpu().numpy()}")
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
             else:
                 logits = model(imgs)
                 loss = criterion(logits, labels)
-                # Debug prints
-                print(f"[VAL] Batch: Loss={loss.item()} | Logits={logits.detach().cpu().numpy()} | Labels={labels.detach().cpu().numpy()}")
+                loss.backward()
+                optimizer.step()
             total_loss += loss.item() * imgs.size(0)
             preds = logits.argmax(1)
             correct += (preds == labels).sum().item()
             total += imgs.size(0)
-            all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-            # Debug prints for first batch
-            if len(all_labels) <= imgs.size(0):
-                print("Sample logits (softmax):", logits[:10].softmax(1).cpu().detach().numpy())
-                print("Sample predictions:", preds[:10].cpu().detach().numpy())
-                print("Sample labels:", labels[:10].cpu().detach().numpy())
-    from sklearn.metrics import classification_report
-    print(classification_report(all_labels, all_preds, target_names=["No Future Dx", "Future Dx"], zero_division=0))
-    return total_loss / total, correct / total
+        return total_loss / total, correct / total
 
-def check_tempdir_size(tempdir, max_gb=160):
-    total = 0
-    for dirpath, dirnames, filenames in os.walk(tempdir):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            try:
-                total += os.path.getsize(fp)
-            except Exception:
-                pass
-    total_gb = total / (1024 ** 3)
-    if total_gb > max_gb:
-        print(f"ERROR: {tempdir} exceeds {max_gb}GB ({total_gb:.2f}GB used). Exiting for safety.")
-        sys.exit(1)
+    def evaluate(model, loader, criterion):
+        model.eval()
+        total_loss, correct, total = 0, 0, 0
+        all_labels, all_preds = [], []
+        with torch.no_grad():
+            for imgs, labels, *_ in loader:
+                imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
+                if scaler is not None:
+                    with torch.amp.autocast('cuda'):
+                        logits = model(imgs)
+                        loss = criterion(logits, labels)
+                else:
+                    logits = model(imgs)
+                    loss = criterion(logits, labels)
+                total_loss += loss.item() * imgs.size(0)
+                preds = logits.argmax(1)
+                correct += (preds == labels).sum().item()
+                total += imgs.size(0)
+                all_labels.extend(labels.cpu().numpy())
+                all_preds.extend(preds.cpu().numpy())
+        from sklearn.metrics import classification_report
+        print(classification_report(all_labels, all_preds, target_names=["No Future Dx", "Future Dx"], zero_division=0))
+        return total_loss / total, correct / total
 
-# --- MAIN ---
-if __name__ == "__main__":
+    def check_tempdir_size(tempdir, max_gb=160):
+        total = 0
+        for dirpath, dirnames, filenames in os.walk(tempdir):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                try:
+                    total += os.path.getsize(fp)
+                except Exception:
+                    pass
+        total_gb = total / (1024 ** 3)
+        if total_gb > max_gb:
+            print(f"ERROR: {tempdir} exceeds {max_gb}GB ({total_gb:.2f}GB used). Exiting for safety.")
+            sys.exit(1)
+
+    # --- TRAINING AND EVALUATION CODE ---
     best_acc = 0
     for epoch in range(EPOCHS):
-        check_tempdir_size('/home/gavrielh/temp', max_gb=160)
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion)
-        val_loss, val_acc = evaluate(model, val_loader, criterion)
-        print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
+        print(f"\n--- TRAINING (Epoch {epoch+1}/{EPOCHS}) ---")
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        for batch in train_loader:
+            imgs, labels, *_ = batch
+            imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad()
+            if scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    logits = model(imgs)
+                    loss = criterion(logits, labels)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits = model(imgs)
+                loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+            train_loss += loss.item() * imgs.size(0)
+            preds = logits.argmax(1)
+            train_correct += (preds == labels).sum().item()
+            train_total += imgs.size(0)
+        train_loss /= train_total
+        train_acc = train_correct / train_total
+        print(f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f}")
+
+        print(f"\n--- VALIDATION (Epoch {epoch+1}/{EPOCHS}) ---")
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        all_val_labels = []
+        all_val_preds = []
+        all_val_logits = []
+        all_val_future_flags = []
+        with torch.no_grad():
+            for batch in val_loader:
+                imgs, labels, *_ = batch
+                imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
+                if scaler is not None:
+                    with torch.amp.autocast('cuda'):
+                        logits = model(imgs)
+                        loss = criterion(logits, labels)
+                else:
+                    logits = model(imgs)
+                    loss = criterion(logits, labels)
+                val_loss += loss.item() * imgs.size(0)
+                preds = logits.argmax(1)
+                val_correct += (preds == labels).sum().item()
+                val_total += imgs.size(0)
+                all_val_labels.extend(labels.cpu().numpy())
+                all_val_preds.extend(preds.cpu().numpy())
+                all_val_logits.extend(logits.cpu().numpy())
+                all_val_future_flags.extend(batch[2].cpu().numpy()) # Assuming batch[2] is future_flag
+        val_loss /= val_total
+        val_acc = val_correct / val_total
+        print(f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
+
+        # Print confusion matrix and classification report
+        print("Confusion Matrix:")
+        print(confusion_matrix(all_val_labels, all_val_preds))
+        print(classification_report(all_val_labels, all_val_preds, target_names=["No Future Dx", "Future Dx"]))
+
+        # PR AUC for Prevalent Hypertension (positive class) in validation set
+        from sklearn.metrics import precision_recall_curve, auc
+        logits_arr = np.array(all_val_logits)
+        print('all_val_logits shape:', logits_arr.shape)
+        if logits_arr.ndim == 1 or (logits_arr.ndim == 2 and logits_arr.shape[1] == 1):
+            # Single logit per sample (binary), use sigmoid
+            probs = torch.sigmoid(torch.tensor(logits_arr)).numpy().reshape(-1)
+            precision, recall, _ = precision_recall_curve(all_val_labels, probs)
+            pr_auc = auc(recall, precision)
+            print(f"[VAL] PR AUC for Prevalent Hypertension: {pr_auc:.3f}")
+        else:
+            # Two logits per sample, use softmax
+            probs = torch.softmax(torch.tensor(logits_arr), dim=1).numpy()
+            precision, recall, _ = precision_recall_curve(all_val_labels, probs[:, 1])
+            pr_auc = auc(recall, precision)
+            print(f"[VAL] PR AUC for Prevalent Hypertension: {pr_auc:.3f}")
+
+        # PR AUC for Future Dx class in validation set
+        future_mask = np.array(all_val_future_flags) == 1
+        if np.sum(future_mask) > 0:
+            if logits_arr.ndim == 1 or (logits_arr.ndim == 2 and logits_arr.shape[1] == 1):
+                future_probs = probs[future_mask]
+            else:
+                future_probs = probs[future_mask, 1]
+            future_labels = np.array(all_val_labels)[future_mask]
+            precision, recall, _ = precision_recall_curve(future_labels, future_probs)
+            pr_auc = auc(recall, precision)
+            print(f"[VAL] PR AUC for Future Dx: {pr_auc:.3f}")
+        else:
+            print("[VAL] No Future Dx samples in validation set for PR AUC.")
+
         if val_acc > best_acc:
             best_acc = val_acc
             #torch.save(model.state_dict(), "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/best_retina_classifier.pt")
+
+    # PR AUC for Prevalent Hypertension (positive class) in validation set
+    from sklearn.metrics import precision_recall_curve, auc
+    probs = torch.softmax(torch.tensor(all_val_logits), dim=1).numpy()
+    precision, recall, _ = precision_recall_curve(all_val_labels, probs[:, 1])
+    pr_auc = auc(recall, precision)
+    print(f"[VAL] PR AUC for Prevalent Hypertension: {pr_auc:.3f}")
+
+    # PR AUC for Future Dx class in validation set
+    future_mask = np.array(all_val_future_flags) == 1
+    if np.sum(future_mask) > 0:
+        future_labels = all_val_labels[future_mask]
+        future_probs = probs[future_mask, 1]
+        precision, recall, _ = precision_recall_curve(future_labels, future_probs)
+        pr_auc = auc(recall, precision)
+        print(f"[VAL] PR AUC for Future Dx: {pr_auc:.3f}")
+    else:
+        print("[VAL] No Future Dx samples in validation set for PR AUC.")
+
     print("Training complete. Best val acc:", best_acc)
     # Clean up temp directory after training
     try:
@@ -314,32 +527,32 @@ if __name__ == "__main__":
     except Exception as e:
         print(f'Could not clean up /home/gavrielh/temp: {e}')
 
-# --- Evaluation loop ---
-all_test_logits = []
-all_test_labels = []
-for batch in test_loader:  # Use test_loader for future hypertension evaluation
-    imgs = batch[0].to(DEVICE)
-    labels = batch[1].to(DEVICE)  # prevalent_hypertension labels
-    with torch.no_grad():
-        logits = model(imgs)
-        all_test_logits.append(logits.cpu().numpy())
-        all_test_labels.append(labels.cpu().numpy())
-test_logits = np.concatenate(all_test_logits, axis=0)  # shape: (num_samples, 2)
-test_labels = np.concatenate(all_test_labels, axis=0)
+    # --- Evaluation loop ---
+    all_test_logits = []
+    all_test_labels = []
+    for batch in test_loader:  # Use test_loader for future hypertension evaluation
+        imgs = batch[0].to(DEVICE)
+        labels = batch[1].to(DEVICE)  # prevalent_hypertension labels
+        with torch.no_grad():
+            logits = model(imgs)
+            all_test_logits.append(logits.cpu().numpy())
+            all_test_labels.append(labels.cpu().numpy())
+    test_logits = np.concatenate(all_test_logits, axis=0)  # shape: (num_samples, 2)
+    test_labels = np.concatenate(all_test_labels, axis=0)
 
-# --- After evaluation, compute PR AUC for future hypertension in test set ---
-import torch
-probs = torch.softmax(torch.tensor(test_logits), dim=1).numpy()
-future_mask = test_df['future_hypertension'] == 1
-future_labels = np.array(test_labels)[future_mask]
-future_probs = probs[future_mask, 1]
-precision, recall, _ = precision_recall_curve(future_labels, future_probs)
-pr_auc = auc(recall, precision)
-plt.figure()
-plt.plot(recall, precision, label=f'PR AUC = {pr_auc:.2f}')
-plt.xlabel('Recall')
-plt.ylabel('Precision')
-plt.title('Precision-Recall curve (Future Hypertension)')
-plt.legend()
-plt.savefig('pr_auc_future_hypertension.png')
-print(f"Saved PR AUC curve for future hypertension to pr_auc_future_hypertension.png (AUC={pr_auc:.3f})")
+    # --- After evaluation, compute PR AUC for future hypertension in test set ---
+    import torch
+    probs = torch.softmax(torch.tensor(test_logits), dim=1).numpy()
+    future_mask = test_df[LABEL_COL] == 1
+    future_labels = np.array(test_labels)[future_mask]
+    future_probs = probs[future_mask, 1]
+    precision, recall, _ = precision_recall_curve(future_labels, future_probs)
+    pr_auc = auc(recall, precision)
+    plt.figure()
+    plt.plot(recall, precision, label=f'PR AUC = {pr_auc:.2f}')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall curve (Future Hypertension)')
+    plt.legend()
+    plt.savefig(os.path.join(BASE_DIR, 'pr_auc_future_hypertension.png'))
+    print(f"Saved PR AUC curve for future hypertension to {os.path.join(BASE_DIR, 'pr_auc_future_hypertension.png')} (AUC={pr_auc:.3f})")

@@ -186,58 +186,76 @@ def create_future_diagnosis_csv(
     out_df.to_csv(output_csv, index=False)
     print(f"Wrote future diagnosis prediction CSV to {output_csv} with {len(out_df)} rows.")
 
-def create_prevalent_and_future_diagnosis_csv(
+def create_prevalent_and_future_diagnosis_csv_all(
     manifest_csv="retina_manifest.csv",
     diagnosis_csv="retina_patient_diagnosis.csv",
     output_csv="retina_prevalent_future_diagnosis.csv",
-    disease="Essential hypertension"
+    diseases=None
 ):
     """
-    For each image, label as:
-      - prevalent_hypertension: 1 if diagnosis date for hypertension <= image date, else 0
-      - future_hypertension: 1 if diagnosis date for hypertension > image date, else 0
-    Output columns: RegistrationCode, date, od_path, os_path, disease, prevalent_hypertension, future_hypertension, diagnosis_date (if any)
+    For each image, for each disease, label as:
+      - prevalent: 1 if diagnosis date for disease <= image date or within 30 days after image date
+      - future: 1 if diagnosis date for disease > image date + 30 days
+    Output columns: RegistrationCode, date, od_path, os_path, prevalent_*, future_*, diagnosis_date_*
     """
+    if diseases is None:
+        diseases = [
+            "Obesity",
+            "Essential hypertension",
+            "Diabetes mellitus, type unspecified"
+        ]
     manifest = pd.read_csv(manifest_csv)
     diagnosis = pd.read_csv(diagnosis_csv)
     # Ensure date columns are datetime
     manifest['date'] = pd.to_datetime(manifest['date'], errors='coerce')
     diagnosis['date'] = pd.to_datetime(diagnosis['date'], errors='coerce')
-    # Get all diagnosis dates for hypertension per patient
-    diag_grouped = diagnosis[diagnosis['disease'] == disease].groupby('RegistrationCode')['date'].apply(list).reset_index()
-    diag_lookup = {row['RegistrationCode']: row['date'] for _, row in diag_grouped.iterrows()}
+    # Build diagnosis lookup for each disease
+    diag_grouped = diagnosis[diagnosis['disease'].isin(diseases)].groupby(['RegistrationCode','disease'])['date'].apply(list).reset_index()
+    diag_lookup = {(row['RegistrationCode'], row['disease']): row['date'] for _, row in diag_grouped.iterrows()}
     rows = []
+    # For summary
+    neg_count = 0
+    summary = {d: {'prevalent': 0, 'future': 0} for d in diseases}
     for _, img in manifest.iterrows():
         reg = img['RegistrationCode']
         img_date = img['date']
-        diag_dates = diag_lookup.get(reg, [])
-        if pd.isnull(img_date):
-            continue
-        prevalent = 0
-        future = 0
-        diagnosis_date = ''
-        # Find earliest diagnosis date (if any)
-        diag_dates_valid = [d for d in diag_dates if not pd.isnull(d)]
-        if diag_dates_valid:
-            earliest_diag = min(diag_dates_valid)
-            diagnosis_date = earliest_diag.strftime('%Y-%m-%d')
-            if earliest_diag <= img_date:
-                prevalent = 1
-            elif earliest_diag > img_date:
-                future = 1
-        rows.append({
+        row = {
             'RegistrationCode': reg,
-            'date': img_date.strftime('%Y-%m-%d'),
+            'date': img_date.strftime('%Y-%m-%d') if not pd.isnull(img_date) else '',
             'od_path': img['od_path'],
-            'os_path': img['os_path'],
-            'disease': disease,
-            'prevalent_hypertension': prevalent,
-            'future_hypertension': future,
-            'diagnosis_date': diagnosis_date
-        })
+            'os_path': img['os_path']
+        }
+        all_neg = True
+        for disease in diseases:
+            diag_dates = diag_lookup.get((reg, disease), [])
+            prevalent = 0
+            future = 0
+            diagnosis_date = ''
+            diag_dates_valid = [d for d in diag_dates if not pd.isnull(d)]
+            if diag_dates_valid and not pd.isnull(img_date):
+                earliest_diag = min(diag_dates_valid)
+                diagnosis_date = earliest_diag.strftime('%Y-%m-%d')
+                delta = (earliest_diag - img_date).days
+                if delta > 30:
+                    future = 1
+                    summary[disease]['future'] += 1
+                    all_neg = False
+                elif delta >= 0:
+                    prevalent = 1
+                    summary[disease]['prevalent'] += 1
+                    all_neg = False
+            row[f'prevalent_{disease}'] = prevalent
+            row[f'future_{disease}'] = future
+            row[f'diagnosis_date_{disease}'] = diagnosis_date
+        if all_neg:
+            neg_count += 1
+        rows.append(row)
     out_df = pd.DataFrame(rows)
     out_df.to_csv(output_csv, index=False)
-    print(f"Wrote prevalent/future hypertension CSV to {output_csv} with {len(out_df)} rows.")
+    print(f"Wrote prevalent/future diagnosis CSV to {output_csv} with {len(out_df)} rows.")
+    print(f"Completely negative samples: {neg_count}")
+    for disease in diseases:
+        print(f"{disease}: prevalent={summary[disease]['prevalent']}, future={summary[disease]['future']}")
 
 # 3. Main: generate manifest and test dataset
 if __name__ == "__main__":
@@ -245,8 +263,8 @@ if __name__ == "__main__":
     create_retina_manifest(EYES_ROOT, MANIFEST_CSV)
     # Step 2: Create diagnosis CSV
     create_diagnosis_csv()
-    # Step 3: Create prevalent/future hypertension CSV
-    create_prevalent_and_future_diagnosis_csv()
+    # Step 3: Create prevalent/future diagnosis CSV for all diseases
+    create_prevalent_and_future_diagnosis_csv_all()
     # Step 4: Load dataset and show a batch
     dataset = RetinaDataset(MANIFEST_CSV)
     loader = DataLoader(dataset, batch_size=4, shuffle=True)
