@@ -13,8 +13,11 @@ from torchvision import transforms
 from sklearn.utils.class_weight import compute_class_weight
 from ijepa.src.datasets.retina import RetinaDataset
 from ijepa.src.models.vision_transformer import vit_huge  # Use ViT-H/14 as backbone
-# LoRA imports
-from peft import get_peft_model, LoraConfig, TaskType
+# LoRA config (manual, not peft)
+USE_LORA = True  # Set to False to disable LoRA
+LORA_R = 8
+LORA_ALPHA = 16
+LORA_DROPOUT = 0.1
 print("debug2")
 import numpy as np
 import pandas as pd
@@ -68,7 +71,9 @@ class RetinaFineTuneDataset(Dataset):
             os_img = self.transform(os_img)
         img = torch.cat([od_img, os_img], dim=0)
         label = int(row[self.label_col])
-        return img, label
+        # Add future_flag for the current disease
+        future_flag = int(row.get(f'future_{DISEASE_TO_TRAIN}', 0))
+        return img, label, future_flag
 
 # Set custom temp directory to avoid filling up system TMPDIR
 os.environ['TMPDIR'] = '/home/gavrielh/temp'
@@ -93,13 +98,13 @@ BATCH_SIZE = 1
 EPOCHS = 20
 LR = 1e-4
 NUM_WORKERS = 0
-IMG_SIZE = (224, 224)
+IMG_SIZE = (336, 336)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 VIT_PATCH_SIZE = 14
 VIT_EMBED_DIM = 1280  # for vit_huge
 PRETRAINED_CKPT = os.path.join(BASE_DIR, "pretrained_IN/IN22K-vit.h.14-900e.pth.tar")
-# LoRA config flag
-USE_LORA = True  # Set to False to disable LoRA
+# Make sure CHECK is disabled for fine-tuning
+CHECK = False
 
 # Set the desired number of samples for each group in one place
 N_POS_PREVALENT = 161
@@ -115,8 +120,9 @@ transform = transforms.Compose([
 ])
 
 # --- MODEL ---
-# Instantiate ViT-H/14 backbone for 6-channel input
-backbone = vit_huge(patch_size=VIT_PATCH_SIZE, img_size=IMG_SIZE, in_chans=6)
+# Instantiate ViT-H/14 backbone for 6-channel input (with new image size)
+backbone = vit_huge(patch_size=VIT_PATCH_SIZE, img_size=IMG_SIZE, in_chans=6,
+                   use_lora=USE_LORA, lora_r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT)
 
 # Optionally load pretrained weights (if available)
 if PRETRAINED_CKPT is not None and os.path.isfile(PRETRAINED_CKPT):
@@ -135,22 +141,16 @@ if PRETRAINED_CKPT is not None and os.path.isfile(PRETRAINED_CKPT):
 else:
     print("No pretrained checkpoint found or specified.")
 
-# LoRA injection (after loading weights)
+# Manual LoRA freezing: freeze all except LoRA and head
 if not CHECK and USE_LORA:
-    lora_config = LoraConfig(
-        r=8,  # LoRA rank
-        lora_alpha=16,  # LoRA scaling
-        target_modules=["attn.qkv", "attn.proj"],  # Target ViT attention layers
-        lora_dropout=0.1,
-        bias="none",
-        task_type=TaskType.FEATURE_EXTRACTION,
-    )
-    backbone = get_peft_model(backbone, lora_config)
-    # Freeze all non-LoRA parameters
+    lora_param_count = 0
     for name, param in backbone.named_parameters():
-        if "lora_" not in name:
+        if 'lora_A' in name or 'lora_B' in name:
+            param.requires_grad = True
+            lora_param_count += param.numel()
+        else:
             param.requires_grad = False
-    print("LoRA enabled: Only LoRA and head parameters will be trainable.")
+    print(f"LoRA enabled: Only LoRA and head parameters will be trainable. LoRA params: {lora_param_count}")
 elif not CHECK:
     print("LoRA disabled: All backbone parameters will be trainable.")
 
@@ -494,7 +494,7 @@ if not CHECK:
         all_val_future_flags = []
         with torch.no_grad():
             for batch in val_loader:
-                imgs, labels, *_ = batch
+                imgs, labels, future_flags in batch
                 imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
                 if scaler is not None:
                     with torch.amp.autocast('cuda'):
@@ -510,7 +510,7 @@ if not CHECK:
                 all_val_labels.extend(labels.cpu().numpy())
                 all_val_preds.extend(preds.cpu().numpy())
                 all_val_logits.extend(logits.cpu().numpy())
-                all_val_future_flags.extend(batch[2].cpu().numpy()) # Assuming batch[2] is future_flag
+                all_val_future_flags.extend(future_flags.cpu().numpy()) # Assuming batch[2] is future_flag
         val_loss /= val_total
         val_acc = val_correct / val_total
         print(f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
@@ -585,8 +585,9 @@ if not CHECK:
     all_test_logits = []
     all_test_labels = []
     for batch in test_loader:  # Use test_loader for future hypertension evaluation
-        imgs = batch[0].to(DEVICE)
-        labels = batch[1].to(DEVICE)  # prevalent_hypertension labels
+        imgs, labels, future_flags = batch
+        imgs = imgs.to(DEVICE)
+        labels = labels.to(DEVICE)  # prevalent_hypertension labels
         with torch.no_grad():
             logits = model(imgs)
             all_test_logits.append(logits.cpu().numpy())
