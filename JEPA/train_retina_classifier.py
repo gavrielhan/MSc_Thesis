@@ -494,7 +494,7 @@ if not CHECK:
         all_val_future_flags = []
         with torch.no_grad():
             for batch in val_loader:
-                imgs, labels, future_flags in batch
+                imgs, labels, future_flags = batch
                 imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
                 if scaler is not None:
                     with torch.amp.autocast('cuda'):
@@ -610,4 +610,4 @@ if not CHECK:
     plt.title('Precision-Recall curve (Future Hypertension)')
     plt.legend()
     plt.savefig(os.path.join(BASE_DIR, 'pr_auc_future_hypertension.png'))
-    print(f"Saved PR AUC curve for future hypertension to {os.path.join(BASE_DIR, 'pr_auc_future_hypertension.png')} (AUC={pr_auc:.3f})")
+    print(f"Saved PR AUC curve for future hypertension to {os.path.join(BASE_DIR, 'pr_auc_future_hypertension.png')} (AUC={pr_auc:.3f})") 
