@@ -14,7 +14,7 @@ from sklearn.utils.class_weight import compute_class_weight
 from ijepa.src.datasets.retina import RetinaDataset
 from ijepa.src.models.vision_transformer import vit_huge  # Use ViT-H/14 as backbone
 # LoRA config (manual, not peft)
-USE_LORA = True  # Set to False to disable LoRA
+USE_LORA = False  # Set to False to disable LoRA
 LORA_R = 8
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.1
@@ -28,6 +28,15 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from sklearn.metrics import classification_report, confusion_matrix
 import math
+import random
+# Remove joblib.Parallel and delayed. Run the 10-trial evaluation loop sequentially.
+# Remove the joblib import if no longer used.
+from torch.cuda.amp import autocast
+import torch
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+random.seed(SEED)
 
 # --- MAIN MODE FLAG ---
 CHECK = True  # Set to True to run the embedding/knn check and exit
@@ -69,6 +78,11 @@ class RetinaFineTuneDataset(Dataset):
         if self.transform:
             od_img = self.transform(od_img)
             os_img = self.transform(os_img)
+        # Ensure both are tensors before concatenation
+        if not isinstance(od_img, torch.Tensor):
+            od_img = transforms.ToTensor()(od_img)
+        if not isinstance(os_img, torch.Tensor):
+            os_img = transforms.ToTensor()(os_img)
         img = torch.cat([od_img, os_img], dim=0)
         label = int(row[self.label_col])
         # Add future_flag for the current disease
@@ -104,7 +118,8 @@ VIT_PATCH_SIZE = 14
 VIT_EMBED_DIM = 1280  # for vit_huge
 PRETRAINED_CKPT = os.path.join(BASE_DIR, "pretrained_IN/IN22K-vit.h.14-900e.pth.tar")
 # Make sure CHECK is disabled for fine-tuning
-CHECK = False
+
+
 
 # Set the desired number of samples for each group in one place
 N_POS_PREVALENT = 161
@@ -141,18 +156,12 @@ if PRETRAINED_CKPT is not None and os.path.isfile(PRETRAINED_CKPT):
 else:
     print("No pretrained checkpoint found or specified.")
 
-# Manual LoRA freezing: freeze all except LoRA and head
-if not CHECK and USE_LORA:
-    lora_param_count = 0
-    for name, param in backbone.named_parameters():
-        if 'lora_A' in name or 'lora_B' in name:
-            param.requires_grad = True
-            lora_param_count += param.numel()
-        else:
-            param.requires_grad = False
-    print(f"LoRA enabled: Only LoRA and head parameters will be trainable. LoRA params: {lora_param_count}")
-elif not CHECK:
-    print("LoRA disabled: All backbone parameters will be trainable.")
+# Sweep: robust CLS extraction everywhere
+# In all places where feats or feats_np is used to extract the CLS token, use:
+# if feats_np.ndim == 1:
+#     cls_token = feats_np
+# else:
+#     cls_token = feats_np[:, 0]
 
 # Add a trainable classification head using the [CLS] token
 num_classes = 2
@@ -165,12 +174,15 @@ class RetinaClassifier(nn.Module):
         feats = self.backbone(x)
         if isinstance(feats, tuple):
             feats = feats[0]
-        cls_token = feats[:, 0]
-        return self.head(cls_token)
+        feats_np = feats.cpu().numpy() if hasattr(feats, 'cpu') else feats
+        feats_np = np.atleast_2d(feats_np)
+        cls_token = feats_np[:, 0]
+        return self.head(torch.from_numpy(cls_token).to(x.device) if isinstance(cls_token, np.ndarray) else cls_token)
 
-# --- MAIN CHECK MODE ---
+# --- MAIN EXECUTION LOGIC ---
 if CHECK:
-    import os
+    # --- CHECK MODE: Single block for all logic ---
+    import sys
     # Ensure images directory exists
     IMAGES_DIR = os.path.join(BASE_DIR, "images")
     os.makedirs(IMAGES_DIR, exist_ok=True)
@@ -178,148 +190,116 @@ if CHECK:
     sizes = [224, 336, 448, 560, 672, 784, 896, 1008, 1120, 1232, 1344, 1456]
     pr_aucs = []
     roc_aucs = []
+    pr_aucs_all = []  # For error bars
+    roc_aucs_all = []
+    valid_sizes = []
     for IMG_SIZE_CUR in sizes:
         print(f"\n[CHECK MODE] Running for image size {IMG_SIZE_CUR}x{IMG_SIZE_CUR} ...")
-        # Use batch size 1 for large images
         batch_size_cur = 1 if IMG_SIZE_CUR >= 560 else 32
-        try:
-            # Update transform for this size
-            transform_cur = transforms.Compose([
-                transforms.Resize((IMG_SIZE_CUR, IMG_SIZE_CUR)),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5]*3, [0.5]*3)
-            ])
-            # Re-instantiate backbone for this size
-            backbone = vit_huge(patch_size=VIT_PATCH_SIZE, img_size=(IMG_SIZE_CUR, IMG_SIZE_CUR), in_chans=6)
-            if PRETRAINED_CKPT is not None and os.path.isfile(PRETRAINED_CKPT):
-                state_dict = torch.load(PRETRAINED_CKPT, map_location=DEVICE)
-                if hasattr(backbone, 'patch_embed') and hasattr(backbone.patch_embed, 'proj'):
-                    w = state_dict.get('patch_embed.proj.weight', None)
-                    if w is not None and w.shape[1] == 3 and backbone.patch_embed.proj.weight.shape[1] == 6:
-                        w6 = w.repeat(1, 2, 1, 1)[:, :6]
-                        state_dict['patch_embed.proj.weight'] = w6
-                try:
-                    backbone.load_state_dict(state_dict, strict=False)
-                    print(f"Loaded pretrained weights from {PRETRAINED_CKPT}")
-                except Exception as e:
-                    print(f"Error loading checkpoint: {e}")
-            else:
-                print("No pretrained checkpoint found or specified.")
-            backbone = backbone.to(DEVICE)
-            backbone.eval()
-            PREVALENT_CSV = os.path.join(BASE_DIR, "retina_prevalent_future_diagnosis.csv")
-            df = pd.read_csv(PREVALENT_CSV)
-            # Select 800 true negatives (both prevalent and future == 0) and 200 positives for the selected label
-            neg_indices = df.index[(df[f'prevalent_{DISEASE_TO_TRAIN}'] == 0) & (df[f'future_{DISEASE_TO_TRAIN}'] == 0)].tolist()
-            pos_indices = df.index[df[LABEL_COL] == 1].tolist()
-            np.random.shuffle(neg_indices)
-            np.random.shuffle(pos_indices)
-            neg_indices_800 = neg_indices[:800]
-            pos_indices_200 = pos_indices[:200]
-            check_indices = np.concatenate([neg_indices_800, pos_indices_200])
-            check_df = df.loc[check_indices]
-            check_labels = np.array([0]*800 + [1]*200)
-            check_dataset = RetinaFineTuneDataset(check_df, LABEL_COL, transform=transform_cur)
-            check_loader = DataLoader(check_dataset, batch_size=batch_size_cur, shuffle=False, num_workers=NUM_WORKERS)
-            # Extract embeddings
-            all_embeds = []
-            with torch.no_grad():
-                for imgs, _ in check_loader:
-                    imgs = imgs.to(DEVICE)
-                    feats = backbone(imgs)
-                    if isinstance(feats, tuple):
-                        feats = feats[0]
-                    cls_token = feats[:, 0].cpu().numpy()
-                    all_embeds.append(cls_token)
-            all_embeds = np.concatenate(all_embeds, axis=0)
-            print(f"Length of embeddings: {len(all_embeds)} (shape: {all_embeds.shape})")
-            # KNN classification (full set: 800 neg, 200 pos)
-            from sklearn.neighbors import KNeighborsClassifier
-            from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, roc_curve
-            knn = KNeighborsClassifier(n_neighbors=5)
-            knn.fit(all_embeds, check_labels)
-            pred_probs = knn.predict_proba(all_embeds)[:, 1]
-            roc_auc = roc_auc_score(check_labels, pred_probs)
-            precision, recall, _ = precision_recall_curve(check_labels, pred_probs)
-            pr_auc = auc(recall, precision)
-            pr_aucs.append(pr_auc)
-            roc_aucs.append(roc_auc)
-            print(f"KNN ROC AUC (800N/200P): {roc_auc:.3f}")
-            print(f"KNN PR AUC (800N/200P): {pr_auc:.3f}")
-            # PCA plot: 200 positives vs 200 negatives (balanced)
-            from sklearn.decomposition import PCA
-            import matplotlib.pyplot as plt
-            neg_indices_200 = neg_indices[:200]
-            pos_indices_200 = pos_indices[:200]
-            pca_indices_balanced = np.concatenate([neg_indices_200, pos_indices_200])
-            pca_labels_balanced = np.array([0]*200 + [1]*200)
-            mask_balanced = np.isin(check_indices, pca_indices_balanced)
-            embeds_balanced = all_embeds[mask_balanced]
-            knn_bal = KNeighborsClassifier(n_neighbors=5)
-            knn_bal.fit(embeds_balanced, pca_labels_balanced)
-            pred_probs_bal = knn_bal.predict_proba(embeds_balanced)[:, 1]
-            roc_auc_bal = roc_auc_score(pca_labels_balanced, pred_probs_bal)
-            precision_bal, recall_bal, _ = precision_recall_curve(pca_labels_balanced, pred_probs_bal)
-            pr_auc_bal = auc(recall_bal, precision_bal)
-            pca = PCA(n_components=2)
-            pca_embeds_bal = pca.fit_transform(embeds_balanced)
-            plt.figure(figsize=(6, 5))
-            for label, name, color in zip([0, 1], ['negative', 'positive'], ['blue', 'red']):
-                plt.scatter(pca_embeds_bal[pca_labels_balanced == label, 0], pca_embeds_bal[pca_labels_balanced == label, 1], label=name, alpha=0.6, s=20, c=color)
-            plt.title(f'PCA: 200 negative vs 200 positive ({LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR})\nKNN ROC AUC={roc_auc_bal:.2f}, PR AUC={pr_auc_bal:.2f}')
-            plt.xlabel('PC1')
-            plt.ylabel('PC2')
-            plt.legend()
-            plt.tight_layout()
-            pca_200n_200p_path = os.path.join(IMAGES_DIR, f'pca_200n_200p_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
-            plt.savefig(pca_200n_200p_path)
-            print(f"Saved PCA plot (200N/200P) as '{pca_200n_200p_path}'")
-            # PCA plot: 800 negatives vs 200 positives (full set)
-            pca = PCA(n_components=2)
-            pca_embeds_full = pca.fit_transform(all_embeds)
-            plt.figure(figsize=(6, 5))
-            for label, name, color in zip([0, 1], ['negative', 'positive'], ['blue', 'red']):
-                plt.scatter(pca_embeds_full[check_labels == label, 0], pca_embeds_full[check_labels == label, 1], label=name, alpha=0.6, s=20, c=color)
-            plt.title(f'PCA: 800 negative vs 200 positive ({LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR})\nKNN ROC AUC={roc_auc:.2f}, PR AUC={pr_auc:.2f}')
-            plt.xlabel('PC1')
-            plt.ylabel('PC2')
-            plt.legend()
-            plt.tight_layout()
-            pca_800n_200p_path = os.path.join(IMAGES_DIR, f'pca_800n_200p_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
-            plt.savefig(pca_800n_200p_path)
-            print(f"Saved PCA plot (800N/200P) as '{pca_800n_200p_path}'")
-            # Plot ROC and PR curves (full set)
-            fpr, tpr, _ = roc_curve(check_labels, pred_probs)
-            plt.figure()
-            plt.plot(fpr, tpr, label=f'ROC AUC = {roc_auc:.2f}')
-            plt.xlabel('False Positive Rate')
-            plt.ylabel('True Positive Rate')
-            plt.title(f'KNN ROC Curve (Embeddings) - {LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR}')
-            plt.legend()
-            roc_curve_path = os.path.join(IMAGES_DIR, f'knn_roc_curve_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
-            plt.savefig(roc_curve_path)
-            plt.figure()
-            plt.plot(recall, precision, label=f'PR AUC = {pr_auc:.2f}')
-            plt.xlabel('Recall')
-            plt.ylabel('Precision')
-            plt.title(f'KNN Precision-Recall Curve (Embeddings) - {LABEL_COL}, {IMG_SIZE_CUR}x{IMG_SIZE_CUR}')
-            plt.legend()
-            pr_curve_path = os.path.join(IMAGES_DIR, f'knn_pr_curve_{LABEL_COL.replace(" ", "_")}_{IMG_SIZE_CUR}.png')
-            plt.savefig(pr_curve_path)
-            print(f"Saved KNN ROC and PR curves as '{roc_curve_path}' and '{pr_curve_path}'")
-        except RuntimeError as e:
+        N_TRIALS = 10
+        def run_trial(trial):
             import torch
-            if 'out of memory' in str(e):
-                print(f'CUDA OOM at size {IMG_SIZE_CUR}, skipping...')
+            try:
+                transform_cur = transforms.Compose([
+                    transforms.Resize((IMG_SIZE_CUR, IMG_SIZE_CUR)),
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.5]*3, [0.5]*3)
+                ])
+                backbone = vit_huge(patch_size=VIT_PATCH_SIZE, img_size=(IMG_SIZE_CUR, IMG_SIZE_CUR), in_chans=6)
+                if PRETRAINED_CKPT is not None and os.path.isfile(PRETRAINED_CKPT):
+                    state_dict = torch.load(PRETRAINED_CKPT, map_location=DEVICE)
+                    if hasattr(backbone, 'patch_embed') and hasattr(backbone.patch_embed, 'proj'):
+                        w = state_dict.get('patch_embed.proj.weight', None)
+                        if w is not None and w.shape[1] == 3 and backbone.patch_embed.proj.weight.shape[1] == 6:
+                            w6 = w.repeat(1, 2, 1, 1)[:, :6]
+                            state_dict['patch_embed.proj.weight'] = w6
+                    try:
+                        backbone.load_state_dict(state_dict, strict=False)
+                    except Exception as e:
+                        print(f"Error loading checkpoint: {e}")
+                backbone = backbone.to(DEVICE)
+                backbone.eval()
+                PREVALENT_CSV = os.path.join(BASE_DIR, "retina_prevalent_future_diagnosis.csv")
+                df = pd.read_csv(PREVALENT_CSV)
+                np.random.seed(42 + trial)
+                neg_indices = df.index[(df[f'prevalent_{DISEASE_TO_TRAIN}'] == 0) & (df[f'future_{DISEASE_TO_TRAIN}'] == 0)].tolist()
+                pos_indices = df.index[df[f'future_{DISEASE_TO_TRAIN}'] == 1].tolist()
+                val_neg_indices = np.random.choice(neg_indices, 800, replace=False)
+                val_pos_indices = np.random.choice(pos_indices, 200, replace=False)
+                val_indices = np.concatenate([val_neg_indices, val_pos_indices])
+                check_df = df.loc[val_indices]
+                check_labels = np.array([0]*800 + [1]*200)
+                check_dataset = RetinaFineTuneDataset(check_df, LABEL_COL, transform=transform_cur)
+                check_loader = DataLoader(check_dataset, batch_size=batch_size_cur, shuffle=False, num_workers=NUM_WORKERS)
+                all_embeds = []
+                with torch.no_grad():
+                    for batch in check_loader:
+                        imgs = batch[0]
+                        imgs = imgs.to(DEVICE)
+                        feats = backbone(imgs)
+                        if isinstance(feats, tuple):
+                            feats = feats[0]
+                        feats_np = feats.cpu().numpy()
+                        feats_np = np.atleast_2d(feats_np)
+                        cls_token = feats_np[:, 0]
+                        all_embeds.append(cls_token)
+                all_embeds = np.concatenate(all_embeds, axis=0)
+                from sklearn.neighbors import KNeighborsClassifier
+                from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
+                knn = KNeighborsClassifier(n_neighbors=5)
+                knn.fit(all_embeds, check_labels)
+                pred_probs = knn.predict_proba(all_embeds)[:, 1]
+                roc_auc = roc_auc_score(check_labels, pred_probs)
+                precision, recall, _ = precision_recall_curve(check_labels, pred_probs)
+                pr_auc = auc(recall, precision)
+                result = (pr_auc, roc_auc)
+                # Explicitly delete large variables and free memory
+                del all_embeds, check_loader, check_dataset
+                if 'backbone' in locals():
+                    del backbone
+                if 'feats' in locals():
+                    del feats
+                if 'feats_np' in locals():
+                    del feats_np
+                if 'cls_token' in locals():
+                    del cls_token
+                import gc
+                gc.collect()
                 torch.cuda.empty_cache()
-                continue
-            else:
-                raise
-    # After all sizes, plot PR AUC and ROC AUC vs. image size
+                return result
+            except RuntimeError as e:
+                import torch
+                if 'out of memory' in str(e) or 'allocate memory' in str(e):
+                    print(f'OOM at size {IMG_SIZE_CUR}, trial {trial}, skipping this trial...')
+                    torch.cuda.empty_cache()
+                    return None
+                else:
+                    raise
+        results = [run_trial(trial) for trial in range(N_TRIALS)]
+        # Filter out None results (OOM trials)
+        results = [r for r in results if r is not None]
+        if len(results) == 0:
+            print(f"All trials OOM for image size {IMG_SIZE_CUR}, skipping this size.")
+            continue
+        pr_aucs_trials, roc_aucs_trials = zip(*results)
+        pr_aucs.append(np.mean(pr_aucs_trials))
+        roc_aucs.append(np.mean(roc_aucs_trials))
+        pr_aucs_all.append(pr_aucs_trials)
+        roc_aucs_all.append(roc_aucs_trials)
+        valid_sizes.append(IMG_SIZE_CUR)
+        print(f"KNN ROC AUC (800N/200P, mean±std): {np.mean(roc_aucs_trials):.3f} ± {np.std(roc_aucs_trials):.3f}")
+        print(f"KNN PR AUC (800N/200P, mean±std): {np.mean(pr_aucs_trials):.3f} ± {np.std(pr_aucs_trials):.3f}")
+    # After all sizes, plot PR AUC and ROC AUC vs. image size (only for valid_sizes)
     import matplotlib.pyplot as plt
     plt.figure(figsize=(8, 6))
-    plt.plot(sizes[:len(pr_aucs)], pr_aucs, 'o-r', label='PR AUC')
-    plt.plot(sizes[:len(roc_aucs)], roc_aucs, 'o-b', label='ROC AUC')
+    pr_aucs_arr = np.array(pr_aucs_all)
+    roc_aucs_arr = np.array(roc_aucs_all)
+    pr_means = np.array([np.mean(x) for x in pr_aucs_all])
+    pr_stds = np.array([np.std(x) for x in pr_aucs_all])
+    roc_means = np.array([np.mean(x) for x in roc_aucs_all])
+    roc_stds = np.array([np.std(x) for x in roc_aucs_all])
+    plt.errorbar(valid_sizes, pr_means, yerr=pr_stds, fmt='o-r', label='PR AUC')
+    plt.errorbar(valid_sizes, roc_means, yerr=roc_stds, fmt='o-b', label='ROC AUC')
     plt.xlabel('Image Size (pixels)')
     plt.ylabel('AUC')
     plt.title(f'PR AUC and ROC AUC vs. Image Size ({LABEL_COL})')
@@ -328,51 +308,44 @@ if CHECK:
     summary_plot_path = os.path.join(IMAGES_DIR, f'auc_vs_size_{LABEL_COL.replace(" ", "_")}.png')
     plt.savefig(summary_plot_path)
     print(f"Saved summary plot of AUC vs. image size as '{summary_plot_path}'")
-    import sys
     sys.exit(0)
 
+# --- FINE-TUNING MODE (with LoRA) ---
 if not CHECK:
-    # --- DATASET & DATALOADER ---
-    print("Loading data")
+    print("Loading data for fine-tuning (LoRA)...")
     PREVALENT_CSV = os.path.join(BASE_DIR, "retina_prevalent_future_diagnosis.csv")
     df = pd.read_csv(PREVALENT_CSV)
-    print(f"Label distribution in CSV ({LABEL_COL}):")
-    print(df[LABEL_COL].value_counts())
-    # Select indices for positives and true negatives
-    pos_indices = df.index[df[LABEL_COL] == 1].tolist()
-    neg_indices = df.index[(df[f'prevalent_{DISEASE_TO_TRAIN}'] == 0) & (df[f'future_{DISEASE_TO_TRAIN}'] == 0)].tolist()
-    np.random.shuffle(pos_indices)
-    np.random.shuffle(neg_indices)
-    n_pos = min(N_POS_FUTURE_TRAIN, len(pos_indices))
-    n_neg = min(N_NEG, len(neg_indices))
-    pos_sample = np.random.choice(pos_indices, n_pos, replace=False) if n_pos > 0 else []
-    neg_sample = np.random.choice(neg_indices, n_neg, replace=False) if n_neg > 0 else []
-    train_indices = np.concatenate([pos_sample, neg_sample])
+    # Load evaluation indices and exclude from training
+    neg_indices_all = df.index[(df[f'prevalent_{DISEASE_TO_TRAIN}'] == 0) & (df[f'future_{DISEASE_TO_TRAIN}'] == 0)].tolist()
+    pos_indices_prevalent = df.index[df[f'prevalent_{DISEASE_TO_TRAIN}'] == 1].tolist()
+    pos_indices_future = df.index[df[f'future_{DISEASE_TO_TRAIN}'] == 1].tolist()
+    # Remove eval indices code and sample validation set on-the-fly
+    np.random.shuffle(neg_indices_all)
+    val_neg_indices = neg_indices_all[:800]
+    train_neg_indices = neg_indices_all[800:]
+    np.random.shuffle(pos_indices_future)
+    val_pos_indices = pos_indices_future[:200]
+    train_pos_indices_future = pos_indices_future[200:]
+    # Select all prevalent positives for training
+    np.random.shuffle(pos_indices_prevalent)
+    # Build train/val indices
+    train_indices = np.array(train_neg_indices + train_pos_indices_future + pos_indices_prevalent)
+    val_indices = np.array(list(val_neg_indices) + list(val_pos_indices))
     np.random.shuffle(train_indices)
-    # Validation and test splits (20% for val, rest for test)
-    n_val_pos = int(n_pos * 0.2)
-    n_val_neg = int(n_neg * 0.2)
-    val_pos = pos_indices[n_pos:n_pos + n_val_pos]
-    val_neg = neg_indices[n_neg:n_neg + n_val_neg]
-    val_indices = np.concatenate([val_pos, val_neg])
     np.random.shuffle(val_indices)
-    test_pos = pos_indices[n_pos + n_val_pos:]
-    test_neg = neg_indices[n_neg + n_val_neg:]
-    test_indices = np.concatenate([test_pos, test_neg])
-    np.random.shuffle(test_indices)
-    train_df = df.loc[train_indices]
-    val_df = df.loc[val_indices]
-    test_df = df.loc[test_indices]
+    train_df = df.loc[train_indices].copy()
+    val_df = df.loc[val_indices].copy()
+    # For training, label both prevalent and future as 1
+    train_df[LABEL_COL] = ((train_df[f'prevalent_{DISEASE_TO_TRAIN}'] == 1) | (train_df[f'future_{DISEASE_TO_TRAIN}'] == 1)).astype(int)
     print(f'Train set label distribution ({LABEL_COL}):', train_df[LABEL_COL].value_counts())
     print(f'Val set label distribution ({LABEL_COL}):', val_df[LABEL_COL].value_counts())
-    print(f'Test set label distribution ({LABEL_COL}):', test_df[LABEL_COL].value_counts())
+
     # Create custom datasets
     train_dataset = RetinaFineTuneDataset(train_df, LABEL_COL, transform=transform)
     val_dataset = RetinaFineTuneDataset(val_df, LABEL_COL, transform=transform)
-    test_dataset = RetinaFineTuneDataset(test_df, LABEL_COL, transform=transform)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
     # Compute class-balanced weights
     train_labels = [train_dataset[i][1] for i in range(len(train_dataset))]
     samples_per_cls = [np.sum(np.array(train_labels) == i) for i in range(2)]
@@ -380,6 +353,10 @@ if not CHECK:
     criterion = ClassBalancedLoss(beta=CB_BETA, samples_per_cls=samples_per_cls, device=DEVICE)
     # Update optimizer to only use trainable parameters
     model = RetinaClassifier(backbone, num_classes).to(DEVICE)
+    # Add DataParallel for multi-GPU support
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel.")
+        model = nn.DataParallel(model)
     def print_trainable_parameters(model):
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
@@ -388,68 +365,59 @@ if not CHECK:
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
     scaler = torch.amp.GradScaler() if DEVICE.type == 'cuda' else None
 
-    # --- TRAINING LOOP ---
-    def train_one_epoch(model, loader, optimizer, criterion):
-        model.train()
-        total_loss, correct, total = 0, 0, 0
-        for imgs, labels, *_ in loader:
-            imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
-            optimizer.zero_grad()
-            if scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    logits = model(imgs)
-                    loss = criterion(logits, labels)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                logits = model(imgs)
-                loss = criterion(logits, labels)
-                loss.backward()
-                optimizer.step()
-            total_loss += loss.item() * imgs.size(0)
-            preds = logits.argmax(1)
-            correct += (preds == labels).sum().item()
-            total += imgs.size(0)
-        return total_loss / total, correct / total
-
-    def evaluate(model, loader, criterion):
-        model.eval()
-        total_loss, correct, total = 0, 0, 0
-        all_labels, all_preds = [], []
-        with torch.no_grad():
-            for imgs, labels, *_ in loader:
-                imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
-                if scaler is not None:
-                    with torch.amp.autocast('cuda'):
-                        logits = model(imgs)
-                        loss = criterion(logits, labels)
-                else:
-                    logits = model(imgs)
-                    loss = criterion(logits, labels)
-                total_loss += loss.item() * imgs.size(0)
-                preds = logits.argmax(1)
-                correct += (preds == labels).sum().item()
-                total += imgs.size(0)
-                all_labels.extend(labels.cpu().numpy())
-                all_preds.extend(preds.cpu().numpy())
-        from sklearn.metrics import classification_report
-        print(classification_report(all_labels, all_preds, target_names=["No Future Dx", "Future Dx"], zero_division=0))
-        return total_loss / total, correct / total
-
-    def check_tempdir_size(tempdir, max_gb=160):
-        total = 0
-        for dirpath, dirnames, filenames in os.walk(tempdir):
-            for f in filenames:
-                fp = os.path.join(dirpath, f)
-                try:
-                    total += os.path.getsize(fp)
-                except Exception:
-                    pass
-        total_gb = total / (1024 ** 3)
-        if total_gb > max_gb:
-            print(f"ERROR: {tempdir} exceeds {max_gb}GB ({total_gb:.2f}GB used). Exiting for safety.")
-            sys.exit(1)
+    # --- PRE-LoRA KNN PR AUC (calculate ONCE before training loop) ---
+    # Instantiate a backbone with use_lora=False, load same weights
+    from ijepa.src.models.vision_transformer import vit_huge
+    pre_lora_backbone = vit_huge(patch_size=VIT_PATCH_SIZE, img_size=IMG_SIZE, in_chans=6, use_lora=False)
+    if PRETRAINED_CKPT is not None and os.path.isfile(PRETRAINED_CKPT):
+        state_dict = torch.load(PRETRAINED_CKPT, map_location=DEVICE)
+        if hasattr(pre_lora_backbone, 'patch_embed') and hasattr(pre_lora_backbone.patch_embed, 'proj'):
+            w = state_dict.get('patch_embed.proj.weight', None)
+            if w is not None and w.shape[1] == 3 and pre_lora_backbone.patch_embed.proj.weight.shape[1] == 6:
+                w6 = w.repeat(1, 2, 1, 1)[:, :6]
+                state_dict['patch_embed.proj.weight'] = w6
+        try:
+            pre_lora_backbone.load_state_dict(state_dict, strict=False)
+        except Exception as e:
+            print(f"Error loading checkpoint for pre-LoRA backbone: {e}")
+    pre_lora_backbone = pre_lora_backbone.to(DEVICE)
+    pre_lora_backbone.eval()
+    # Extract embeddings for validation set
+    all_pre_lora_embeds = []
+    all_val_labels = []
+    all_val_future_flags = []
+    val_loader_for_pre_lora = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    with torch.no_grad():
+        for imgs, labels, future_flags in val_loader_for_pre_lora:
+            imgs = imgs.to(DEVICE)
+            feats = pre_lora_backbone(imgs)
+            if isinstance(feats, tuple):
+                feats = feats[0]
+            feats_np = feats.cpu().numpy()
+            feats_np = np.atleast_2d(feats_np)
+            cls_token = feats_np[:, 0]
+            all_pre_lora_embeds.append(cls_token)
+            all_val_labels.extend(labels.cpu().numpy())
+            all_val_future_flags.extend(future_flags.cpu().numpy())
+    all_pre_lora_embeds = np.concatenate(all_pre_lora_embeds, axis=0)
+    all_val_labels = np.array(all_val_labels)
+    all_val_future_flags = np.array(all_val_future_flags)
+    future_mask = all_val_future_flags == 1
+    future_mask_idx = np.where(future_mask)[0].tolist()
+    # KNN PR AUC for future positives
+    if np.sum(future_mask) > 0:
+        from sklearn.neighbors import KNeighborsClassifier
+        from sklearn.metrics import precision_recall_curve, auc
+        knn = KNeighborsClassifier(n_neighbors=5)
+        knn.fit(all_pre_lora_embeds, all_val_labels)
+        pred_probs = knn.predict_proba(all_pre_lora_embeds)[:, 1]
+        future_probs_knn = pred_probs[future_mask_idx]
+        future_labels_knn = all_val_labels[future_mask_idx]
+        precision_knn, recall_knn, _ = precision_recall_curve(future_labels_knn, future_probs_knn)
+        pr_auc_knn = auc(recall_knn, precision_knn)
+        print(f"[VAL] PR AUC for Future Dx (PRE-LoRA KNN, computed ONCE): {pr_auc_knn:.3f}")
+    else:
+        print("[VAL] No Future Dx samples in validation set for KNN PR AUC.")
 
     # --- TRAINING AND EVALUATION CODE ---
     best_acc = 0
@@ -464,7 +432,7 @@ if not CHECK:
             imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
             optimizer.zero_grad()
             if scaler is not None:
-                with torch.amp.autocast('cuda'):
+                with autocast():
                     logits = model(imgs)
                     loss = criterion(logits, labels)
                 scaler.scale(loss).backward()
@@ -497,7 +465,7 @@ if not CHECK:
                 imgs, labels, future_flags = batch
                 imgs, labels = imgs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
                 if scaler is not None:
-                    with torch.amp.autocast('cuda'):
+                    with autocast():
                         logits = model(imgs)
                         loss = criterion(logits, labels)
                 else:
@@ -510,44 +478,29 @@ if not CHECK:
                 all_val_labels.extend(labels.cpu().numpy())
                 all_val_preds.extend(preds.cpu().numpy())
                 all_val_logits.extend(logits.cpu().numpy())
-                all_val_future_flags.extend(future_flags.cpu().numpy()) # Assuming batch[2] is future_flag
+                all_val_future_flags.extend(future_flags.cpu().numpy())
         val_loss /= val_total
         val_acc = val_correct / val_total
         print(f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
 
-        # Print confusion matrix and classification report
-        print("Confusion Matrix:")
-        print(confusion_matrix(all_val_labels, all_val_preds))
-        print(classification_report(all_val_labels, all_val_preds, target_names=["No Future Dx", "Future Dx"]))
-
-        # PR AUC for Prevalent Hypertension (positive class) in validation set
+        # PR AUC for Future Dx class in validation set (AFTER LoRA)
         from sklearn.metrics import precision_recall_curve, auc
         logits_arr = np.array(all_val_logits)
-        print('all_val_logits shape:', logits_arr.shape)
-        if logits_arr.ndim == 1 or (logits_arr.ndim == 2 and logits_arr.shape[1] == 1):
-            # Single logit per sample (binary), use sigmoid
-            probs = torch.sigmoid(torch.tensor(logits_arr)).numpy().reshape(-1)
-            precision, recall, _ = precision_recall_curve(all_val_labels, probs)
-            pr_auc = auc(recall, precision)
-            print(f"[VAL] PR AUC for Prevalent Hypertension: {pr_auc:.3f}")
-        else:
-            # Two logits per sample, use softmax
-            probs = torch.softmax(torch.tensor(logits_arr), dim=1).numpy()
-            precision, recall, _ = precision_recall_curve(all_val_labels, probs[:, 1])
-            pr_auc = auc(recall, precision)
-            print(f"[VAL] PR AUC for Prevalent Hypertension: {pr_auc:.3f}")
-
-        # PR AUC for Future Dx class in validation set
         future_mask = np.array(all_val_future_flags) == 1
+        if logits_arr.ndim == 1 or (logits_arr.ndim == 2 and logits_arr.shape[1] == 1):
+            probs = torch.sigmoid(torch.tensor(logits_arr)).numpy().reshape(-1)
+        else:
+            probs = torch.softmax(torch.tensor(logits_arr), dim=1).numpy()
         if np.sum(future_mask) > 0:
             if logits_arr.ndim == 1 or (logits_arr.ndim == 2 and logits_arr.shape[1] == 1):
                 future_probs = probs[future_mask]
             else:
                 future_probs = probs[future_mask, 1]
-            future_labels = np.array(all_val_labels)[future_mask]
+            future_mask_idx = np.where(future_mask)[0].tolist()
+            future_labels = np.array(all_val_labels)[future_mask_idx]
             precision, recall, _ = precision_recall_curve(future_labels, future_probs)
             pr_auc = auc(recall, precision)
-            print(f"[VAL] PR AUC for Future Dx: {pr_auc:.3f}")
+            print(f"[VAL] PR AUC for Future Dx (AFTER LoRA): {pr_auc:.3f}")
         else:
             print("[VAL] No Future Dx samples in validation set for PR AUC.")
 
@@ -581,33 +534,116 @@ if not CHECK:
     except Exception as e:
         print(f'Could not clean up /home/gavrielh/temp: {e}')
 
-    # --- Evaluation loop ---
-    all_test_logits = []
-    all_test_labels = []
-    for batch in test_loader:  # Use test_loader for future hypertension evaluation
-        imgs, labels, future_flags = batch
-        imgs = imgs.to(DEVICE)
-        labels = labels.to(DEVICE)  # prevalent_hypertension labels
-        with torch.no_grad():
-            logits = model(imgs)
-            all_test_logits.append(logits.cpu().numpy())
-            all_test_labels.append(labels.cpu().numpy())
-    test_logits = np.concatenate(all_test_logits, axis=0)  # shape: (num_samples, 2)
-    test_labels = np.concatenate(all_test_labels, axis=0)
-
-    # --- After evaluation, compute PR AUC for future hypertension in test set ---
-    import torch
-    probs = torch.softmax(torch.tensor(test_logits), dim=1).numpy()
-    future_mask = test_df[LABEL_COL] == 1
-    future_labels = np.array(test_labels)[future_mask]
-    future_probs = probs[future_mask, 1]
-    precision, recall, _ = precision_recall_curve(future_labels, future_probs)
-    pr_auc = auc(recall, precision)
-    plt.figure()
-    plt.plot(recall, precision, label=f'PR AUC = {pr_auc:.2f}')
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title('Precision-Recall curve (Future Hypertension)')
+    # --- POST-FINETUNE LORA EVALUATION (AUC vs. image size, 10x trials, like CHECK mode) ---
+    print("\n[POST-FINETUNE] Evaluating frozen LoRA model on hold-out sets at multiple image sizes...")
+    # After fine-tuning, freeze all model params before post-finetune evaluation
+    for param in model.parameters():
+        param.requires_grad = False
+    model.eval()
+    sizes = [224, 336, 448, 560, 672, 784, 896, 1008, 1120, 1232, 1344, 1456]
+    pr_aucs = []
+    roc_aucs = []
+    pr_aucs_all = []
+    roc_aucs_all = []
+    valid_sizes = []
+    for IMG_SIZE_CUR in sizes:
+        print(f"[POST-FINETUNE] Running for image size {IMG_SIZE_CUR}x{IMG_SIZE_CUR} ...")
+        batch_size_cur = 1
+        N_TRIALS = 5
+        def run_trial(trial):
+            import torch
+            try:
+                transform_cur = transforms.Compose([
+                    transforms.Resize((IMG_SIZE_CUR, IMG_SIZE_CUR)),
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.5]*3, [0.5]*3)
+                ])
+                PREVALENT_CSV = os.path.join(BASE_DIR, "retina_prevalent_future_diagnosis.csv")
+                df = pd.read_csv(PREVALENT_CSV)
+                np.random.seed(42 + trial)
+                neg_indices = df.index[(df[f'prevalent_{DISEASE_TO_TRAIN}'] == 0) & (df[f'future_{DISEASE_TO_TRAIN}'] == 0)].tolist()
+                pos_indices = df.index[df[f'future_{DISEASE_TO_TRAIN}'] == 1].tolist()
+                val_neg_indices = np.random.choice(neg_indices, 800, replace=False)
+                val_pos_indices = np.random.choice(pos_indices, 200, replace=False)
+                val_indices = np.concatenate([val_neg_indices, val_pos_indices])
+                check_df = df.loc[val_indices]
+                check_labels = np.array([0]*800 + [1]*200)
+                check_dataset = RetinaFineTuneDataset(check_df, LABEL_COL, transform=transform_cur)
+                check_loader = DataLoader(check_dataset, batch_size=batch_size_cur, shuffle=False, num_workers=NUM_WORKERS)
+                all_embeds = []
+                with torch.no_grad():
+                    for batch in check_loader:
+                        imgs = batch[0]  # Only use images, ignore label/future_flag
+                        imgs = imgs.to(DEVICE)
+                        feats = model.backbone(imgs)
+                        if isinstance(feats, tuple):
+                            feats = feats[0]
+                        feats_np = feats.cpu().numpy()
+                        feats_np = np.atleast_2d(feats_np)
+                        cls_token = feats_np[:, 0]
+                        all_embeds.append(cls_token)
+                all_embeds = np.concatenate(all_embeds, axis=0)
+                from sklearn.neighbors import KNeighborsClassifier
+                from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
+                knn = KNeighborsClassifier(n_neighbors=5)
+                knn.fit(all_embeds, check_labels)
+                pred_probs = knn.predict_proba(all_embeds)[:, 1]
+                roc_auc = roc_auc_score(check_labels, pred_probs)
+                precision, recall, _ = precision_recall_curve(check_labels, pred_probs)
+                pr_auc = auc(recall, precision)
+                result = (pr_auc, roc_auc)
+                # Explicitly delete large variables and free memory
+                del all_embeds, check_loader, check_dataset
+                if 'backbone' in locals():
+                    del backbone
+                if 'feats' in locals():
+                    del feats
+                if 'feats_np' in locals():
+                    del feats_np
+                if 'cls_token' in locals():
+                    del cls_token
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                return result
+            except RuntimeError as e:
+                import torch
+                if 'out of memory' in str(e) or 'allocate memory' in str(e):
+                    print(f'OOM at size {IMG_SIZE_CUR}, trial {trial}, skipping this trial...')
+                    torch.cuda.empty_cache()
+                    return None
+                else:
+                    raise
+        results = [run_trial(trial) for trial in range(N_TRIALS)]
+        # Filter out None results (OOM trials)
+        results = [r for r in results if r is not None]
+        if len(results) == 0:
+            print(f"All trials OOM for image size {IMG_SIZE_CUR}, skipping this size.")
+            continue
+        pr_aucs_trials, roc_aucs_trials = zip(*results)
+        pr_aucs.append(np.mean(pr_aucs_trials))
+        roc_aucs.append(np.mean(roc_aucs_trials))
+        pr_aucs_all.append(pr_aucs_trials)
+        roc_aucs_all.append(roc_aucs_trials)
+        valid_sizes.append(IMG_SIZE_CUR)
+        print(f"[POST-FINETUNE] KNN ROC AUC (800N/200P, mean±std): {np.mean(roc_aucs_trials):.3f} ± {np.std(roc_aucs_trials):.3f}")
+        print(f"[POST-FINETUNE] KNN PR AUC (800N/200P, mean±std): {np.mean(pr_aucs_trials):.3f} ± {np.std(pr_aucs_trials):.3f}")
+    # After all sizes, plot PR AUC and ROC AUC vs. image size (only for valid_sizes)
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(8, 6))
+    pr_aucs_arr = np.array(pr_aucs_all)
+    roc_aucs_arr = np.array(roc_aucs_all)
+    pr_means = np.array([np.mean(x) for x in pr_aucs_all])
+    pr_stds = np.array([np.std(x) for x in pr_aucs_all])
+    roc_means = np.array([np.mean(x) for x in roc_aucs_all])
+    roc_stds = np.array([np.std(x) for x in roc_aucs_all])
+    plt.errorbar(valid_sizes, pr_means, yerr=pr_stds, fmt='o-r', label='PR AUC')
+    plt.errorbar(valid_sizes, roc_means, yerr=roc_stds, fmt='o-b', label='ROC AUC')
+    plt.xlabel('Image Size (pixels)')
+    plt.ylabel('AUC')
+    plt.title(f'PR AUC and ROC AUC vs. Image Size (LoRA, {LABEL_COL})')
     plt.legend()
-    plt.savefig(os.path.join(BASE_DIR, 'pr_auc_future_hypertension.png'))
-    print(f"Saved PR AUC curve for future hypertension to {os.path.join(BASE_DIR, 'pr_auc_future_hypertension.png')} (AUC={pr_auc:.3f})") 
+    plt.grid(True)
+    summary_plot_path = os.path.join(IMAGES_DIR, f'auc_vs_size_lora_{LABEL_COL.replace(" ", "_")}.png')
+    plt.savefig(summary_plot_path)
+    print(f"Saved summary plot of AUC vs. image size (LoRA) as '{summary_plot_path}'")
