@@ -16,6 +16,11 @@ from torchvision import transforms
 from ijepa.src.models.vision_transformer import vit_huge
 from LabData.DataLoaders.RetinaScanLoader import RetinaScanLoader
 from PIL import Image
+import matplotlib.pyplot as plt
+import seaborn as sns
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
+from sklearn.preprocessing import StandardScaler
 
 # --- LoRA config (manual, not peft) ---
 USE_LORA = True
@@ -26,6 +31,11 @@ LORA_DROPOUT = 0.1
 # --- Load and filter data ---
 bm = RetinaScanLoader().get_data()
 df = bm.df.copy()
+# Reset index (keep old as column) right after copy
+# This preserves the original row order/index in a new column
+old_index = df.index
+df = df.reset_index(drop=False)
+print('Index reset with drop=False. Original index is now in column "index". New DF length:', len(df))
 if 'patient_id' in df.columns:
     df = df.rename(columns={'patient_id': 'RegistrationCode'})
 if 'date' not in df.columns:
@@ -63,16 +73,40 @@ if 'date' in df.columns and 'date' in man_df.columns:
 merged = pd.merge(df, man_df, on=merge_keys, how='inner')
 print('Merged shape:', merged.shape)
 
-# Prepare features and targets (regress all automorph features)
-X = merged[feature_cols].values.astype(np.float32)
-y = X.copy()
-paths = merged[['od_path', 'os_path']].values
+# === Restrict merged DataFrame to only the image paths and automorph features ===
+merged = merged[['od_path', 'os_path'] + feature_cols]
+print('Trimmed merged DataFrame to only image paths and feature columns. New shape:', merged.shape)
 
-# Split train/val
-X_train, X_val, y_train, y_val, paths_train, paths_val = train_test_split(
-    X, y, paths, test_size=0.2, random_state=42
-)
-print('Train shape:', X_train.shape, 'Val shape:', X_val.shape)
+# 1. 60/20/20 train/val/test split
+SEED = 42
+train_df, temp_df = train_test_split(merged, test_size=0.4, random_state=SEED, stratify=merged['target'] if 'target' in merged.columns else None)
+val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=SEED, stratify=temp_df['target'] if 'target' in temp_df.columns else None)
+print(f"Train: {train_df.shape}, Val: {val_df.shape}, Test: {test_df.shape}")
+
+# Extract features, targets, and paths for each split
+X_train = train_df[feature_cols].values.astype(np.float32)
+y_train = X_train.copy()
+paths_train = train_df[['od_path', 'os_path']].values
+
+X_val = val_df[feature_cols].values.astype(np.float32)
+y_val = X_val.copy()
+paths_val = val_df[['od_path', 'os_path']].values
+
+X_test = test_df[feature_cols].values.astype(np.float32)
+y_test = X_test.copy()
+paths_test = test_df[['od_path', 'os_path']].values
+
+# Standardize features (fit on train, transform all)
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+X_test_scaled = scaler.transform(X_test)
+
+# Standardize targets (fit on train, transform all)
+target_scaler = StandardScaler()
+y_train_scaled = target_scaler.fit_transform(y_train)
+y_val_scaled = target_scaler.transform(y_val)
+y_test_scaled = target_scaler.transform(y_test)
 
 # --- Image transforms ---
 IMG_SIZE = (336, 336)
@@ -103,18 +137,23 @@ class FeatureImageDataset(torch.utils.data.Dataset):
         return img, target
 
 # DataLoaders
-BATCH_SIZE = 32
-NUM_WORKERS = 0
+BATCH_SIZE = 8  # reduced to avoid OOM
+
+NUM_WORKERS = 2
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-train_dataset = FeatureImageDataset(X_train, y_train, paths_train, transform)
-val_dataset   = FeatureImageDataset(X_val,   y_val,   paths_val,   transform)
+train_dataset = FeatureImageDataset(X_train_scaled, y_train_scaled, paths_train, transform)
+val_dataset   = FeatureImageDataset(X_val_scaled,   y_val_scaled,   paths_val,   transform)
+test_dataset  = FeatureImageDataset(X_test_scaled,  y_test_scaled,  paths_test,  transform)
 
 train_loader = torch.utils.data.DataLoader(
     train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS
 )
 val_loader = torch.utils.data.DataLoader(
     val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS
+)
+test_loader = torch.utils.data.DataLoader(
+    test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS
 )
 
 # --- Model: ViT backbone + regression head ---
@@ -173,6 +212,8 @@ for name, param in model.named_parameters():
 # Optimizer and loss
 optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
 criterion = nn.MSELoss()
+# Mixed precision scaler
+scaler = GradScaler('cuda') if DEVICE.type == 'cuda' else None
 
 # --- Training loop ---
 EPOCHS = 10
@@ -182,10 +223,18 @@ for epoch in range(1, EPOCHS+1):
     for imgs, targets in train_loader:
         imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
         optimizer.zero_grad()
-        preds = model(imgs)
-        loss = criterion(preds, targets)
-        loss.backward()
-        optimizer.step()
+        if scaler:
+            with autocast('cuda'):
+                preds = model(imgs)
+                loss = criterion(preds, targets)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            preds = model(imgs)
+            loss = criterion(preds, targets)
+            loss.backward()
+            optimizer.step()
         train_losses.append(loss.item())
     print(f'Epoch {epoch} Train Loss: {np.mean(train_losses):.4f}')
 
@@ -195,8 +244,13 @@ for epoch in range(1, EPOCHS+1):
     with torch.no_grad():
         for imgs, targets in val_loader:
             imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
-            preds = model(imgs)
-            loss = criterion(preds, targets)
+            if scaler:
+                with autocast('cuda'):
+                    preds = model(imgs)
+                    loss = criterion(preds, targets)
+            else:
+                preds = model(imgs)
+                loss = criterion(preds, targets)
             val_losses.append(loss.item())
             all_preds.append(preds.cpu().numpy())
             all_targets.append(targets.cpu().numpy())
@@ -205,5 +259,13 @@ for epoch in range(1, EPOCHS+1):
     all_targets = np.concatenate(all_targets, axis=0)
     r2s = [r2_score(all_targets[:, i], all_preds[:, i]) for i in range(all_targets.shape[1])]
     print('R2 per feature:', dict(zip(feature_cols, np.round(r2s, 3))))
+
+# 2. Save LoRA matrices after training
+lora_state = {}
+for name, param in model.named_parameters():
+    if 'lora_A' in name or 'lora_B' in name:
+        lora_state[name] = param.detach().cpu()
+torch.save(lora_state, 'lora_matrices.pth')
+print("Saved LoRA matrices to lora_matrices.pth")
 
 print('Fine-tuning complete.')

@@ -195,8 +195,8 @@ if CHECK:
     valid_sizes = []
     for IMG_SIZE_CUR in sizes:
         print(f"\n[CHECK MODE] Running for image size {IMG_SIZE_CUR}x{IMG_SIZE_CUR} ...")
-        batch_size_cur = 1 if IMG_SIZE_CUR >= 560 else 32
-        N_TRIALS = 10
+        batch_size_cur = 1
+        N_TRIALS = 5
         def run_trial(trial):
             import torch
             try:

@@ -417,7 +417,7 @@ def build_diag_by_win(full_map, graphs):
     return m
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 10  # you can adjust this multiplier later
+NEGATIVE_MULTIPLIER = 2  # you can adjust this multiplier later
 PAIRWISE_TAU = 5.0       # scale for time-weighted ranking loss
 SMOTE_MULTIPLIER = 5.0   # oversample positives beyond negatives
 HORIZON = 10   # how many graphs ahead to predict over
