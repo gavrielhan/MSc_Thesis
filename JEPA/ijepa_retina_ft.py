@@ -287,7 +287,7 @@ for epoch in range(1, CONFIG['epochs'] + 1):
         masks_pred = [m.to(DEVICE, non_blocking=True) for m in masks_pred]
 
         optimizer.zero_grad()
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device_type='cuda'):
             z     = encoder(imgs, masks_enc)
             preds = predictor(z, masks_enc, masks_pred)
             with torch.no_grad():
