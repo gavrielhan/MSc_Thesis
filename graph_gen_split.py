@@ -62,7 +62,7 @@ OUTPUT_DIR = "split"
 random.seed(42)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 # toggle demographic vs. precomputed patient embeddings
-age_sex_bmi = True
+age_sex_bmi = True # set true if you want the patient embeddings to be derived from age_sex_bmi
 
 # ========== UTILS ==========
 def start_pulse_timer(message="running", delay=1800, interval=1800):
