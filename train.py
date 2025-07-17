@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from losses import advanced_link_loss
 from link_prediction_head import CoxHead
+import numpy as np
 
 # --- Training function and main loop ---
 # (Move train() and main() logic here, update DataLoader num_workers)
@@ -50,78 +51,66 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
             if rel in batch.edge_types and hasattr(batch[rel], 'edge_attr'):
                 edge_attr_dict[rel] = batch[rel].edge_attr
 
+        # --- Positive edge oversampling for ('patient','has','condition') ---
+        if 'patient' in batch.x_dict and ('patient','has','condition') in batch.edge_types and hasattr(batch['patient','has','condition'], 'edge_attr'):
+            edge_attr = batch['patient','has','condition'].edge_attr.view(-1)
+            pos_indices = (edge_attr == 1.0).nonzero(as_tuple=True)[0]
+            if pos_indices.numel() > 0:
+                edge_index = batch['patient','has','condition'].edge_index
+                pos_edge_index = edge_index[:, pos_indices]
+                pos_edge_attr = edge_attr[pos_indices]
+                n_dup = 5
+                dup_edge_index = pos_edge_index.repeat(1, n_dup)
+                dup_edge_attr = pos_edge_attr.repeat(n_dup)
+                # Concatenate to original edge_index and edge_attr
+                batch['patient','has','condition'].edge_index = torch.cat([edge_index, dup_edge_index], dim=1)
+                batch['patient','has','condition'].edge_attr = torch.cat([edge_attr, dup_edge_attr], dim=0)
+                print(f"[DEBUG] Duplicated {pos_indices.numel()} positive edges {n_dup}x for oversampling.")
+
         # 3) Forward through GNN
         out = model(batch.x_dict, batch.edge_index_dict, edge_attr_dict)
         P = out['patient']    # [N_pat, D]
         C = out['condition']  # [C, D]
         zero = P.sum() * 0.0
 
-        # 4) Gather true positives in horizon
-        t = int(batch.window)
-        pos_triples = []
-        for w in range(t+1, t+1+HORIZON):
-            for (p, ci) in diag_by_win_train.get(w, []):
-                if focus_idx is None or ci == focus_idx:
-                    pos_triples.append((p, ci, w - t))
-
-        # 5) Map to indices & filter
-        flat_names = [n for sub in batch['patient'].name
-                      for n in (sub if isinstance(sub, list) else [sub])]
-        filtered = []
-        for p, ci, d in pos_triples:
-            if ci == BREAST_IDX:
-                if p in flat_names and gender_map.get(p,'female')=='female':
-                    filtered.append((p,ci,d))
-            else:
-                if p in flat_names:
-                    filtered.append((p,ci,d))
-
-        src, dst, dists = [], [], []
-        for p, ci, d in filtered:
-            idx = flat_names.index(p)
-            src.append(idx); dst.append(ci); dists.append(d)
-
-        if src:
-            # positives
-            pos_ei = torch.stack([torch.tensor(src, device=device),
-                                   torch.tensor(dst, device=device)], dim=0)
-            tte_pos = batch['patient'].duration[pos_ei[0], pos_ei[1]]
-            # negatives
-            with torch.no_grad():
-                all_src = torch.arange(P.size(0), device=device)
-                all_dst = torch.full((P.size(0),), focus_idx, device=device)
-                all_ei  = torch.stack([all_src, all_dst], dim=0)
-                tte_all = batch['patient'].duration[all_src, all_dst]
-                all_logits = link_head(P, C, all_ei, tte_all)
-            pos_pairs = set((int(i), int(c)) for i, c in zip(pos_ei[0], pos_ei[1]))
-            neg_mask = [(s.item(), focus_idx) not in pos_pairs for s in all_src]
-            cand_src   = all_src[neg_mask]
-            cand_logits = all_logits[neg_mask]
-            n_neg = pos_ei.size(1) * NEGATIVE_MULTIPLIER
-            if cand_logits.numel() >= n_neg:
-                _, topk = cand_logits.topk(n_neg, largest=True)
-                neg_src = cand_src[topk]
-            else:
-                neg_src = cand_src
-            neg_dst = torch.full_like(neg_src, focus_idx, device=device)
-            neg_ei  = torch.stack([neg_src, neg_dst], dim=0)
-            tte_neg = batch['patient'].duration[neg_ei[0], neg_ei[1]]
-            # --- Use advanced_link_loss ---
-            link_loss, loss_dict = advanced_link_loss(
-                P, C, link_head, pos_ei, neg_ei, device,
-                loss_weights={'focal': 1.0, 'ap': 1.0},
-                smoothing=0.1,
-                mixup_alpha=0.2,
-                cb_beta=0.9999,
-                ap_delta=1.0,
-                focal_alpha=0.95,
-                focal_gamma=2.5,
-                smote_multiplier=SMOTE_MULTIPLIER
-            )
+        # --- New: Link regression loss for all patient-condition edges ---
+        if ('patient','has','condition') in batch.edge_types and hasattr(batch['patient','has','condition'], 'edge_attr'):
+            edge_index = batch['patient','has','condition'].edge_index
+            edge_attr = batch['patient','has','condition'].edge_attr.view(-1)
+            pred = link_head(P, C, edge_index)
+            mse_loss = F.mse_loss(pred, edge_attr)
+            # --- Updated: diagnosis_targets is 1 if diagnosis occurs within HORIZON ---
+            diagnosis_targets = torch.zeros_like(edge_attr, device=pred.device)
+            # batch.window is the current window index (int)
+            t = int(batch.window)
+            H = HORIZON if 'HORIZON' in globals() else 50
+            for idx in range(edge_index.size(1)):
+                pi = edge_index[0, idx].item()
+                ci = edge_index[1, idx].item()
+                pname = batch['patient'].name[0][pi] if isinstance(batch['patient'].name[0], list) else batch['patient'].name[pi]
+                # Check if (pname, ci) is diagnosed in [t, t+HORIZON]
+                positive = False
+                for wi in range(t, t + H + 1):
+                    if (pname, ci) in set(diag_by_win_train.get(wi, [])):
+                        positive = True
+                        break
+                if positive:
+                    diagnosis_targets[idx] = 1.0
+            diagnosis_weights = torch.ones_like(edge_attr, device=pred.device)
+            diagnosis_weights[diagnosis_targets == 1.0] = 20.0  # Increased pos_weight
+            weighted_loss = F.binary_cross_entropy_with_logits(pred, diagnosis_targets, weight=diagnosis_weights, reduction='mean')
+            link_loss = mse_loss + weighted_loss
+            # Debug print for batch composition
+            if batch_idx < 5:
+                n_pos = diagnosis_targets.sum().item()
+                n_neg = len(diagnosis_targets) - n_pos
+                print(f"[DEBUG] Batch {batch_idx}: {n_pos} positives, {n_neg} negatives (HORIZON positives)")
+            if batch_idx == 0:
+                print(f"[TRAIN] MSE loss: {mse_loss.item():.4f} | Weighted diagnosis loss: {weighted_loss.item():.4f} | Total link loss: {link_loss.item():.4f}")
         else:
             link_loss = zero.clone()
 
-        # 6) Cox loss
+        # 6) Cox loss (unchanged)
         cox_loss = zero.clone()
         if hasattr(batch['patient'],'event') and hasattr(batch['patient'],'duration'):
             batch_names = [n for sub in batch['patient'].name for n in (sub if isinstance(sub, list) else [sub])]
@@ -132,13 +121,13 @@ def train(model, link_head, cox_head, patient_classifier, loader, optimizer, dev
             if (ev > 0).sum().item() > 0:
                 cox_loss = CoxHead.cox_partial_log_likelihood(rs, du, ev)
 
-        # 7) Pseudo?label CE
+        # 7) Pseudo?label CE (unchanged)
         node_ps = zero.clone()
+        t = int(batch.window)
         lm = pseudo_label_by_window.get(t,{})
         if lm:
             idxs = torch.tensor(list(lm.keys()), device=device)
-            labs = torch.tensor([lm[i] for i in idxs.cpu().tolist()],
-                                device=device)
+            labs = torch.tensor([lm[i] for i in idxs.cpu().tolist()], device=device)
             logits = patient_classifier(P[idxs])
             node_ps = F.cross_entropy(logits, labs)
 

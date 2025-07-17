@@ -32,15 +32,19 @@ def evaluate(
     link_head.eval()
     cox_head.eval()
     joint_head.eval()
+    import torch
 
     # Accumulators
     total_link_loss = 0.0
+    link_loss_batches = 0
     total_cox_loss  = 0.0
     window_scores  = []
     # store the maximum predicted probability for each (patient, condition)
     patient_cond_max = defaultdict(float)
     all_risk_scores, all_durations, all_events = [], [], []
     num_batches = 0
+    mse_losses = []
+    weighted_losses = []
 
     with torch.no_grad():
         w_link = torch.exp(-F.softplus(joint_head.s_link)).item()
@@ -69,10 +73,8 @@ def evaluate(
         rel_sig = ('patient', 'to', 'signature')
         if rel_sig in batch.edge_types and hasattr(batch[rel_sig], 'edge_attr'):
             edge_attr_dict[rel_sig] = batch[rel_sig].edge_attr
-            # if you also use the reverse relation in your model:
             edge_attr_dict[('signature', 'to_rev', 'patient')] = batch[rel_sig].edge_attr
 
-        # 2) temporal 'follows' edges (3-day intervals)
         for rel in [
             ('patient', 'follows', 'patient'),
             ('patient', 'follows_rev', 'patient')
@@ -84,97 +86,90 @@ def evaluate(
         P     = out['patient']                            # [N_pat, D]
         C_emb = frozen_condition_embeddings.to(device)    # [C, D]
         Np, Nc = P.size(0), C_emb.size(0)
+        # Robustly flatten names if they are lists (possibly nested)
+        names = batch['patient'].name[0]
 
-        # 3) build full grid of (patient,cond)
-        src_all = torch.arange(Np, device=device).repeat_interleave(Nc)  # [Np*Nc]
-        dst_all = torch.arange(Nc, device=device).repeat(Np)            # [Np*Nc]
-        full_ei = torch.stack([src_all, dst_all], dim=0)               # [2, Np*Nc]
-
-        # 4) compute & blend logits using the fixed evaluation weights
-        link_logits = link_head(P, C_emb, full_ei)     # [Np*Nc]
-        risks       = cox_head(P)                      # [Np, Nc]
-        cox_logits  = risks[src_all, dst_all]          # [Np*Nc]
-
-        # now blend using the constants you set
-        logits_all = BLEND_LINK * link_logits + BLEND_COX * cox_logits
-        probs_all  = torch.sigmoid(logits_all)         # [Np*Nc]
-
-        # save for sliding-window plot
-        window_scores.append(probs_all.view(Np, Nc).cpu().detach().numpy())
-
-        # 5) gather true positives in this window?s HORIZON
-        flat_names = [
-            n for sub in batch['patient'].name
-              for n in (sub if isinstance(sub, list) else [sub])
-        ]
-        is_female_flat = torch.tensor(
-            [gender_map.get(p,'female')=='female' for p in flat_names],
-            device=device, dtype=torch.bool
-        )
-        pos_pairs = []
-        for w in range(window_idx+1, window_idx+1+HORIZON):
-            pos_pairs.extend(diag_by_win_map.get(w, []))
-
-        # filter male?breast
-        filtered = []
-        for (p,ci) in pos_pairs:
-            if ci==BREAST_IDX:
-                if p in flat_names and is_female_flat[flat_names.index(p)]:
-                    filtered.append((p,ci))
-            else:
-                filtered.append((p,ci))
-
-        # map to node indices
-        src_nodes, dst_nodes = [], []
-        for (p,ci) in filtered:
-            if p in flat_names:
-                src_nodes.append(flat_names.index(p))
-                dst_nodes.append(ci)
-
-        # pack into pos_ei
-        if src_nodes:
-            pos_ei = torch.stack([
-                torch.tensor(src_nodes, device=device),
-                torch.tensor(dst_nodes, device=device)
-            ], dim=0)  # [2, N_pos]
-        else:
-            pos_ei = torch.empty((2,0), device=device, dtype=torch.long)
-
-        # 6) build dense labels over full grid
-        labels_all = torch.zeros_like(probs_all)
-        if pos_ei.numel()>0:
-            flat_pos = pos_ei[0]*Nc + pos_ei[1]
-            labels_all[flat_pos] = 1.0
-
-        # 7) update patient-level maximum scores
-        prob_matrix = probs_all.view(Np, Nc)
+        # --- Predict for all (patient, condition) pairs ---
+        pred_count = 0
+        window_ys, window_yt = [], []
+        mse_targets, mse_preds = [], []
+        weighted_targets, weighted_preds, weighted_weights = [], [], []
         if focus_idx is not None:
-            cond_range = [focus_idx]
+            conds = [focus_idx]
         else:
-            cond_range = range(num_conditions)
-        for i, pname in enumerate(flat_names):
-            for ci in cond_range:
-                score = prob_matrix[i, ci].item()
+            conds = list(range(Nc))
+        # Compute baseline risks for this window
+        from model import baseline_risk_diabetes
+        baseline_risks = baseline_risk_diabetes(names, window_idx)
+        for pi, pname in enumerate(names):
+            for ci in conds:
+                edge_index = torch.tensor([[pi], [ci]], dtype=torch.long, device=device)
+                pred = link_head(P, C_emb, edge_index)
+                score = pred.item()
+                # Clamp prediction to [0.0, 1.0]
+                score = max(0.0, min(1.0, score))
                 key = (pname, ci)
-                if score > patient_cond_max.get(key, 0.0):
+                if score > patient_cond_max.get(key, float('-inf')):
                     patient_cond_max[key] = score
+                pred_count += 1
+                # For link loss: get true label for this (patient, condition) in this window
+                # True label is 1 if (pname, ci) in any diag_by_win_map[wi] for wi in [window_idx, window_idx+HORIZON]
+                H = HORIZON if 'HORIZON' in globals() else 50  # fallback if not imported
+                future_pos = False
+                for wi in range(window_idx, window_idx + H + 1):
+                    if (pname, ci) in set(diag_by_win_map.get(wi, [])):
+                        future_pos = True
+                        break
+                true_label = 1.0 if future_pos else 0.0
+                window_ys.append(score)
+                window_yt.append(true_label)
+                # --- Calculate edge attribute as in training ---
+                # Find all future diagnosis windows for this patient-condition
+                future_diags = [w for w, pairs in diag_by_win_map.items() if w >= window_idx and (pname, ci) in pairs]
+                if not future_diags:
+                    # Never diagnosed
+                    edge_attr = baseline_risks[pi]
+                else:
+                    diag_win = min(future_diags)
+                    if window_idx == diag_win:
+                        edge_attr = 1.0
+                    elif window_idx < diag_win:
+                        total = max(1, diag_win - window_idx)
+                        progress = 1 - total / (diag_win - window_idx + 1)
+                        baseline = baseline_risks[pi]
+                        edge_attr = baseline + (1.0 - baseline) * progress
+                        edge_attr = min(edge_attr, 1.0)
+                mse_targets.append(edge_attr)
+                mse_preds.append(score)
+                # For weighted loss: 1.0 if edge_attr==1.0, else 0.0
+                weighted_targets.append(1.0 if edge_attr == 1.0 else 0.0)
+                weighted_preds.append(score)
+                weighted_weights.append(10.0 if edge_attr == 1.0 else 1.0)  # Example: 10x weight for positives
+        # Compute link loss for this window
+        if window_ys and window_yt:
+            ys_tensor = torch.tensor(window_ys)
+            yt_tensor = torch.tensor(window_yt)
+            pos_weight = 1000.0  # Weight for positive samples
+            weights = torch.ones_like(yt_tensor)
+            weights[yt_tensor == 1.0] = pos_weight
+            batch_link_loss = torch.mean(weights * (ys_tensor - yt_tensor) ** 2).item()
+            total_link_loss += batch_link_loss
+            link_loss_batches += 1
+        # --- Compute MSE loss on edge attributes ---
+        if mse_targets:
+            mse_loss = F.mse_loss(torch.tensor(mse_preds), torch.tensor(mse_targets)).item()
+            mse_losses.append(mse_loss)
+        # --- Compute weighted binary loss for diagnosis ---
+        if weighted_targets:
+            pred_tensor = torch.tensor(weighted_preds)
+            target_tensor = torch.tensor(weighted_targets)
+            weight_tensor = torch.tensor(weighted_weights)
+            # Weighted BCE loss
+            bce = F.binary_cross_entropy(pred_tensor, target_tensor, weight=weight_tensor, reduction='mean').item()
+            weighted_losses.append(bce)
 
-        # 8) balanced 1:1 BCE link loss
-        pos_idx = (labels_all==1).nonzero(as_tuple=True)[0]
-        neg_idx = (labels_all==0).nonzero(as_tuple=True)[0]
-        if pos_idx.numel()>0:
-            k = pos_idx.numel()
-            if neg_idx.numel()>k:
-                neg_idx = neg_idx[torch.randperm(neg_idx.numel())[:k]]
-            sample_idx = torch.cat([pos_idx, neg_idx], dim=0)
-        else:
-            sample_idx = neg_idx
-
-        logits_s = logits_all[sample_idx]
-        labels_s = labels_all[sample_idx]
-        total_link_loss += F.binary_cross_entropy_with_logits(logits_s, labels_s).item()
-
-        # 9) Cox partial-likelihood
+        # 9) Cox partial-likelihood (unchanged)
+        risks = cox_head(P)
         if hasattr(batch['patient'],'event'):
             evts = batch['patient'].event
             durs = batch['patient'].duration
@@ -195,17 +190,25 @@ def evaluate(
         num_batches += 1
 
     # finalize
-    avg_link = total_link_loss / max(1, num_batches)
+    avg_link = total_link_loss / max(1, link_loss_batches)
     avg_cox  = total_cox_loss  / max(1, num_batches)
+    avg_mse_loss = sum(mse_losses) / max(1, len(mse_losses))
+    avg_weighted_loss = sum(weighted_losses) / max(1, len(weighted_losses))
+    total_eval_loss = avg_mse_loss + avg_weighted_loss
 
     # --- Patient level AUC calculations ---
     pos_pairs = set()
     for pairs in diag_by_win_map.values():
         pos_pairs.update(pairs)
 
+    # Debug: count positive and predicted pairs for focus_idx
+    if plot_idx is not None:
+        n_pos_pairs = sum(1 for (p, c) in pos_pairs if c == plot_idx)
+        n_pred_pairs = sum(1 for (p, c) in patient_cond_max if c == plot_idx)
+
     y_true, y_score = [], []
     for (p, ci), score in patient_cond_max.items():
-        if focus_idx is not None and ci != focus_idx:
+        if plot_idx is not None and ci != plot_idx:
             continue
         y_score.append(score)
         y_true.append(1 if (p, ci) in pos_pairs else 0)
@@ -218,7 +221,7 @@ def evaluate(
 
     pr_per_cond = []
     for ci in range(num_conditions):
-        if focus_idx is not None and ci != focus_idx:
+        if plot_idx is not None and ci != plot_idx:
             pr_per_cond.append(None)
             continue
         ys, yt = [], []
@@ -231,7 +234,7 @@ def evaluate(
         else:
             pr_per_cond.append(None)
 
-    # C-index
+    # C-index (unchanged)
     c_idxs = []
     if all_risk_scores:
         R = torch.cat(all_risk_scores).detach().numpy()
@@ -260,11 +263,13 @@ def evaluate(
         D_np = torch.cat(all_durations).detach().numpy()
         E_np = torch.cat(all_events).detach().numpy()
         calibrators = fit_absolute_risk_calibrator(R_np, D_np, E_np)
+    print(f"[EVAL] MSE loss: {avg_mse_loss:.4f} | Weighted diagnosis loss: {avg_weighted_loss:.4f} | Total eval loss: {total_eval_loss:.4f}")
     return (
-        avg_link,    # balanced BCE link loss
+        avg_link,    # MSE link loss (legacy)
         avg_cox,     # Cox loss
-        None,        # node?CE (not computed here)
-        None,        # node?acc (not computed here)
+        avg_mse_loss, # New: MSE on edge attributes
+        avg_weighted_loss, # New: weighted binary loss for diagnosis
+        total_eval_loss,   # Sum of both losses
         c_idxs,
         mean_c,
         link_auc,
@@ -272,4 +277,5 @@ def evaluate(
         pr_per_cond,
         window_scores,
         calibrators,
+        patient_cond_max,  # <-- add this to the return tuple
     )

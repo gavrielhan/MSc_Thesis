@@ -425,7 +425,7 @@ def subsample_patients_in_graphs(graphs, focus_idx=None, seed=42):
     negative_patients = list(negative_patients)
     random.seed(seed)
     num_positives = len(positive_patients)
-    num_negatives = min(2 * num_positives, len(negative_patients))
+    num_negatives = min(10 * num_positives, len(negative_patients))
     sampled_negatives = set(random.sample(negative_patients, num_negatives))
     keep_patients = positive_patients | sampled_negatives
     filtered_graphs = []
@@ -463,8 +463,110 @@ def subsample_patients_in_graphs(graphs, focus_idx=None, seed=42):
         filtered_graphs.append(g)
     return filtered_graphs
 
+def baseline_risk_diabetes(names, window_idx):
+    """
+    Compute baseline diabetes risk for each patient in names at the given window index.
+    Uses age, sex, and BMI if available, otherwise defaults: age=45, sex=male, bmi=25.
+    The first window is 2018-12-28, each window is 3 days later.
+    Returns a list of risk scores in [0,0.99].
+    """
+    # Prepare lookup tables from age_gender and bm (if available)
+    # age_gender: DataFrame with columns ['RegistrationCode', 'age', 'gender', 'yob']
+    # gender_map: dict from RegistrationCode to 'male'/'female'
+    # Try to get BMI from bm if available, else use 25
+    try:
+        bmi_map = dict(zip(bm['RegistrationCode'], bm['bmi'])) if 'bmi' in bm.columns else {}
+    except Exception:
+        bmi_map = {}
+    yob_map = dict(zip(age_gender['RegistrationCode'], age_gender['yob'])) if 'yob' in age_gender.columns else {}
+    gender_map_local = dict(zip(age_gender['RegistrationCode'], age_gender['gender'])) if 'gender' in age_gender.columns else {}
+    # Window start date
+    base_date = datetime.date(2018, 12, 28)
+    window_date = base_date + datetime.timedelta(days=window_idx * 3)
+    risks = []
+    for name in names:
+        # Get yob, sex, bmi
+        yob = yob_map.get(name, None)
+        sex_str = gender_map_local.get(name, 'male')
+        sex = 1 if sex_str == 'male' else 0
+        bmi = bmi_map.get(name, 25.0)
+        # Compute age at this window
+        if yob is not None and not pd.isna(yob):
+            try:
+                yob_int = int(float(yob))
+                age = window_date.year - yob_int
+            except Exception:
+                age = 45.0
+        else:
+            age = 45.0
+        # Risk logistic function (updated intercept)
+        logit = -7.0 + 0.08 * age + 0.5 * sex + 0.04 * bmi
+        risk = 1 / (1 + np.exp(-logit))
+        risk = min(0.99, max(0.0, float(risk)))
+        risks.append(risk)
+    return risks
+
+def patch_patient_condition_edges(graphs, diag_by_win, focus_idx=None):
+    """
+    For each graph, add (or update) edges between every patient and every condition.
+    If focus_idx is set, only connect to the chosen condition.
+    Edge attributes:
+      - 0.0 if patient will never be diagnosed with the condition
+      - 1.0 on the day of diagnosis
+      - linearly increase from baseline risk to 1.0 as diagnosis day approaches, based on distance to diagnosis
+      - For diabetes negatives, use baseline_risk_diabetes()
+    """
+    for wi, g in enumerate(graphs):
+        names = g['patient'].name
+        num_pat = len(names)
+        if focus_idx is not None:
+            conds = [focus_idx]
+        else:
+            conds = list(range(g['condition'].x.size(0)))
+        edge_indices = []
+        edge_attrs = []
+        # Precompute baseline risks for diabetes
+        if focus_idx is not None:
+            baseline_risks = baseline_risk_diabetes(names, wi)
+        for pi, pname in enumerate(names):
+            for ci in conds:
+                # Find all future diagnosis windows for this patient-condition
+                future_diags = [w for w, pairs in diag_by_win.items() if w >= wi and (pname, ci) in pairs]
+                if not future_diags:
+                    # Never diagnosed
+                    if focus_idx is not None and ci == focus_idx:
+                        # Use baseline risk for diabetes negatives
+                        risk = baseline_risks[pi]
+                        edge_indices.append([pi, ci])
+                        edge_attrs.append([risk])
+                    else:
+                        edge_indices.append([pi, ci])
+                        edge_attrs.append([0.0])
+                else:
+                    diag_win = min(future_diags)
+                    if wi == diag_win:
+                        edge_indices.append([pi, ci])
+                        edge_attrs.append([1.0])
+                    elif wi < diag_win:
+                        # Linearly increase from baseline risk to 1.0 as diagnosis approaches
+                        total = max(1, diag_win - wi)
+                        progress = 1 - total / (diag_win - wi + 1)
+                        baseline = baseline_risks[pi] if focus_idx is not None and ci == focus_idx else 0.1
+                        val = baseline + (1.0 - baseline) * progress
+                        val = min(val, 1.0)
+                        edge_indices.append([pi, ci])
+                        edge_attrs.append([val])
+        if edge_indices:
+            ei = torch.tensor(edge_indices, dtype=torch.long).T
+            ea = torch.tensor(edge_attrs, dtype=torch.float)
+            g['patient','has','condition'].edge_index = ei
+            g['patient','has','condition'].edge_attr = ea
+            g['condition','has_rev','patient'].edge_index = ei.flip(0)
+            g['condition','has_rev','patient'].edge_attr = ea
+    return graphs
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NEGATIVE_MULTIPLIER = 10  # you can adjust this multiplier later
+NEGATIVE_MULTIPLIER = 2  # you can adjust this multiplier later
 PAIRWISE_TAU = 5.0       # scale for time-weighted ranking loss
 SMOTE_MULTIPLIER = 5.0   # oversample positives beyond negatives
 HORIZON = 10   # how many graphs ahead to predict over
@@ -520,8 +622,8 @@ def main():
     from eval import evaluate
     # 1. Load graphs
     train_graphs = torch.load("split/train_graphs_3d.pt", weights_only=False)
-    val_graphs = torch.load("split/val_graphs_3d.pt", weights_only=False)
-    test_graphs = torch.load("split/test_graphs_3d.pt", weights_only=False)
+    val_graphs = torch.load("split/test_graphs_3d.pt", weights_only=False)
+    test_graphs = torch.load("split/val_graphs_3d.pt", weights_only=False)
 
     # 2. Subsample patients in training set
     train_graphs = subsample_patients_in_graphs(train_graphs, focus_idx=focus_idx)
@@ -533,6 +635,43 @@ def main():
     diag_by_win_train = build_diag_by_win(full_diag_map, train_graphs)
     diag_by_win_val = build_diag_by_win(full_diag_map, val_graphs)
     diag_by_win_test = build_diag_by_win(full_diag_map, test_graphs)
+    # DEBUG: Print number of unique patients in validation who will get chosen[focus_idx]
+    if focus_idx is not None:
+        val_focus_patients = set()
+        train_focus_patients = set()
+        test_focus_patients = set()
+        for pairs in diag_by_win_val.values():
+            for p, c in pairs:
+                if c == focus_idx:
+                    val_focus_patients.add(p)
+        print(f"[DEBUG] Number of unique patients in validation who will get {chosen[focus_idx]}: {len(val_focus_patients)}")
+        for pairs in diag_by_win_train.values():
+            for p, c in pairs:
+                if c == focus_idx:
+                    train_focus_patients.add(p)
+        print(f"[DEBUG] Number of unique patients in train who will get {chosen[focus_idx]}: {len(train_focus_patients)}")
+        for pairs in diag_by_win_test.values():
+            for p, c in pairs:
+                if c == focus_idx:
+                    test_focus_patients.add(p)
+        print(f"[DEBUG] Number of unique patients in test who will get {chosen[focus_idx]}: {len(test_focus_patients)}")
+
+
+
+
+    # Patch patient-condition edges in the training set
+    train_graphs = patch_patient_condition_edges(train_graphs, diag_by_win_train, focus_idx=focus_idx)
+
+    # Print sample baseline risk scores for first and last window
+    if focus_idx is not None and len(train_graphs) > 0:
+        print("[DEBUG] Sample baseline diabetes risk scores:")
+        for idx, wi in zip([0, -1], [0, len(train_graphs)-1]):
+            g = train_graphs[wi]
+            names = g['patient'].name
+            risks = baseline_risk_diabetes(names, wi)
+            print(f"  Window {wi} ({'first' if wi==0 else 'last'}):")
+            for pname, risk in list(zip(names, risks))[:5]:
+                print(f"    {pname}: {risk:.4f}")
 
     # 4. DataLoaders
     POS_WINDOW_WEIGHT = 10.0
@@ -566,12 +705,12 @@ def main():
         + list(cox_head.parameters())
         + list(patient_classifier.parameters())
         + list(joint_head.parameters()),
-        lr=1e-3
+        lr=1e-5
     )
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     # 6. Full advanced training loop
-    USE_PSEUDO = True  # Set to None to disable pseudo-labeling
+    USE_PSEUDO = None  # Set to None to disable pseudo-labeling
     plot_idx = focus_idx  # Set to None to disable plotting
     EPOCHS = 200
     pseudo_eps = 0.80
@@ -649,10 +788,9 @@ def main():
             h = F.relu(model.shrink['condition'](h))
             cond_embeds = model.linear_proj['condition'](h)
         (
-            avg_link, avg_cox, avg_node_ce, node_acc,
-            cidx_list, mean_cidx, link_auc,
-            pr_auc, pr_per_cond, val_scores,
-            calibrators,
+            avg_link, avg_cox, avg_mse_loss, avg_weighted_loss, total_eval_loss,
+            cidx_list, mean_cidx, link_auc, pr_auc, pr_per_cond, val_scores,
+            calibrators, patient_cond_max
         ) = evaluate(
             model, link_head, cox_head, joint_head, patient_classifier,
             val_loader, device,
@@ -665,8 +803,9 @@ def main():
             "train_loss": train_loss,
             "val_link_loss": avg_link,
             "val_cox_loss": avg_cox,
-            "val_node_ce": avg_node_ce,
-            "val_node_acc": node_acc,
+            "val_mse_loss": avg_mse_loss,
+            "val_weighted_loss": avg_weighted_loss,
+            "total_eval_loss": total_eval_loss,
             "val_c_indices": cidx_list,
             "val_mean_c": mean_cidx,
             "val_link_auc": link_auc,
@@ -675,9 +814,37 @@ def main():
             "calibrators": bool(calibrators is not None),
             "timestamp": datetime.datetime.now().isoformat(),
         })
-        print(f"[Epoch {epoch}] Train {train_loss:.4f} | ValLink {avg_link:.4f} "
-              f"Val Cox Loss: {avg_cox:.4f} | Node Acc: {node_acc} | "
-              f"Val C-Index: {cidx_list} | PR AUC per condition: {pr_per_cond}")
+        print(f"[Epoch {epoch}] "
+              f"Train {train_loss:.4f} | "
+              f"ValLink {avg_link:.4f} | "
+              f"Val Cox Loss: {avg_cox:.4f} | "
+              f"Val MSE: {avg_mse_loss:.4f} | "
+              f"Val Weighted Loss: {avg_weighted_loss:.4f} | "
+              f"Total Eval Loss: {total_eval_loss:.4f} | "
+              f"Val C-Index: {cidx_list} | "
+              f"Mean C-Index: {mean_cidx} | "
+              f"Link AUC: {link_auc} | "
+              f"PR AUC: {pr_auc} | "
+              f"PR AUC per condition: {pr_per_cond}")
+
+        # Top-20 print for focus_idx
+        if focus_idx is not None and patient_cond_max:
+            # Collect all (patient, focus_idx) scores and labels in validation set
+            val_patient_scores = []
+            val_patient_labels = []
+            pos_pairs = set()
+            for pairs in diag_by_win_val.values():
+                pos_pairs.update(pairs)
+            for (p, ci), score in patient_cond_max.items():
+                if ci == focus_idx:
+                    val_patient_scores.append((p, score))
+                    val_patient_labels.append(1 if (p, ci) in pos_pairs else 0)
+            # Sort by predicted score
+            sorted_scores = sorted(zip(val_patient_scores, val_patient_labels), key=lambda x: x[0][1], reverse=True)
+            top20 = sorted_scores[:20]
+            n_true = sum(label for (_, _), label in top20)
+            pct = 100.0 * n_true / max(1, len(top20))
+            print(f"[Val] Top 20 predicted patients for {chosen[focus_idx]}: {pct:.1f}% will be diagnosed within the horizon.")
 
         # Plotting
         if plot_idx is not None and max_pr_auc < (pr_per_cond[plot_idx] if pr_per_cond[plot_idx] is not None else 0):
