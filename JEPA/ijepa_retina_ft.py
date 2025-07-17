@@ -313,8 +313,13 @@ def get_grad_scaler():
     else:
         return torch.cuda.amp.GradScaler()
 
+
 # Helper to plot and save loss curves with image size in the title
 def save_loss_plot(train_losses, val_losses, epochs, filename, config, stage):
+    min_len = min(len(epochs), len(train_losses), len(val_losses))
+    epochs = epochs[:min_len]
+    train_losses = train_losses[:min_len]
+    val_losses = val_losses[:min_len]
     plt.figure()
     plt.plot(epochs, train_losses, label=f'{stage.capitalize()} Train MSE')
     plt.plot(epochs, val_losses, label=f'{stage.capitalize()} Val MSE')
@@ -324,7 +329,6 @@ def save_loss_plot(train_losses, val_losses, epochs, filename, config, stage):
     plt.tight_layout()
     plt.savefig(filename)
     plt.close()
-
 
 def save_checkpoint(state, train_losses, val_losses, epoch_list, config, stage, filename=CHECKPOINT_PATH):
     torch.save(state, filename)
@@ -527,8 +531,8 @@ def main():
     if checkpoint is not None:
         stage = checkpoint.get('stage', None)
         epoch = checkpoint.get('epoch', 1)
-        elapsed_time = checkpoint.get('elapsed_time', 0)
-        logger.info(f"Resuming from checkpoint at epoch {epoch}, elapsed_time {elapsed_time/3600:.2f} hrs, stage {stage}")
+        elapsed_time = 0  # Reset elapsed time on resume
+        logger.info(f"Resuming from checkpoint at epoch {epoch}, elapsed_time reset to 0, stage {stage}")
     else:
         stage = None
         epoch = 1
