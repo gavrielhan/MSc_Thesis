@@ -123,6 +123,13 @@ def load_pretrained_encoder(enc, config):
     else:
         logger.info("No pretrained checkpoint found; skipping load")
 
+def freeze_lora_params(model):
+    for p in model.parameters():
+        p.requires_grad = False
+    for n, p in model.named_parameters():
+        if 'lora_' in n:
+            p.requires_grad = True
+
 def build_transforms():
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
@@ -133,8 +140,12 @@ def build_transforms():
     ])
 
 # ---------- Main Training/Eval ----------
+CHECKPOINT_PATH = 'checkpoint_papila_finetune.pth'
+MAX_TRAIN_SECONDS = 11.5 * 3600  # 11.5 hours in seconds
+
 def main():
     # Paths
+    import time
     root = CONFIG['external_root']
     img_dir = os.path.join(root, 'FundusImages')
     kfold_dir = os.path.join(root, 'HelpCode', 'kfold', 'Test 1')
@@ -153,13 +164,32 @@ def main():
     enc = build_encoder(CONFIG)
     load_pretrained_encoder(enc, CONFIG)
     enc.to(DEVICE)
+    freeze_lora_params(enc)  # Only LoRA adapters are trainable
     head = ClassificationHead(CONFIG['embed_dim'], CONFIG['n_classes']).to(DEVICE)
     model = nn.Sequential(enc, head)
-    optimizer = AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'])
+    optimizer = AdamW([
+        {'params': [p for n, p in enc.named_parameters() if p.requires_grad], 'weight_decay': CONFIG['weight_decay']},
+        {'params': head.parameters(), 'weight_decay': 0.0}
+    ], lr=CONFIG['lr'])
     scheduler = CosineAnnealingLR(optimizer, T_max=CONFIG['epochs'])
     criterion = nn.CrossEntropyLoss()
+
+    # Check for checkpoint
+    start_epoch = 1
+    elapsed_time = 0
+    if os.path.isfile(CHECKPOINT_PATH):
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        enc.load_state_dict(checkpoint['enc'])
+        head.load_state_dict(checkpoint['head'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        start_epoch = checkpoint.get('epoch', 1)
+        elapsed_time = checkpoint.get('elapsed_time', 0)
+        print(f"Resuming from checkpoint at epoch {start_epoch}, elapsed_time {elapsed_time:.2f}s")
+
     # Training loop
-    for epoch in range(1, CONFIG['epochs']+1):
+    total_start_time = time.time()
+    for epoch in range(start_epoch, CONFIG['epochs']+1):
         model.train()
         train_loss = 0
         n_samples = 0
@@ -173,6 +203,19 @@ def main():
             batch_size = imgs.size(0)
             train_loss += loss.item() * batch_size
             n_samples += batch_size
+            # Check for time limit
+            total_elapsed = elapsed_time + (time.time() - total_start_time)
+            if total_elapsed >= MAX_TRAIN_SECONDS:
+                torch.save({
+                    'enc': enc.state_dict(),
+                    'head': head.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'epoch': epoch,
+                    'elapsed_time': total_elapsed,
+                }, CHECKPOINT_PATH)
+                print(f"Reached max training time. Checkpoint saved to {CHECKPOINT_PATH}. Exiting.")
+                return
         train_loss /= n_samples if n_samples > 0 else 1
         logger.info(f"Epoch {epoch} Train Loss: {train_loss:.4f}")
         scheduler.step()
@@ -215,6 +258,75 @@ def main():
         plt.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{auc:.2f}', ha='center', va='bottom')
     plt.tight_layout()
     plt.savefig('roc_auc_per_class.png')
+    plt.close()
+
+    # --- Clinical Data Baseline ---
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import LabelEncoder, StandardScaler
+    # Load clinical data
+    clinical_dir = os.path.join(root,"ClinicalData")
+    od_path = os.path.join(clinical_dir, 'patient_data_od.xlsx')
+    os_path = os.path.join(clinical_dir, 'patient_data_os.xlsx')
+    df_od = pd.read_excel(od_path, header=1)
+    df_os = pd.read_excel(os_path, header=1)
+    # Rename the first column to 'ID' if it's unnamed
+    df_od = df_od.rename(columns={str(df_od.columns[0]): 'ID'})
+    df_os = df_os.rename(columns={str(df_os.columns[0]): 'ID'})
+    # Drop the first row (sub-header)
+    df_od = df_od.iloc[1:].reset_index(drop=True)
+    df_os = df_os.iloc[1:].reset_index(drop=True)
+    df_clin = pd.concat([df_od, df_os], ignore_index=True)
+    # Clean and encode
+    df_clin = df_clin.dropna(subset=['Age', 'Gender', 'Diagnosis'])
+    df_clin['Gender'] = df_clin['Gender'].apply(lambda g: 0 if str(g).lower() == 'm' else 1 if str(g).lower() == 'f' else 0).astype(int)
+    # Merge with train/test splits
+    def get_keys(df):
+        return set(zip(df['Patient ID'].astype(str), df['eyeID'].astype(str)))
+    train_keys = get_keys(df_train)
+    test_keys = get_keys(df_test)
+    clin_keys = list(zip(df_clin['ID'].astype(str), df_clin['eyeID'].astype(str)))
+    is_train = np.array([k in train_keys for k in clin_keys])
+    is_test = np.array([k in test_keys for k in clin_keys])
+    X = df_clin[['Age', 'Gender']].values
+    y = df_clin['Diagnosis'].astype(int).values
+    # Split
+    train_idx = np.where(is_train)[0]
+    test_idx = np.where(is_test)[0]
+    X_train, y_train = X[train_idx], y[train_idx]
+    X_test, y_test = X[test_idx], y[test_idx]
+    # Standardize
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+    # Train logistic regression
+    clf = LogisticRegression(multi_class='ovr', max_iter=1000)
+    clf.fit(X_train, y_train)
+    y_proba = clf.predict_proba(X_test)
+    # Compute ROC AUC per class
+    roc_aucs_clin = {}
+    for c in range(CONFIG['n_classes']):
+        y_true = (y_test == c).astype(int)
+        y_score = y_proba[:, c]
+        try:
+            auc = roc_auc_score(y_true, y_score)
+        except ValueError:
+            auc = float('nan')
+        roc_aucs_clin[f'class_{c}'] = auc
+    print("\nClinical Data Baseline ROC AUC:")
+    for c, auc in roc_aucs_clin.items():
+        print(f"ROC AUC for {c}: {auc:.4f}")
+    # Plot
+    class_labels = list(roc_aucs_clin.keys())
+    auc_values = [roc_aucs_clin[c] for c in class_labels]
+    plt.figure(figsize=(6,4))
+    bars = plt.bar(class_labels, auc_values, color='salmon')
+    plt.ylim(0, 1)
+    plt.ylabel('ROC AUC')
+    plt.title('ROC AUC per Class (Clinical Data)')
+    for bar, auc in zip(bars, auc_values):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{auc:.2f}', ha='center', va='bottom')
+    plt.tight_layout()
+    plt.savefig('roc_auc_per_class_clinical.png')
     plt.close()
 
 if __name__ == '__main__':
