@@ -44,7 +44,7 @@ CONFIG['img_size'] = tuple(CONFIG['img_size'])
 
 CONFIG['epochs'] = 100
 CONFIG['use_lora'] = False  # Ensure LoRA is not used during pretraining
-print("Batch size:f{CONFIG['batch_size']}")
+print("Batch size:", CONFIG['batch_size'])
 
 logging.basicConfig(
     level=logging.INFO,
@@ -244,8 +244,6 @@ def load_checkpoint(filename=CHECKPOINT_PATH):
 
 
 def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch=1, elapsed_time=0):
-    freeze_lora_params(enc)
-    freeze_lora_params(pred)
     optimizer = AdamW(
         [{'params': [p for n, p in list(enc.named_parameters()) + list(pred.named_parameters()) if p.requires_grad],
           'weight_decay': config['weight_decay']}],
@@ -266,9 +264,10 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
             imgs = imgs.to(DEVICE)
             m_enc = [m.to(DEVICE) for m in m_enc]
             m_pred = [m.to(DEVICE) for m in m_pred]
-            with torch.amp.autocast(device_type='cuda'):
+            with torch.amp.autocast('cuda'):
                 z = enc(imgs, m_enc)
                 out = pred(z, m_enc, m_pred)
+                print("out.requires_grad:", out.requires_grad)
                 with torch.no_grad():
                     h = F.layer_norm(enc(imgs), (z.size(-1),))
                     t = apply_masks(h, m_pred).repeat(len(m_enc), 1, 1)
@@ -314,7 +313,7 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                 imgs = imgs.to(DEVICE)
                 m_enc = [m.to(DEVICE) for m in m_enc]
                 m_pred = [m.to(DEVICE) for m in m_pred]
-                with torch.amp.autocast(device_type='cuda'):
+                with torch.amp.autocast('cuda'):
                     z = enc(imgs, m_enc)
                     out = pred(z, m_enc, m_pred)
                     h = F.layer_norm(enc(imgs), (z.size(-1),))
@@ -363,6 +362,9 @@ def main():
         else:
             CONFIG['pretrained_ckpt'] = None
             logger.info("No checkpoint found, starting from scratch.")
+        stage = None
+        epoch = 1
+        elapsed_time = 0
     else:
         stage = checkpoint.get('stage', None)
         epoch = checkpoint.get('epoch', 1)
