@@ -64,7 +64,7 @@ CONFIG = {
     'num_workers': 2,
     'lr': 3e-4,
     'weight_decay': 1e-2,
-    'epochs': 20,
+    'epochs': 40,
     'mask_scales': {'enc': (0.2, 0.6), 'pred': (0.2, 0.6)},
     'nenc': 2,
     'npred': 2,
@@ -251,22 +251,20 @@ def build_supervised_loaders(config, transform):
     paths = labeled[['od_path','os_path']].values
     feats = labeled[feature_cols].values.astype(np.float32)
     idx = np.arange(len(paths))
-    train_idx, temp_idx = train_test_split(idx, test_size=0.3, random_state=config['seed'])
-    val_idx, test_idx = train_test_split(temp_idx, test_size=0.5, random_state=config['seed'])
+    # Select 3000 for train, 1000 for val, rest for test
+    rng = np.random.default_rng(config['seed'])
+    rng.shuffle(idx)
+    n_train = min(3000, len(idx))
+    n_val = min(1000, max(0, len(idx) - n_train))
+    train_idx = idx[:n_train]
+    val_idx = idx[n_train:n_train+n_val]
+    test_idx = idx[n_train+n_val:]
     paths_train, paths_val, paths_test = paths[train_idx], paths[val_idx], paths[test_idx]
     feats_train, feats_val, feats_test = feats[train_idx], feats[val_idx], feats[test_idx]
-    # Reduce training samples by 40% (keep 60%)
-    if len(paths_train) > 0:
-        print(len(paths_train))
-        rng = np.random.default_rng(config['seed'])
-        n_sub = int(len(paths_train) * 0.3)
-        sub_idx = rng.choice(len(paths_train), n_sub, replace=False)
-        paths_train = paths_train[sub_idx]
-        feats_train = feats_train[sub_idx]
     scaler = StandardScaler()
     feats_train = scaler.fit_transform(feats_train)
-    feats_val   = scaler.transform(feats_val)
-    feats_test  = scaler.transform(feats_test)
+    feats_val   = scaler.transform(feats_val) if len(feats_val) > 0 else feats_val
+    feats_test  = scaler.transform(feats_test) if len(feats_test) > 0 else feats_test
     class SupDS(Dataset):
         def __init__(self, paths, feats):
             self.paths = paths
@@ -290,8 +288,8 @@ def build_supervised_loaders(config, transform):
             target = torch.tensor(self.feats[idx], dtype=torch.float32)
             return img, target
     sup_train = DataLoader(SupDS(paths_train, feats_train), batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'], pin_memory=True)
-    sup_val   = DataLoader(SupDS(paths_val,   feats_val),   batch_size=config['batch_size'], shuffle=False,num_workers=config['num_workers'], pin_memory=True)
-    sup_test  = DataLoader(SupDS(paths_test,  feats_test),  batch_size=config['batch_size'], shuffle=False,num_workers=config['num_workers'], pin_memory=True)
+    sup_val   = DataLoader(SupDS(paths_val,   feats_val),   batch_size=config['batch_size'], shuffle=False,num_workers=config['num_workers'], pin_memory=True) if len(paths_val) > 0 else None
+    sup_test  = DataLoader(SupDS(paths_test,  feats_test),  batch_size=config['batch_size'], shuffle=False,num_workers=config['num_workers'], pin_memory=True) if len(paths_test) > 0 else None
     sup_loaders = {'train': sup_train, 'val': sup_val, 'test': sup_test}
     n_features = len(feature_cols)
     return sup_loaders, n_features
@@ -313,7 +311,6 @@ def get_grad_scaler():
     else:
         return torch.cuda.amp.GradScaler()
 
-
 # Helper to plot and save loss curves with image size in the title
 def save_loss_plot(train_losses, val_losses, epochs, filename, config, stage):
     min_len = min(len(epochs), len(train_losses), len(val_losses))
@@ -329,6 +326,7 @@ def save_loss_plot(train_losses, val_losses, epochs, filename, config, stage):
     plt.tight_layout()
     plt.savefig(filename)
     plt.close()
+
 
 def save_checkpoint(state, train_losses, val_losses, epoch_list, config, stage, filename=CHECKPOINT_PATH):
     torch.save(state, filename)
@@ -443,21 +441,35 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, start_ep
         {'params': [p for n,p in enc.named_parameters() if p.requires_grad], 'weight_decay': config['weight_decay']},
         {'params': head.parameters(), 'weight_decay': 0.0}
     ], lr=config['lr'])
-    scheduler = CosineAnnealingLR(optimizer, T_max=config['epochs'])
+    # Learning rate warmup + cosine annealing
+    from torch.optim.lr_scheduler import SequentialLR, LinearLR
+    warmup_epochs = 5
+    main_epochs = config['epochs'] - warmup_epochs
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=main_epochs)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
     scaler = get_grad_scaler()
     sup_train_losses, sup_val_losses = [], []
+    sup_train_mae, sup_val_mae = [], []
+    sup_train_r2, sup_val_r2 = [], []
     start_time = time.time()
     accum_steps = 2
     for epoch in range(start_epoch, config['epochs']+1):
-        enc.eval(); head.train()
+        enc.train(); head.train()  # Changed from enc.eval() to enc.train()
         train_losses = []
+        train_mae = []
+        train_targets = []
+        train_preds = []
         optimizer.zero_grad()
         for i, (imgs, targets) in enumerate(tqdm(sup_loaders['train'], desc=f"Sup E{epoch} Train")):
             imgs = imgs.to(DEVICE); targets = targets.to(DEVICE)
-            with torch.amp.autocast(device_type='cuda'):
+            with torch.cuda.amp.autocast():
                 f = enc(imgs); preds = head(f); loss = F.mse_loss(preds, targets) / accum_steps
             scaler.scale(loss).backward()
             train_losses.append(loss.item() * accum_steps)
+            train_mae.append(F.l1_loss(preds, targets, reduction='mean').item())
+            train_targets.append(targets.detach().cpu().numpy())
+            train_preds.append(preds.detach().cpu().numpy())
             # Gradient accumulation
             if (i + 1) % accum_steps == 0:
                 scaler.step(optimizer)
@@ -489,19 +501,39 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, start_ep
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+        # Compute train metrics
+        train_targets_np = np.concatenate(train_targets, axis=0) if train_targets else np.array([])
+        train_preds_np = np.concatenate(train_preds, axis=0) if train_preds else np.array([])
+        train_mae_val = np.mean(train_mae) if train_mae else float('nan')
+        train_r2_val = r2_score(train_targets_np, train_preds_np) if train_targets_np.size > 0 else float('nan')
+        sup_train_mae.append(train_mae_val)
+        sup_train_r2.append(train_r2_val)
         # validation
         enc.eval(); head.eval()
         val_losses = []
-        with torch.no_grad():
-            for imgs, targets in sup_loaders['val']:
-                imgs = imgs.to(DEVICE); targets = targets.to(DEVICE)
-                with torch.amp.autocast(device_type='cuda'):
-                    f = enc(imgs); preds = head(f); loss = F.mse_loss(preds, targets)
-                val_losses.append(loss.item())
-        mt = np.mean(train_losses); mv = np.mean(val_losses)
+        val_mae = []
+        val_targets = []
+        val_preds = []
+        if sup_loaders['val'] is not None:
+            with torch.no_grad():
+                for imgs, targets in sup_loaders['val']:
+                    imgs = imgs.to(DEVICE); targets = targets.to(DEVICE)
+                    with torch.cuda.amp.autocast():
+                        f = enc(imgs); preds = head(f); loss = F.mse_loss(preds, targets)
+                    val_losses.append(loss.item())
+                    val_mae.append(F.l1_loss(preds, targets, reduction='mean').item())
+                    val_targets.append(targets.detach().cpu().numpy())
+                    val_preds.append(preds.detach().cpu().numpy())
+        val_targets_np = np.concatenate(val_targets, axis=0) if val_targets else np.array([])
+        val_preds_np = np.concatenate(val_preds, axis=0) if val_preds else np.array([])
+        val_mae_val = np.mean(val_mae) if val_mae else float('nan')
+        val_r2_val = r2_score(val_targets_np, val_preds_np) if val_targets_np.size > 0 else float('nan')
+        sup_val_mae.append(val_mae_val)
+        sup_val_r2.append(val_r2_val)
+        mt = np.mean(train_losses); mv = np.mean(val_losses) if val_losses else float('nan')
         sup_train_losses.append(mt)
         sup_val_losses.append(mv)
-        logger.info(f"Sup E{epoch} Train MSE={mt:.4f} Val MSE={mv:.4f}")
+        logger.info(f"Sup E{epoch} Train MSE={mt:.4f} Val MSE={mv:.4f} | Train MAE={train_mae_val:.4f} Val MAE={val_mae_val:.4f} | Train R2={train_r2_val:.4f} Val R2={val_r2_val:.4f}")
         scheduler.step()
     epochs = list(range(start_epoch, config['epochs']+1))
     save_loss_plot(sup_train_losses, sup_val_losses, epochs, 'supervised_finetune_loss.png', config, 'supervised finetune')
