@@ -44,6 +44,7 @@ CONFIG['img_size'] = tuple(CONFIG['img_size'])
 
 CONFIG['epochs'] = 100
 CONFIG['use_lora'] = False  # Ensure LoRA is not used during pretraining
+CONFIG['lr'] = 1e-4  # Lower learning rate for stability
 print("Batch size:", CONFIG['batch_size'])
 
 logging.basicConfig(
@@ -195,7 +196,7 @@ def build_masked_dataloaders(paths, transform, config):
 
 
 # ---------- Checkpoint Utilities ----------
-CHECKPOINT_PATH = 'checkpoint_pretrain.pth'
+CHECKPOINT_PATH = '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_pretrain.pth'
 MAX_TRAIN_SECONDS = 11.5 * 3600  # 11.5 hours in seconds
 
 
@@ -244,6 +245,13 @@ def load_checkpoint(filename=CHECKPOINT_PATH):
 
 
 def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch=1, elapsed_time=0):
+    # Debug: print which parameters do not require grad
+    for name, param in enc.named_parameters():
+        if not param.requires_grad:
+            print(f"Encoder param {name} does not require grad")
+    for name, param in pred.named_parameters():
+        if not param.requires_grad:
+            print(f"Predictor param {name} does not require grad")
     optimizer = AdamW(
         [{'params': [p for n, p in list(enc.named_parameters()) + list(pred.named_parameters()) if p.requires_grad],
           'weight_decay': config['weight_decay']}],
@@ -264,14 +272,19 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
             imgs = imgs.to(DEVICE)
             m_enc = [m.to(DEVICE) for m in m_enc]
             m_pred = [m.to(DEVICE) for m in m_pred]
+            if torch.isnan(imgs).any():
+                print(f"NaN detected in input images at batch {i}!")
             with torch.amp.autocast('cuda'):
                 z = enc(imgs, m_enc)
                 out = pred(z, m_enc, m_pred)
-                print("out.requires_grad:", out.requires_grad)
+                if torch.isnan(out).any():
+                    print(f"NaN detected in model output at batch {i}!")
                 with torch.no_grad():
                     h = F.layer_norm(enc(imgs), (z.size(-1),))
                     t = apply_masks(h, m_pred).repeat(len(m_enc), 1, 1)
                 loss = F.mse_loss(out, t) / accum_steps
+                if torch.isnan(loss):
+                    print(f"NaN detected in loss at batch {i}!")
             scaler.scale(loss).backward()
             train_losses.append(loss.item() * accum_steps)  # store unscaled loss
             # Gradient accumulation
@@ -309,16 +322,22 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
         enc.eval();
         pred.eval()
         with torch.no_grad():
-            for imgs, m_enc, m_pred in loader_val:
+            for i, (imgs, m_enc, m_pred) in enumerate(loader_val):
                 imgs = imgs.to(DEVICE)
                 m_enc = [m.to(DEVICE) for m in m_enc]
                 m_pred = [m.to(DEVICE) for m in m_pred]
+                if torch.isnan(imgs).any():
+                    print(f"NaN detected in validation input images at batch {i}!")
                 with torch.amp.autocast('cuda'):
                     z = enc(imgs, m_enc)
                     out = pred(z, m_enc, m_pred)
+                    if torch.isnan(out).any():
+                        print(f"NaN detected in validation model output at batch {i}!")
                     h = F.layer_norm(enc(imgs), (z.size(-1),))
                     t = apply_masks(h, m_pred).repeat(len(m_enc), 1, 1)
                     l = F.mse_loss(out, t)
+                    if torch.isnan(l):
+                        print(f"NaN detected in validation loss at batch {i}!")
                 val_losses.append(l.item())
         mt = np.mean(train_losses);
         mv = np.mean(val_losses)
@@ -383,6 +402,8 @@ def main():
         if checkpoint is not None and stage == 'pretrain':
             enc.load_state_dict(checkpoint['enc'])
             pred.load_state_dict(checkpoint['pred'])
+            elapsed_time = 0
+
         run_masked_pretrain(enc, pred, loader_train, loader_val, CONFIG, start_epoch=epoch, elapsed_time=elapsed_time)
 
 

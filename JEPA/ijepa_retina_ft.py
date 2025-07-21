@@ -62,9 +62,9 @@ CONFIG = {
     'pred_depth': 6,
     'batch_size': 2,
     'num_workers': 2,
-    'lr': 3e-4,
+    'lr': 2e-4,
     'weight_decay': 1e-2,
-    'epochs': 40,
+    'epochs': 50,
     'mask_scales': {'enc': (0.2, 0.6), 'pred': (0.2, 0.6)},
     'nenc': 2,
     'npred': 2,
@@ -173,7 +173,8 @@ def load_pretrained_encoder(enc, config):
 
 
 def freeze_lora_params(model):
-    for p in model.parameters(): p.requires_grad = False
+    for p in model.parameters():
+        p.requires_grad = False
     for n, p in model.named_parameters():
         if 'lora_' in n:
             p.requires_grad = True
@@ -251,20 +252,17 @@ def build_supervised_loaders(config, transform):
     paths = labeled[['od_path','os_path']].values
     feats = labeled[feature_cols].values.astype(np.float32)
     idx = np.arange(len(paths))
-    # Select 3000 for train, 1000 for val, rest for test
+    # 80/20 split
     rng = np.random.default_rng(config['seed'])
     rng.shuffle(idx)
-    n_train = min(3000, len(idx))
-    n_val = min(1000, max(0, len(idx) - n_train))
+    n_train = int(0.8 * len(idx))
     train_idx = idx[:n_train]
-    val_idx = idx[n_train:n_train+n_val]
-    test_idx = idx[n_train+n_val:]
-    paths_train, paths_val, paths_test = paths[train_idx], paths[val_idx], paths[test_idx]
-    feats_train, feats_val, feats_test = feats[train_idx], feats[val_idx], feats[test_idx]
+    val_idx = idx[n_train:]
+    paths_train, paths_val = paths[train_idx], paths[val_idx]
+    feats_train, feats_val = feats[train_idx], feats[val_idx]
     scaler = StandardScaler()
     feats_train = scaler.fit_transform(feats_train)
     feats_val   = scaler.transform(feats_val) if len(feats_val) > 0 else feats_val
-    feats_test  = scaler.transform(feats_test) if len(feats_test) > 0 else feats_test
     class SupDS(Dataset):
         def __init__(self, paths, feats):
             self.paths = paths
@@ -289,14 +287,13 @@ def build_supervised_loaders(config, transform):
             return img, target
     sup_train = DataLoader(SupDS(paths_train, feats_train), batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'], pin_memory=True)
     sup_val   = DataLoader(SupDS(paths_val,   feats_val),   batch_size=config['batch_size'], shuffle=False,num_workers=config['num_workers'], pin_memory=True) if len(paths_val) > 0 else None
-    sup_test  = DataLoader(SupDS(paths_test,  feats_test),  batch_size=config['batch_size'], shuffle=False,num_workers=config['num_workers'], pin_memory=True) if len(paths_test) > 0 else None
-    sup_loaders = {'train': sup_train, 'val': sup_val, 'test': sup_test}
+    sup_loaders = {'train': sup_train, 'val': sup_val}
     n_features = len(feature_cols)
-    return sup_loaders, n_features
+    return sup_loaders, n_features, feature_cols
 
 
 # ---------- Checkpoint Utilities ----------
-CHECKPOINT_PATH = 'checkpoint.pth'
+CHECKPOINT_PATH = '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_retina_finetune.pth'
 MAX_TRAIN_SECONDS = 11.5 * 3600  # 11.5 hours in seconds
 
 # Robust GradScaler instantiation for PyTorch 1.x and 2.x
@@ -329,6 +326,9 @@ def save_loss_plot(train_losses, val_losses, epochs, filename, config, stage):
 
 
 def save_checkpoint(state, train_losses, val_losses, epoch_list, config, stage, filename=CHECKPOINT_PATH):
+    # Save checkpoint with next epoch to run
+    state = dict(state)
+    state['epoch'] = state.get('epoch', 1) + 1
     torch.save(state, filename)
     logger.info(f"Checkpoint saved to {filename}")
     # Save loss plot at checkpoint
@@ -434,7 +434,7 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
     logger.info("Masked pretraining complete.")
 
 
-def run_supervised_finetune(enc, head, sup_loaders, config, n_features, start_epoch=1, elapsed_time=0):
+def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_cols, start_epoch=1, elapsed_time=0):
     freeze_lora_params(enc)
     head.to(DEVICE)
     optimizer = AdamW([
@@ -450,14 +450,12 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, start_ep
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
     scaler = get_grad_scaler()
     sup_train_losses, sup_val_losses = [], []
-    sup_train_mae, sup_val_mae = [], []
-    sup_train_r2, sup_val_r2 = [], []
-    start_time = time.time()
+    sup_train_r2s, sup_val_r2s = [], []  # List of lists: r2 per feature per epoch
+    start_time = time.time()  # Always reset when entering the function
     accum_steps = 2
     for epoch in range(start_epoch, config['epochs']+1):
         enc.train(); head.train()  # Changed from enc.eval() to enc.train()
         train_losses = []
-        train_mae = []
         train_targets = []
         train_preds = []
         optimizer.zero_grad()
@@ -467,7 +465,6 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, start_ep
                 f = enc(imgs); preds = head(f); loss = F.mse_loss(preds, targets) / accum_steps
             scaler.scale(loss).backward()
             train_losses.append(loss.item() * accum_steps)
-            train_mae.append(F.l1_loss(preds, targets, reduction='mean').item())
             train_targets.append(targets.detach().cpu().numpy())
             train_preds.append(preds.detach().cpu().numpy())
             # Gradient accumulation
@@ -479,7 +476,7 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, start_ep
             total_elapsed = elapsed_time + (time.time() - start_time)
             if total_elapsed >= MAX_TRAIN_SECONDS:
                 epoch_list = list(range(start_epoch, epoch+1))
-                save_checkpoint({
+                torch.save({
                     'enc': enc.state_dict(),
                     'head': head.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -487,14 +484,8 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, start_ep
                     'scaler': scaler.state_dict(),
                     'epoch': epoch,
                     'elapsed_time': total_elapsed,
-                    'stage': 'finetune',
-                },
-                sup_train_losses + [np.mean(train_losses)],
-                sup_val_losses,
-                epoch_list,
-                config,
-                'finetune')
-                logger.info("Reached max training time. Exiting.")
+                }, CHECKPOINT_PATH)
+                logger.info(f"Reached max training time. Checkpoint saved to {CHECKPOINT_PATH}. Exiting.")
                 sys.exit(0)
         # Final step if leftover gradients
         if len(sup_loaders['train']) % accum_steps != 0:
@@ -504,14 +495,14 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, start_ep
         # Compute train metrics
         train_targets_np = np.concatenate(train_targets, axis=0) if train_targets else np.array([])
         train_preds_np = np.concatenate(train_preds, axis=0) if train_preds else np.array([])
-        train_mae_val = np.mean(train_mae) if train_mae else float('nan')
-        train_r2_val = r2_score(train_targets_np, train_preds_np) if train_targets_np.size > 0 else float('nan')
-        sup_train_mae.append(train_mae_val)
-        sup_train_r2.append(train_r2_val)
+        # Per-feature metrics
+        train_mse = np.mean((train_preds_np - train_targets_np) ** 2, axis=0) if train_targets_np.size > 0 else np.array([])
+        train_r2 = [r2_score(train_targets_np[:, i], train_preds_np[:, i]) if train_targets_np.shape[0] > 0 else float('nan') for i in range(n_features)]
+        sup_train_losses.append(np.mean(train_mse))
+        sup_train_r2s.append(train_r2)
         # validation
         enc.eval(); head.eval()
         val_losses = []
-        val_mae = []
         val_targets = []
         val_preds = []
         if sup_loaders['val'] is not None:
@@ -521,25 +512,50 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, start_ep
                     with torch.cuda.amp.autocast():
                         f = enc(imgs); preds = head(f); loss = F.mse_loss(preds, targets)
                     val_losses.append(loss.item())
-                    val_mae.append(F.l1_loss(preds, targets, reduction='mean').item())
                     val_targets.append(targets.detach().cpu().numpy())
                     val_preds.append(preds.detach().cpu().numpy())
         val_targets_np = np.concatenate(val_targets, axis=0) if val_targets else np.array([])
         val_preds_np = np.concatenate(val_preds, axis=0) if val_preds else np.array([])
-        val_mae_val = np.mean(val_mae) if val_mae else float('nan')
-        val_r2_val = r2_score(val_targets_np, val_preds_np) if val_targets_np.size > 0 else float('nan')
-        sup_val_mae.append(val_mae_val)
-        sup_val_r2.append(val_r2_val)
-        mt = np.mean(train_losses); mv = np.mean(val_losses) if val_losses else float('nan')
-        sup_train_losses.append(mt)
-        sup_val_losses.append(mv)
-        logger.info(f"Sup E{epoch} Train MSE={mt:.4f} Val MSE={mv:.4f} | Train MAE={train_mae_val:.4f} Val MAE={val_mae_val:.4f} | Train R2={train_r2_val:.4f} Val R2={val_r2_val:.4f}")
+        val_mse = np.mean((val_preds_np - val_targets_np) ** 2, axis=0) if val_targets_np.size > 0 else np.array([])
+        val_r2 = [r2_score(val_targets_np[:, i], val_preds_np[:, i]) if val_targets_np.shape[0] > 0 else float('nan') for i in range(n_features)]
+        sup_val_losses.append(np.mean(val_mse))
+        sup_val_r2s.append(val_r2)
+        # Logging
+        logger.info(f"Sup E{epoch} Train MSE={np.mean(train_mse):.4f} Val MSE={np.mean(val_mse):.4f}")
+        for i, feat in enumerate(feature_cols):
+            logger.info(f"  Feature {feat}: Train MSE={train_mse[i]:.4f} Val MSE={val_mse[i]:.4f} Train R2={train_r2[i]:.4f} Val R2={val_r2[i]:.4f}")
         scheduler.step()
     epochs = list(range(start_epoch, config['epochs']+1))
-    save_loss_plot(sup_train_losses, sup_val_losses, epochs, 'supervised_finetune_loss.png', config, 'supervised finetune')
-    logger.info("Saved supervised fine-tuning loss curve to supervised_finetune_loss.png")
+    # Plot R2 per feature over epochs
+    sup_train_r2s = np.array(sup_train_r2s)
+    sup_val_r2s = np.array(sup_val_r2s)
+    for i, feat in enumerate(feature_cols):
+        plt.figure()
+        plt.plot(epochs, sup_train_r2s[:, i], label='Train R2')
+        plt.plot(epochs, sup_val_r2s[:, i], label='Val R2')
+        plt.xlabel('Epoch')
+        plt.ylabel('R2')
+        plt.title(f'R2 for {feat}')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f'r2_{feat}.png')
+        plt.close()
+    # Plot MSE per epoch
+    plt.figure()
+    plt.plot(epochs, sup_train_losses, label='Train MSE')
+    plt.plot(epochs, sup_val_losses, label='Val MSE')
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE')
+    plt.title('MSE per Epoch')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('mse_per_epoch.png')
+    plt.close()
+    logger.info("Saved R2 and MSE plots.")
     logger.info("Supervised fine-tuning complete.")
 
+
+IMAGENET_CKPT = os.path.expanduser('~/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN22K-vit.h.14-900e.pth.tar')
 
 def main():
     # Load manifest and compute transforms (used by both stages)
@@ -563,12 +579,43 @@ def main():
     if checkpoint is not None:
         stage = checkpoint.get('stage', None)
         epoch = checkpoint.get('epoch', 1)
-        elapsed_time = 0  # Reset elapsed time on resume
-        logger.info(f"Resuming from checkpoint at epoch {epoch}, elapsed_time reset to 0, stage {stage}")
+        elapsed_time = 0
+        logger.info(f"Resuming from checkpoint at epoch {epoch}, elapsed_time {elapsed_time:.2f}s, stage {stage}")
+        if 'enc' in checkpoint:
+            enc, _ = build_encoder_and_predictor(CONFIG)
+            enc.load_state_dict(checkpoint['enc'])
+            logger.info("Encoder weights loaded from checkpoint.")
+            freeze_lora_params(enc)
+            logger.info("Encoder LoRA parameters unfrozen.")
+        else:
+            logger.info("No encoder checkpoint found. Building new encoder.")
+            enc, _ = build_encoder_and_predictor(CONFIG)
+            # Check for ImageNet checkpoint
+            if os.path.isfile(IMAGENET_CKPT):
+                CONFIG['pretrained_ckpt'] = IMAGENET_CKPT
+                logger.info(f"Using ImageNet checkpoint: {IMAGENET_CKPT}")
+            else:
+                CONFIG['pretrained_ckpt'] = None
+                logger.info("No ImageNet checkpoint found. Starting from scratch.")
+            load_pretrained_encoder(enc, CONFIG)
+            freeze_lora_params(enc)
+            logger.info("Encoder LoRA parameters frozen.")
     else:
         stage = None
         epoch = 1
         elapsed_time = 0
+        logger.info("No checkpoint found. Building new encoder.")
+        enc, _ = build_encoder_and_predictor(CONFIG)
+        # Check for ImageNet checkpoint
+        if os.path.isfile(IMAGENET_CKPT):
+            CONFIG['pretrained_ckpt'] = IMAGENET_CKPT
+            logger.info(f"Using ImageNet checkpoint: {IMAGENET_CKPT}")
+        else:
+            CONFIG['pretrained_ckpt'] = None
+            logger.info("No ImageNet checkpoint found. Starting from scratch.")
+        load_pretrained_encoder(enc, CONFIG)
+        freeze_lora_params(enc)
+        logger.info("Encoder LoRA parameters frozen.")
 
     # Masked pretrain stage
     if RUN_MASKED_PRETRAIN and (stage is None or stage == 'pretrain'):
@@ -586,17 +633,13 @@ def main():
 
     # Supervised fine-tune stage
     if RUN_SUPERVISED_FINETUNE and (stage is None or stage == 'finetune'):
-        try:
-            enc
-        except NameError:
-            enc, _ = build_encoder_and_predictor(CONFIG)
-            load_pretrained_encoder(enc, CONFIG)
-        sup_loaders, n_features = build_supervised_loaders(CONFIG, trsf)
+        sup_loaders, n_features, feature_cols = build_supervised_loaders(CONFIG, trsf)
         head = RegressionHead(CONFIG['embed_dim'], n_features)
         if checkpoint is not None and stage == 'finetune':
             enc.load_state_dict(checkpoint['enc'])
             head.load_state_dict(checkpoint['head'])
-        run_supervised_finetune(enc, head, sup_loaders, CONFIG, n_features, start_epoch=epoch, elapsed_time=elapsed_time)
+        total_start_time = time.time()  # Reset time counter on resume or new run
+        run_supervised_finetune(enc, head, sup_loaders, CONFIG, n_features, feature_cols, start_epoch=epoch, elapsed_time=elapsed_time)
 
 if __name__ == '__main__':
     main()
