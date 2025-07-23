@@ -46,7 +46,7 @@ CONFIG = {
     'lr': 2e-4,
     'weight_decay': 1e-2,
     'epochs': 30,
-    'pretrained_ckpt': os.path.expanduser('~/checkpoint_pretrain.pth'),
+    'pretrained_ckpt': os.path.expanduser('/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_pretrain.pth'),
     'n_classes': 3,
     'external_root': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/external_datasets/PAPILA/PapilaDB-PAPILA-9c67b80983805f0f886b068af800ef2b507e7dc0',
 }
@@ -111,7 +111,8 @@ def build_encoder(config):
 
 def load_pretrained_encoder(enc, config):
     ckpt = config.get('pretrained_ckpt', None)
-    if ckpt and os.path.isfile(ckpt):
+    CHECKPOINT_PATH = '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_papila_finetune.pth'
+    if ckpt and os.path.isfile(ckpt) and not os.path.isfile(CHECKPOINT_PATH):
         state = torch.load(ckpt, map_location=DEVICE)
         enc_state = state.get('enc', state)
         filtered = {k: v for k, v in enc_state.items()
@@ -393,12 +394,53 @@ def main():
         df_train = pd.read_excel(train_xlsx)
         df_test = pd.read_excel(test_xlsx)
         trsf = build_transforms()
-        train_ds = PapilaDataset(df_train, img_dir, trsf)
-        test_ds = PapilaDataset(df_test, img_dir, trsf)
+        # For KNN, we need to load paired images as 6 channels (OD+OS)
+        class PapilaPairedDataset(Dataset):
+            def __init__(self, df, img_dir, transform):
+                self.df = df.reset_index(drop=True)
+                self.img_dir = img_dir
+                self.transform = transform
+            def __len__(self):
+                return len(self.df)
+            def __getitem__(self, idx):
+                row = self.df.iloc[idx]
+                pid = row['Patient ID']
+                eye = row['eyeID']
+                label = int(row['Diagnosis'])
+                # Compose paired filenames: RET{pid}OD.jpg and RET{pid}OS.jpg
+                img_name_od = f"RET{pid}OD.jpg"
+                img_name_os = f"RET{pid}OS.jpg"
+                img_path_od = os.path.join(self.img_dir, img_name_od)
+                img_path_os = os.path.join(self.img_dir, img_name_os)
+                try:
+                    img_od = Image.open(img_path_od).convert('RGB')
+                except:
+                    img_od = Image.new('RGB', CONFIG['img_size'], 'black')
+                try:
+                    img_os = Image.open(img_path_os).convert('RGB')
+                except:
+                    img_os = Image.new('RGB', CONFIG['img_size'], 'black')
+                img_od = self.transform(img_od)
+                img_os = self.transform(img_os)
+                img = torch.cat([img_od, img_os], dim=0)  # [6, H, W]
+                return img, label
+        train_ds = PapilaPairedDataset(df_train, img_dir, trsf)
+        test_ds = PapilaPairedDataset(df_test, img_dir, trsf)
         train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=CONFIG['num_workers'], pin_memory=True)
         test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=CONFIG['num_workers'], pin_memory=True)
-        # Load encoder from retina_ft checkpoint
-        enc = build_encoder(CONFIG)
+        # Build encoder with in_chans=6 to match checkpoint
+        enc = VisionTransformer(
+            img_size=CONFIG['img_size'],
+            patch_size=CONFIG['patch_size'],
+            in_chans=6,
+            embed_dim=CONFIG['embed_dim'],
+            depth=CONFIG['depth'],
+            num_heads=CONFIG['num_heads'],
+            use_lora=CONFIG['use_lora'],
+            lora_r=CONFIG['lora_r'],
+            lora_alpha=CONFIG['lora_alpha'],
+            lora_dropout=CONFIG['lora_dropout']
+        )
         ckpt = torch.load(KNN_CKPT_PATH, map_location=DEVICE)
         enc.load_state_dict(ckpt['enc'])
         enc.to(DEVICE)

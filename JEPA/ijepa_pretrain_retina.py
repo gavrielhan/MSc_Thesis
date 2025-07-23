@@ -43,8 +43,10 @@ with open('config.json', 'r') as f:
 CONFIG['img_size'] = tuple(CONFIG['img_size'])
 
 CONFIG['epochs'] = 100
+CONFIG['num_workers'] = 0
+CONFIG['batch_size'] = 1
 CONFIG['use_lora'] = False  # Ensure LoRA is not used during pretraining
-CONFIG['lr'] = 1e-4  # Lower learning rate for stability
+CONFIG['lr'] = 1e-5  # Lower learning rate for stability
 print("Batch size:", CONFIG['batch_size'])
 
 logging.basicConfig(
@@ -196,7 +198,7 @@ def build_masked_dataloaders(paths, transform, config):
 
 
 # ---------- Checkpoint Utilities ----------
-CHECKPOINT_PATH = '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_pretrain.pth'
+CHECKPOINT_PATH = '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_pretrain_newrun.pth'
 MAX_TRAIN_SECONDS = 11.5 * 3600  # 11.5 hours in seconds
 
 
@@ -272,6 +274,13 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
             imgs = imgs.to(DEVICE)
             m_enc = [m.to(DEVICE) for m in m_enc]
             m_pred = [m.to(DEVICE) for m in m_pred]
+            # Print image stats for the first batch of each epoch
+            if i == 0:
+                print(
+                    f"Batch {i} image stats: min={imgs.min().item():.4f}, max={imgs.max().item():.4f}, mean={imgs.mean().item():.4f}")
+            # 4. Check for Infs in input images
+            if torch.isinf(imgs).any():
+                print(f"Inf detected in input images at batch {i}!")
             if torch.isnan(imgs).any():
                 print(f"NaN detected in input images at batch {i}!")
             with torch.amp.autocast('cuda'):
@@ -286,27 +295,38 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                 if torch.isnan(loss):
                     print(f"NaN detected in loss at batch {i}!")
             scaler.scale(loss).backward()
+            # 5. Check for NaNs in gradients
+            for name, param in enc.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"NaN detected in encoder gradient: {name}")
+            for name, param in pred.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"NaN detected in predictor gradient: {name}")
             train_losses.append(loss.item() * accum_steps)  # store unscaled loss
             # Gradient accumulation
             if (i + 1) % accum_steps == 0:
+                # Add gradient clipping
+                torch.nn.utils.clip_grad_norm_(enc.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(pred.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
             # Check for time limit
             total_elapsed = elapsed_time + (time.time() - start_time)
             if total_elapsed >= MAX_TRAIN_SECONDS:
-                epoch_list = list(range(start_epoch, epoch + 1))
+                # Save only up to the last completed epoch
+                epoch_list = list(range(start_epoch, epoch))  # up to epoch-1
                 save_checkpoint({
                     'enc': enc.state_dict(),
                     'pred': pred.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                     'scaler': scaler.state_dict(),
-                    'epoch': epoch,
+                    'epoch': epoch - 1,  # last completed epoch
                     'elapsed_time': total_elapsed,
                     'stage': 'pretrain',
                 },
-                    masked_train_losses + [np.mean(train_losses)],
+                    masked_train_losses,  # up to last completed epoch
                     masked_val_losses,
                     epoch_list,
                     config,
@@ -326,6 +346,9 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                 imgs = imgs.to(DEVICE)
                 m_enc = [m.to(DEVICE) for m in m_enc]
                 m_pred = [m.to(DEVICE) for m in m_pred]
+                # 4. Check for Infs in input images during validation
+                if torch.isinf(imgs).any():
+                    print(f"Inf detected in validation input images at batch {i}!")
                 if torch.isnan(imgs).any():
                     print(f"NaN detected in validation input images at batch {i}!")
                 with torch.amp.autocast('cuda'):
@@ -343,6 +366,27 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
         mv = np.mean(val_losses)
         masked_train_losses.append(mt)
         masked_val_losses.append(mv)
+        # Compute and print relative MSE (MSE / variance of target)
+        # Use a batch of targets from validation set for variance estimate
+        try:
+            all_targets = []
+            for i, (imgs, m_enc, m_pred) in enumerate(loader_val):
+                with torch.no_grad():
+                    imgs = imgs.to(DEVICE)
+                    m_enc = [m.to(DEVICE) for m in m_enc]
+                    m_pred = [m.to(DEVICE) for m in m_pred]
+                    h = F.layer_norm(enc(imgs), (enc(imgs).size(-1),))
+                    t = apply_masks(h, m_pred).repeat(len(m_enc), 1, 1)
+                    all_targets.append(t.cpu().numpy().ravel())  # flatten to 1D
+                if i > 10:  # limit to 10 batches for speed
+                    break
+            all_targets = np.concatenate(all_targets, axis=0)  # now 1D
+            target_var = np.var(all_targets)
+            rel_train_mse = mt / target_var if target_var > 0 else float('nan')
+            rel_val_mse = mv / target_var if target_var > 0 else float('nan')
+            logger.info(f"Pretrain E{epoch} Relative Train MSE={rel_train_mse:.4f} Relative Val MSE={rel_val_mse:.4f}")
+        except Exception as e:
+            logger.warning(f"Could not compute relative MSE: {e}")
         logger.info(f"Pretrain E{epoch} Train MSE={mt:.4f} Val MSE={mv:.4f}")
         scheduler.step()
         if mv < best_val:
@@ -370,26 +414,52 @@ def main():
         logger.info(f"Computed and saved image stats to {stats_file}")
     trsf = build_transforms(mean, std)
 
+    print("Model config:", CONFIG)
+    # Always define stage, epoch, elapsed_time before use
+    stage = None
+    epoch = 1
+    elapsed_time = 0
     checkpoint = load_checkpoint()
-    # If no checkpoint, check for ImageNet pretrain
-    if checkpoint is None:
-        imagenet_ckpt = os.path.expanduser(
-            '~/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN22K-vit.h.14-900e.pth.tar')
-        if os.path.isfile(imagenet_ckpt):
-            CONFIG['pretrained_ckpt'] = imagenet_ckpt
-            logger.info(f"No training checkpoint found, using ImageNet pretrain: {imagenet_ckpt}")
-        else:
-            CONFIG['pretrained_ckpt'] = None
-            logger.info("No checkpoint found, starting from scratch.")
-        stage = None
-        epoch = 1
-        elapsed_time = 0
-    else:
+    # Always prefer resuming from retina pretrain checkpoint if available
+    if checkpoint is not None:
+        logger.info("Found retina pretrain checkpoint, resuming training from it.")
         stage = checkpoint.get('stage', None)
         epoch = checkpoint.get('epoch', 1)
         elapsed_time = 0  # Reset elapsed time on resume
-        logger.info(f"Resuming from checkpoint at epoch {epoch}, elapsed_time reset to 0, stage {stage}")
-
+        enc, pred = build_encoder_and_predictor(CONFIG)
+        enc.load_state_dict(checkpoint['enc'])
+        pred.load_state_dict(checkpoint['pred'])
+        freeze_lora_params(enc)
+        logger.info("Encoder LoRA parameters unfrozen.")
+    else:
+        # No retina pretrain checkpoint, start from ImageNet checkpoint
+        imagenet_ckpt = os.path.expanduser(
+            '~/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN22K-vit.h.14-900e.pth.tar')
+        if os.path.isfile(imagenet_ckpt):
+            logger.info(f"No retina pretrain checkpoint found, initializing from ImageNet checkpoint: {imagenet_ckpt}")
+        else:
+            logger.info("No retina pretrain checkpoint or ImageNet checkpoint found, starting from scratch.")
+        stage = None
+        epoch = 1
+        elapsed_time = 0
+        enc, pred = build_encoder_and_predictor(CONFIG)
+        # Only load ImageNet checkpoint if it exists
+        if os.path.isfile(imagenet_ckpt):
+            # Use the same logic as load_pretrained_encoder but with explicit path
+            state = torch.load(imagenet_ckpt, map_location=DEVICE)
+            filtered = {k: v for k, v in state.items()
+                        if k.startswith('patch_embed.') or k.startswith('blocks.')
+                        or k in ('cls_token', 'pos_embed')}
+            w = filtered.get('patch_embed.proj.weight')
+            if w is not None and w.shape[1] == 3 and enc.patch_embed.proj.weight.shape[1] == 6:
+                filtered['patch_embed.proj.weight'] = w.repeat(1, 2, 1, 1)[:, :6]
+            enc.load_state_dict(filtered, strict=False)
+            logger.info("Pretrained ImageNet weights loaded into encoder")
+        freeze_lora_params(enc)
+        logger.info("Encoder initialized from ImageNet checkpoint (if provided).")
+    # Print data pipeline summary
+    print(
+        f"Data pipeline: batch_size={CONFIG['batch_size']}, img_size={CONFIG['img_size']}, normalization=mean/std {CONFIG.get('mean', '[default]')}/{CONFIG.get('std', '[default]')}")
     # Always run masked pretraining in this script
     if stage is None or stage == 'pretrain':
         tr_paths, val_paths = train_test_split(
@@ -408,4 +478,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main() 
