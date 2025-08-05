@@ -23,8 +23,9 @@ import logging
 from typing import List, Tuple, Dict, Any
 import math
 
-# Add the current directory to Python path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Add the ijepa directory to Python path
+ijepa_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ijepa')
+sys.path.append(ijepa_path)
 
 # Import the Vision Transformer model
 from ijepa.src.models.vision_transformer import VisionTransformer
@@ -54,7 +55,7 @@ CONFIG = {
     'epochs': 30,
     'batch_size': 1,  # Process one patch at a time
     'num_workers': 0,
-    'external_root': '/home/gavrielh/PycharmProjects/MSc_Thesis/external_datasets',
+    'external_root': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/external_datasets',
     'checkpoint_path': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/checkpoint_retina_finetune.pth',
     'output_dir': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/outputs/retina_patch_messidor'
 }
@@ -159,10 +160,46 @@ class MessidorPatchDataset(Dataset):
         self.expanded_data = []
         for idx, row in self.df.iterrows():
             img_name = row['image_id']
+
+            # Debug: Print first few image names to verify
+            if idx < 5:
+                print(f"Processing CSV row {idx}: image_id = '{img_name}'")
+
+            # Handle NaN values in labels
+            if pd.isna(row['adjudicated_dr_grade']):
+                print(f"Skipping row {idx} with NaN label for image {img_name}")
+                continue
+
             label = int(row['adjudicated_dr_grade'])
 
             # Get patches for this image
             img_path = os.path.join(self.img_dir, img_name)
+
+            # Debug: Print first few paths to verify
+            if idx < 5:
+                print(f"  Looking for: {img_path}")
+
+            # Check if image file exists (case-insensitive)
+            if not os.path.exists(img_path):
+                # Try with different case extensions
+                base_name = os.path.splitext(img_name)[0]
+                possible_extensions = ['.jpg', '.JPG', '.jpeg', '.JPEG', '.png', '.PNG']
+
+                found_file = None
+                for ext in possible_extensions:
+                    alt_path = os.path.join(self.img_dir, base_name + ext)
+                    if os.path.exists(alt_path):
+                        found_file = alt_path
+                        if idx < 5:
+                            print(f"  Found with different case: {alt_path}")
+                        break
+
+                if found_file:
+                    img_path = found_file
+                else:
+                    print(f"Image file not found: {img_path}")
+                    continue
+
             try:
                 img = Image.open(img_path).convert('RGB')
                 patches = self.patch_extractor.extract_patches(img)
@@ -358,6 +395,38 @@ def main():
     df = pd.read_csv(data_csv)
     print(f"Loaded {len(df)} Messidor samples")
 
+    # Debug: Check CSV structure
+    print(f"CSV columns: {list(df.columns)}")
+    print(f"First few rows:")
+    print(df.head())
+
+    # Check for NaN values
+    nan_counts = df.isna().sum()
+    print(f"NaN counts per column:")
+    print(nan_counts)
+
+    # Check image directory
+    print(f"Image directory: {img_dir}")
+    if os.path.exists(img_dir):
+        image_files = os.listdir(img_dir)
+        print(f"Found {len(image_files)} files in image directory")
+        print(f"First 5 image files: {image_files[:5]}")
+
+        # Check if CSV image names match actual files
+        csv_image_names = df['image_id'].tolist()
+        print(f"First 5 CSV image names: {csv_image_names[:5]}")
+
+        # Check how many CSV images actually exist
+        existing_count = 0
+        for img_name in csv_image_names:
+            if os.path.exists(os.path.join(img_dir, img_name)):
+                existing_count += 1
+
+        print(f"CSV images that exist: {existing_count}/{len(csv_image_names)}")
+
+    else:
+        print(f"Image directory does not exist: {img_dir}")
+
     # Create train/test split (80/20)
     np.random.seed(42)
     indices = np.random.permutation(len(df))
@@ -420,7 +489,7 @@ def main():
 
     # Training loop
     best_auc = 0.0
-    train_losses = []
+    epoch_logs = []
 
     for epoch in range(CONFIG['epochs']):
         model.train()
@@ -446,21 +515,38 @@ def main():
             epoch_loss += weighted_loss.item()
             num_batches += 1
 
-            if batch_idx % 100 == 0:
-                print(f"Epoch {epoch + 1}/{CONFIG['epochs']}, Batch {batch_idx}/{len(train_loader)}, "
-                      f"Loss: {weighted_loss.item():.4f}")
-
         avg_loss = epoch_loss / num_batches
-        train_losses.append(avg_loss)
 
         # Evaluate on test set
         test_metrics = evaluate_model(model, test_loader, DEVICE)
+
+        # Log epoch performance
+        epoch_log = {
+            'epoch': epoch + 1,
+            'train_loss': avg_loss,
+            'test_auc': test_metrics['avg_auc'],
+            'test_pr_auc': test_metrics['avg_pr_auc'],
+            'test_f1': test_metrics['avg_f1'],
+            'test_auc_class_0': test_metrics['aucs'][0],
+            'test_auc_class_1': test_metrics['aucs'][1],
+            'test_pr_auc_class_0': test_metrics['pr_aucs'][0],
+            'test_pr_auc_class_1': test_metrics['pr_aucs'][1],
+            'test_f1_class_0': test_metrics['f1s'][0],
+            'test_f1_class_1': test_metrics['f1s'][1]
+        }
+        epoch_logs.append(epoch_log)
 
         print(f"Epoch {epoch + 1}/{CONFIG['epochs']}:")
         print(f"  Train Loss: {avg_loss:.4f}")
         print(f"  Test AUC: {test_metrics['avg_auc']:.4f}")
         print(f"  Test PR AUC: {test_metrics['avg_pr_auc']:.4f}")
         print(f"  Test F1: {test_metrics['avg_f1']:.4f}")
+        print(f"  Test AUC (Class 0): {test_metrics['aucs'][0]:.4f}")
+        print(f"  Test AUC (Class 1): {test_metrics['aucs'][1]:.4f}")
+        print(f"  Test PR AUC (Class 0): {test_metrics['pr_aucs'][0]:.4f}")
+        print(f"  Test PR AUC (Class 1): {test_metrics['pr_aucs'][1]:.4f}")
+        print(f"  Test F1 (Class 0): {test_metrics['f1s'][0]:.4f}")
+        print(f"  Test F1 (Class 1): {test_metrics['f1s'][1]:.4f}")
 
         # Save best model
         if test_metrics['avg_auc'] > best_auc:
@@ -472,32 +558,22 @@ def main():
                 'best_auc': best_auc,
                 'config': CONFIG
             }, os.path.join(OUTPUT_DIRS['checkpoints'], 'best_model.pth'))
-            print(f"  New best model saved! AUC: {best_auc:.4f}")
+            print(f"  ? New best model! AUC: {best_auc:.4f}")
+        print()
 
-    print(f"\nTraining completed!")
-    print(f"Best test AUC: {best_auc:.4f}")
+    print(f"\nTraining completed! Best test AUC: {best_auc:.4f}")
 
-    # Save final results
-    results = {
+    # Save performance log
+    performance_log = {
         'config': CONFIG,
         'best_auc': best_auc,
-        'train_losses': train_losses,
-        'final_test_metrics': test_metrics
+        'epochs': epoch_logs
     }
 
-    with open(os.path.join(OUTPUT_DIRS['results'], 'training_results.json'), 'w') as f:
-        json.dump(results, f, indent=2)
+    with open(os.path.join(OUTPUT_DIRS['results'], 'performance_log.json'), 'w') as f:
+        json.dump(performance_log, f, indent=2)
 
-    # Plot training curve
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses)
-    plt.title('Training Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.savefig(os.path.join(OUTPUT_DIRS['images'], 'training_loss.png'))
-    plt.close()
-
-    print(f"Results saved to {CONFIG['output_dir']}")
+    print(f"Performance log saved to {os.path.join(OUTPUT_DIRS['results'], 'performance_log.json')}")
 
 
 if __name__ == '__main__':

@@ -260,6 +260,29 @@ class MessidorDataset(Dataset):
         img_name = row['image_id']
         label = int(row[self.label_col])
         img_path = os.path.join(self.img_dir, img_name)
+
+        # Check if image file exists (case-insensitive)
+        if not os.path.exists(img_path):
+            # Try with different case extensions
+            base_name = os.path.splitext(img_name)[0]
+            possible_extensions = ['.jpg', '.JPG', '.jpeg', '.JPEG', '.png', '.PNG']
+
+            found_file = None
+            for ext in possible_extensions:
+                alt_path = os.path.join(self.img_dir, base_name + ext)
+                if os.path.exists(alt_path):
+                    found_file = alt_path
+                    break
+
+            if found_file:
+                img_path = found_file
+            else:
+                print(f"Image file not found: {img_path}")
+                img = Image.new('RGB', CONFIG['img_size'], 'black')
+                self.black_image_count += 1
+                img = self.transform(img)
+                return img, label
+
         try:
             img = Image.open(img_path).convert('RGB')
             # Check if image is mostly black
@@ -470,7 +493,7 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
     if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
         # Normal mode - initialize W&B with fixed config
         wandb.init(
-            project="retina-lora-finetuning_strat0",
+            project="retina-lora-finetuning_strat1",
             config={
                 "dataset": "messidor",
                 "strategy": strategy_name or "imagenet_finetune",
