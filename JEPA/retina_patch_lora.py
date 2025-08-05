@@ -40,23 +40,24 @@ print(f"Using device: {DEVICE}")
 
 # Configuration
 CONFIG = {
-    'patch_size': 616,  # Patch size for training
-    'stride': 512,  # Stride for overlapping patches
+    'patch_size': 224,  # Patch size for training (larger to reduce memory)
+    'stride': 200,  # Stride for overlapping patches (less overlap)
     'embed_dim': 1280,
     'depth': 32,
     'num_heads': 16,
-    'patch_size_vit': 16,
+    'patch_size_vit': 14,  # ViT patch size (MUST match checkpoint)
+    'img_size_vit': 224,  # Input size for ViT (224x224 = 16x16 patches with patch_size_vit=14)
     'use_lora': True,
     'lora_r': 16,
     'lora_alpha': 16,
     'lora_dropout': 0.2,
     'lr': 1e-4,
     'weight_decay': 1e-2,
-    'epochs': 30,
+    'epochs': 20,
     'batch_size': 1,  # Process one patch at a time
     'num_workers': 0,
     'external_root': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/external_datasets',
-    'checkpoint_path': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/checkpoint_retina_finetune.pth',
+    'checkpoint_path': '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_retina_finetune.pth',
     'output_dir': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/outputs/retina_patch_messidor'
 }
 
@@ -74,7 +75,7 @@ for dir_path in OUTPUT_DIRS.values():
 class PatchExtractor:
     """Extracts overlapping patches from retina images of any size."""
 
-    def __init__(self, patch_size: int = 616, stride: int = 512):
+    def __init__(self, patch_size: int = 224, stride: int = 200):
         self.patch_size = patch_size
         self.stride = stride
         print(f"Patch extractor initialized with {patch_size}x{patch_size} patches and {stride} stride")
@@ -172,6 +173,9 @@ class MessidorPatchDataset(Dataset):
 
             label = int(row['adjudicated_dr_grade'])
 
+            # Binarize labels: 0 = no DR, 1+ = DR
+            label = 1 if label > 0 else 0
+
             # Get patches for this image
             img_path = os.path.join(self.img_dir, img_name)
 
@@ -229,6 +233,11 @@ class MessidorPatchDataset(Dataset):
         print(f"Expanded dataset: {len(self.df)} images ? {len(self.expanded_data)} patches")
         print(f"Black images: {self.black_image_count}")
 
+        # Check label distribution
+        labels = [data['label'] for data in self.expanded_data]
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        print(f"Label distribution: {dict(zip(unique_labels, counts))}")
+
     def __len__(self):
         return len(self.expanded_data)
 
@@ -260,7 +269,7 @@ class ClassificationHead(nn.Module):
 def build_encoder(config: Dict[str, Any]) -> VisionTransformer:
     """Build the Vision Transformer encoder."""
     enc = VisionTransformer(
-        img_size=config['patch_size'],  # Use patch size for ViT
+        img_size=(config['img_size_vit'], config['img_size_vit']),  # Use fixed ViT input size
         patch_size=config['patch_size_vit'],
         in_chans=3,
         embed_dim=config['embed_dim'],
@@ -281,14 +290,76 @@ def load_pretrained_encoder(enc: VisionTransformer, ckpt_path: str):
         enc_state = state.get('enc', state)
 
         # Load ALL parameters including LoRA parameters
-        filtered = {k: v for k, v in enc_state.items()
-                    if (k.startswith('patch_embed.') or k.startswith('blocks.')
-                        or k.startswith('lora_') or k in ('cls_token', 'pos_embed'))}
+        # The encoder state dict contains all parameters including LoRA
+        filtered = enc_state
 
         # Handle input channel mismatch
         w = filtered.get('patch_embed.proj.weight')
         if w is not None and w.shape[1] == 6 and enc.patch_embed.proj.weight.shape[1] == 3:
             filtered['patch_embed.proj.weight'] = w[:, :3]
+
+        # Handle positional embedding size mismatch by interpolation
+        if 'pos_embed' in filtered:
+            old_pos_embed = filtered['pos_embed']
+            new_pos_embed = enc.pos_embed
+
+            if old_pos_embed.shape != new_pos_embed.shape:
+                print(f"Interpolating pos_embed from {old_pos_embed.shape} to {new_pos_embed.shape}")
+
+                # Remove cls token for interpolation
+                old_pos_embed_no_cls = old_pos_embed[:, 1:, :]  # Remove cls token
+                new_pos_embed_no_cls = new_pos_embed[:, 1:, :]  # Remove cls token
+
+                # Calculate old and new grid sizes (handle non-square cases)
+                old_num_patches = old_pos_embed_no_cls.shape[1]
+                new_num_patches = new_pos_embed_no_cls.shape[1]
+
+                # Find the closest square dimensions
+                old_size = int(math.sqrt(old_num_patches))
+                new_size = int(math.sqrt(new_num_patches))
+
+                # If not perfect squares, use the next larger square and pad
+                if old_size * old_size != old_num_patches:
+                    old_size = int(math.ceil(math.sqrt(old_num_patches)))
+                if new_size * new_size != new_num_patches:
+                    new_size = int(math.ceil(math.sqrt(new_num_patches)))
+
+                # Pad old embeddings to square
+                old_pad_size = old_size * old_size - old_num_patches
+                if old_pad_size > 0:
+                    old_pad = torch.zeros(1, old_pad_size, old_pos_embed_no_cls.shape[2],
+                                          device=old_pos_embed_no_cls.device)
+                    old_pos_embed_no_cls = torch.cat([old_pos_embed_no_cls, old_pad], dim=1)
+
+                # Pad new embeddings to square
+                new_pad_size = new_size * new_size - new_num_patches
+                if new_pad_size > 0:
+                    new_pad = torch.zeros(1, new_pad_size, new_pos_embed_no_cls.shape[2],
+                                          device=new_pos_embed_no_cls.device)
+                    new_pos_embed_no_cls = torch.cat([new_pos_embed_no_cls, new_pad], dim=1)
+
+                # Reshape to 2D grid
+                old_pos_embed_2d = old_pos_embed_no_cls.reshape(1, old_size, old_size, -1).permute(0, 3, 1, 2)
+                new_pos_embed_2d = new_pos_embed_no_cls.reshape(1, new_size, new_size, -1).permute(0, 3, 1, 2)
+
+                # Interpolate
+                interpolated = torch.nn.functional.interpolate(
+                    old_pos_embed_2d,
+                    size=(new_size, new_size),
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+                # Reshape back
+                interpolated = interpolated.permute(0, 2, 3, 1).reshape(1, new_size * new_size, -1)
+
+                # Remove padding from interpolated result
+                if new_pad_size > 0:
+                    interpolated = interpolated[:, :new_num_patches, :]
+
+                # Add cls token back
+                cls_token = new_pos_embed[:, 0:1, :]
+                filtered['pos_embed'] = torch.cat([cls_token, interpolated], dim=1)
 
         # Load state dict and report what was loaded
         missing_keys, unexpected_keys = enc.load_state_dict(filtered, strict=False)
@@ -302,6 +373,11 @@ def load_pretrained_encoder(enc: VisionTransformer, ckpt_path: str):
         logger.info(f"LoRA parameters loaded: {len(lora_params_loaded)}")
         if lora_params_loaded:
             logger.info(f"Sample LoRA params: {lora_params_loaded[:5]}")
+        else:
+            logger.warning("No LoRA parameters found in checkpoint!")
+            logger.info(f"Available parameter prefixes: {list(set([k.split('.')[0] for k in filtered.keys()]))}")
+            logger.info(f"First 10 loaded parameters: {list(filtered.keys())[:10]}")
+            logger.info(f"Total parameters in checkpoint: {len(filtered)}")
     else:
         logger.info("No pretrained checkpoint found; skipping load")
 
@@ -320,7 +396,7 @@ def build_transforms():
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
     return transforms.Compose([
-        transforms.Resize((CONFIG['patch_size'], CONFIG['patch_size'])),
+        transforms.Resize((CONFIG['img_size_vit'], CONFIG['img_size_vit'])),  # Resize to ViT input size
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std)
     ])

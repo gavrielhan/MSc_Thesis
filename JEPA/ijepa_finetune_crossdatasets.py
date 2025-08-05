@@ -336,9 +336,8 @@ def load_pretrained_encoder(enc, ckpt_path):
         enc_state = state.get('enc', state)
 
         # Load ALL parameters including LoRA parameters
-        filtered = {k: v for k, v in enc_state.items()
-                    if (k.startswith('patch_embed.') or k.startswith('blocks.')
-                        or k.startswith('lora_') or k in ('cls_token', 'pos_embed'))}
+        # The encoder state dict contains all parameters including LoRA
+        filtered = enc_state
 
         # Handle input channel mismatch
         w = filtered.get('patch_embed.proj.weight')
@@ -357,6 +356,11 @@ def load_pretrained_encoder(enc, ckpt_path):
         logger.info(f"LoRA parameters loaded: {len(lora_params_loaded)}")
         if lora_params_loaded:
             logger.info(f"Sample LoRA params: {lora_params_loaded[:5]}")
+        else:
+            logger.warning("No LoRA parameters found in checkpoint!")
+            logger.info(f"Available parameter prefixes: {list(set([k.split('.')[0] for k in filtered.keys()]))}")
+            logger.info(f"First 10 loaded parameters: {list(filtered.keys())[:10]}")
+            logger.info(f"Total parameters in checkpoint: {len(filtered)}")
     else:
         logger.info("No pretrained checkpoint found; skipping load")
 
