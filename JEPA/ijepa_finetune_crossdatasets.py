@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.checkpoint import checkpoint
 from torchvision import transforms
 from PIL import Image
 from tqdm.auto import tqdm
@@ -46,6 +47,14 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+# Disable W&B telemetry to avoid connection issues
+os.environ["WANDB_TELEMETRY_DISABLED"] = "true"
+
+# Memory optimization settings
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 # For IDRID and Messidor: use single split (no folds)
 # For PAPILA: use existing fold structure
 USE_SINGLE_SPLIT = True  # Set to True for IDRID/Messidor, False for PAPILA
@@ -57,14 +66,14 @@ CONFIG = {
     'depth': 32,
     'num_heads': 16,
     'use_lora': True,
-    'lora_r': 16,
-    'lora_alpha': 16,
-    'lora_dropout': 0.2,
-    'batch_size': 2,
-    'num_workers': 2,
-    'lr': 5e-5,  # Reduced learning rate for LoRA fine-tuning
-    'weight_decay': 1e-2,
-    'epochs': 10,  # Reduced to 10 epochs for LoRA fine-tuning
+    'lora_r': 16,  # Match the pretrained checkpoint
+    'lora_alpha': 16,  # Match the pretrained checkpoint
+    'lora_dropout': 0.2,  # Match the pretrained checkpoint
+    'batch_size': 1,  # Minimal batch size to save memory
+    'num_workers': 0,  # No workers to save memory
+    'lr': 1e-4,  # Reduced learning rate for more stable fine-tuning
+    'weight_decay': 1e-2,  # Increased weight decay to prevent overfitting
+    'epochs': 30,  # Increased epochs for better convergence
     'external_root': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/external_datasets',
 }
 
@@ -78,12 +87,93 @@ logger = logging.getLogger()
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+# Memory cleanup function
+def cleanup_memory():
+    """Clean up GPU memory"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+# Function to manually count images in a dataset
+def count_images_in_dataset(dataset, dataset_name):
+    """Manually count images and black images in a dataset"""
+    total_checked = 0
+    black_count = 0
+
+    print(f"Manually checking {dataset_name} dataset...")
+    for i in range(len(dataset)):
+        try:
+            # Get the original image path and load it directly
+            if hasattr(dataset, 'df') and hasattr(dataset, 'img_dir'):
+                # For Messidor dataset (check first since it also has label_col)
+                if 'image_id' in dataset.df.columns:
+                    row = dataset.df.iloc[i]
+                    img_name = row['image_id']
+                    img_path = os.path.join(dataset.img_dir, img_name)
+                # For PAPILA dataset
+                elif 'Patient ID' in dataset.df.columns:
+                    row = dataset.df.iloc[i]
+                    pid = row['Patient ID']
+                    eye = row['eyeID']
+                    img_name = f"RET{pid}{eye}.jpg"
+                    img_path = os.path.join(dataset.img_dir, img_name)
+                # For IDRID dataset
+                elif hasattr(dataset, 'label_col'):
+                    row = dataset.df.iloc[i]
+                    img_name = row['Image name']
+                    if not img_name.endswith('.jpg'):
+                        img_name = img_name + '.jpg'
+                    img_path = os.path.join(dataset.img_dir, img_name)
+                else:
+                    # Fallback to checking transformed image
+                    img, label = dataset[i]
+                    total_checked += 1
+                    if hasattr(img, 'numpy'):
+                        img_array = img.numpy()
+                    else:
+                        img_array = np.array(img)
+                    # For normalized images, check if they're close to zero
+                    if np.mean(img_array) < 0.1:  # Much lower threshold for normalized images
+                        black_count += 1
+                    continue
+
+                # Load original image and check
+                original_img = Image.open(img_path).convert('RGB')
+                img_array = np.array(original_img)
+                total_checked += 1
+
+                # Check if image is mostly black (mean < 30 for RGB images)
+                if np.mean(img_array) < 30:
+                    black_count += 1
+                    print(f"Warning: {dataset_name} image {img_name} is very dark (mean: {np.mean(img_array):.1f})")
+
+            else:
+                # Fallback for other dataset types
+                img, label = dataset[i]
+                total_checked += 1
+                if hasattr(img, 'numpy'):
+                    img_array = img.numpy()
+                else:
+                    img_array = np.array(img)
+                if np.mean(img_array) < 0.1:
+                    black_count += 1
+
+        except Exception as e:
+            print(f"Error checking {dataset_name} sample {i}: {e}")
+            black_count += 1
+
+    return total_checked, black_count
+
+
 # ---------- Data Utilities ----------
 class PapilaDataset(Dataset):
     def __init__(self, df, img_dir, transform):
         self.df = df.reset_index(drop=True)
         self.img_dir = img_dir
         self.transform = transform
+        self.black_image_count = 0
+        self.total_images_checked = 0
 
     def __len__(self):
         return len(self.df)
@@ -97,8 +187,16 @@ class PapilaDataset(Dataset):
         img_path = os.path.join(self.img_dir, img_name)
         try:
             img = Image.open(img_path).convert('RGB')
-        except:
+            # Check if image is mostly black
+            img_array = np.array(img)
+            self.total_images_checked += 1
+            if np.mean(img_array) < 10:  # Very dark image
+                self.black_image_count += 1
+                print(f"Warning: Image {img_name} is very dark (mean: {np.mean(img_array):.1f})")
+        except Exception as e:
+            print(f"Error loading image {img_path}: {e}")
             img = Image.new('RGB', CONFIG['img_size'], 'black')
+            self.black_image_count += 1
         img = self.transform(img)
         return img, label
 
@@ -109,6 +207,8 @@ class IDRIDDataset(torch.utils.data.Dataset):
         self.img_dir = img_dir
         self.transform = transform
         self.label_col = label_col
+        self.black_image_count = 0
+        self.total_images_checked = 0
 
     def __len__(self):
         return len(self.df)
@@ -129,9 +229,16 @@ class IDRIDDataset(torch.utils.data.Dataset):
         img_path = os.path.join(self.img_dir, img_name)
         try:
             img = Image.open(img_path).convert('RGB')
+            # Check if image is mostly black
+            img_array = np.array(img)
+            self.total_images_checked += 1
+            if np.mean(img_array) < 10:  # Very dark image
+                self.black_image_count += 1
+                print(f"Warning: Image {img_name} is very dark (mean: {np.mean(img_array):.1f})")
         except Exception as e:
             print(f"Error loading image {img_path}: {e}")
             img = Image.new('RGB', CONFIG['img_size'], 'black')
+            self.black_image_count += 1
         img = self.transform(img)
         return img, label
 
@@ -142,6 +249,8 @@ class MessidorDataset(Dataset):
         self.img_dir = img_dir
         self.transform = transform
         self.label_col = label_col
+        self.black_image_count = 0
+        self.total_images_checked = 0
 
     def __len__(self):
         return len(self.df)
@@ -153,8 +262,16 @@ class MessidorDataset(Dataset):
         img_path = os.path.join(self.img_dir, img_name)
         try:
             img = Image.open(img_path).convert('RGB')
-        except:
+            # Check if image is mostly black
+            img_array = np.array(img)
+            self.total_images_checked += 1
+            if np.mean(img_array) < 10:  # Very dark image
+                self.black_image_count += 1
+                print(f"Warning: Image {img_name} is very dark (mean: {np.mean(img_array):.1f})")
+        except Exception as e:
+            print(f"Error loading image {img_path}: {e}")
             img = Image.new('RGB', CONFIG['img_size'], 'black')
+            self.black_image_count += 1
         img = self.transform(img)
         return img, label
 
@@ -184,6 +301,8 @@ def build_encoder(config):
         lora_alpha=config['lora_alpha'],
         lora_dropout=config['lora_dropout']
     )
+    # Note: VisionTransformer doesn't support gradient_checkpointing_enable()
+    # Memory optimization is handled through reduced batch size and image size
     return enc
 
 
@@ -192,14 +311,29 @@ def load_pretrained_encoder(enc, ckpt_path):
     if ckpt_path and os.path.isfile(ckpt_path):
         state = torch.load(ckpt_path, map_location=DEVICE)
         enc_state = state.get('enc', state)
+
+        # Load ALL parameters including LoRA parameters
         filtered = {k: v for k, v in enc_state.items()
-                    if k.startswith('patch_embed.') or k.startswith('blocks.')
-                    or k in ('cls_token', 'pos_embed')}
+                    if (k.startswith('patch_embed.') or k.startswith('blocks.')
+                        or k.startswith('lora_') or k in ('cls_token', 'pos_embed'))}
+
+        # Handle input channel mismatch
         w = filtered.get('patch_embed.proj.weight')
         if w is not None and w.shape[1] == 6 and enc.patch_embed.proj.weight.shape[1] == 3:
             filtered['patch_embed.proj.weight'] = w[:, :3]
-        enc.load_state_dict(filtered, strict=False)
+
+        # Load state dict and report what was loaded
+        missing_keys, unexpected_keys = enc.load_state_dict(filtered, strict=False)
         logger.info("Pretrained weights loaded into encoder")
+        logger.info(f"Loaded {len(filtered)} parameters")
+        logger.info(f"Missing keys: {len(missing_keys)}")
+        logger.info(f"Unexpected keys: {len(unexpected_keys)}")
+
+        # Debug: Check if LoRA parameters were loaded
+        lora_params_loaded = [k for k in filtered.keys() if k.startswith('lora_')]
+        logger.info(f"LoRA parameters loaded: {len(lora_params_loaded)}")
+        if lora_params_loaded:
+            logger.info(f"Sample LoRA params: {lora_params_loaded[:5]}")
     else:
         logger.info("No pretrained checkpoint found; skipping load")
 
@@ -278,7 +412,7 @@ STRATEGIES = [
 # 1: imagenet_finetune
 # 2: retina_pretrain_finetune
 # 3: retina_feature_knn
-STRATEGY_INDEX = 1  # Change this to select different strategies
+STRATEGY_INDEX = 0  # Change this to select different strategies
 
 
 # ---------- Utility: Save/Load Results ----------
@@ -329,31 +463,43 @@ def knn_evaluate(encoder, train_loader, test_loader, n_classes, device, k=5):
 
 
 # ---------- Main Training/Eval Loop (Refactored) ----------
-def main():
+def main(strategy_name=None, fold=0, sweep_mode=False):
     import os
 
     # Initialize W&B
-    wandb.init(
-        project="retina-lora-finetuning",
-        config={
-            "dataset": "idrid",
-            "strategy": "imagenet_finetune",
-            "lora_r": CONFIG['lora_r'],
-            "lora_alpha": CONFIG['lora_alpha'],
-            "lr": CONFIG['lr'],
-            "batch_size": CONFIG['batch_size'],
-            "epochs": CONFIG['epochs'],
-            "weight_decay": CONFIG['weight_decay'],
-        },
-        name=f"idrid_lora_r{CONFIG['lora_r']}_lr{CONFIG['lr']}"
-    )
+    if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
+        # Normal mode - initialize W&B with fixed config
+        wandb.init(
+            project="retina-lora-finetuning_strat0",
+            config={
+                "dataset": "messidor",
+                "strategy": strategy_name or "imagenet_finetune",
+                "lora_r": CONFIG['lora_r'],
+                "lora_alpha": CONFIG['lora_alpha'],
+                "lr": CONFIG['lr'],
+                "batch_size": CONFIG['batch_size'],
+                "epochs": CONFIG['epochs'],
+                "weight_decay": CONFIG['weight_decay'],
+            },
+            name=f"messidor_lora_r{CONFIG['lora_r']}_lr{CONFIG['lr']}"
+        )
+    else:
+        # Sweep mode - don't use W&B at all
+        print("SWEEP MODE: Running without W&B logging")
+        # Don't try to update wandb.config since W&B isn't initialized
 
     # User selects dataset for fine-tuning and testing
-    train_dataset = "idrid"  # Start with IDRID
-    test_dataset = "idrid"
-    print("Selected dataset for fine-tuning (train): ", train_dataset)
-    print("Selected dataset for testing (eval): ", test_dataset)
-    print("Using single split (no folds) to avoid data leakage")
+    train_dataset = "messidor"  # Start with IDRID
+    test_dataset = "messidor"
+
+    if sweep_mode:
+        print(f"? SWEEP MODE: Running {strategy_name} with config:")
+        print(f"  LoRA r: {CONFIG['lora_r']}, alpha: {CONFIG['lora_alpha']}, dropout: {CONFIG['lora_dropout']}")
+        print(f"  LR: {CONFIG['lr']}, weight_decay: {CONFIG['weight_decay']}, epochs: {CONFIG['epochs']}")
+    else:
+        print("Selected dataset for fine-tuning (train): ", train_dataset)
+        print("Selected dataset for testing (eval): ", test_dataset)
+        print("Using single split (no folds) to avoid data leakage")
 
     trsf = build_transforms()
     n_folds = 5
@@ -487,7 +633,17 @@ def main():
         raise NotImplementedError(f"Dataset not implemented: {train_dataset}")
 
     # Select the strategy to run
-    strategy_select = STRATEGIES[STRATEGY_INDEX]
+    if strategy_name:
+        # Find strategy by name
+        strategy_select = None
+        for strategy in STRATEGIES:
+            if strategy['name'] == strategy_name:
+                strategy_select = strategy
+                break
+        if strategy_select is None:
+            raise ValueError(f"Unknown strategy: {strategy_name}")
+    else:
+        strategy_select = STRATEGIES[STRATEGY_INDEX]
     print(f"\n=== Running strategy: {strategy_select['name']} ===")
 
     if not os.path.isfile(strategy_select['ckpt']):
@@ -495,7 +651,11 @@ def main():
         return
 
     # Handle different dataset types
-    if train_dataset in ['idrid', 'messidor']:
+    if strategy_name and fold is not None:
+        # Use provided fold for sweep mode
+        folds_to_run = [fold]
+        print(f"Running fold {fold} for strategy {strategy_select['name']} (sweep mode)")
+    elif train_dataset in ['idrid', 'messidor']:
         # Single split datasets - always use fold 0
         fold = 0
         print(f"Running single split (fold 0) for strategy {strategy_select['name']} on {train_dataset}")
@@ -529,6 +689,16 @@ def main():
             df_train, df_test = splits[0]  # Single split
             train_ds = IDRIDDataset(df_train, img_dir, trsf, label_col=label_col)
             test_ds = IDRIDDataset(df_test, img_dir, trsf, label_col=label_col)
+
+            # Check a few images to see if they're loading properly
+            print("Checking image loading...")
+            for i in range(min(5, len(train_ds))):
+                img, label = train_ds[i]
+                print(f"Sample {i}: Image shape {img.shape}, Label {label}")
+
+            print(f"Train dataset: {len(train_ds)} images")
+            print(f"Test dataset: {len(test_ds)} images")
+
             n_classes = n_classes_idrid
         elif train_dataset == 'papila':
             train_xlsx, test_xlsx = splits[fold]  # Use specific fold
@@ -548,10 +718,36 @@ def main():
         else:
             raise NotImplementedError
 
+        # Check images at the beginning
+        print(f"\nImage Loading Summary:")
+        train_total, train_black = count_images_in_dataset(train_ds, "train")
+        test_total, test_black = count_images_in_dataset(test_ds, "test")
+        print(f"Train dataset - Total checked: {train_total}, Black images: {train_black}")
+        print(f"Test dataset - Total checked: {test_total}, Black images: {test_black}")
+
+        # If all images are black, there's a serious problem
+        if train_black == train_total and test_black == test_total:
+            error_msg = "All images are black - cannot proceed with training!"
+            print(f"ERROR: {error_msg}")
+            print("Possible causes:")
+            print("1. Image paths are incorrect")
+            print("2. Images are actually black/damaged")
+            print("3. Image loading is failing")
+            print("4. Threshold for 'black' detection is too strict")
+
+            if sweep_mode:
+                # In sweep mode, just return instead of raising exception
+                print("SWEEP MODE: Logging error and continuing with next trial")
+                return
+            else:
+                raise RuntimeError(error_msg)
+
         train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True,
                                   num_workers=CONFIG['num_workers'], pin_memory=True)
-        test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False,
-                                 num_workers=CONFIG['num_workers'], pin_memory=True)
+        # Use num_workers=0 for test_loader to ensure black image tracking works properly
+        # (When using multiple workers, tracking attributes don't propagate back to main process)
+        test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0,
+                                 pin_memory=True)
 
         # Calculate class weights to handle imbalance
         train_labels = []
@@ -636,6 +832,13 @@ def main():
                 if len(trainable_lora_params) == 0:
                     print("WARNING: No trainable LoRA parameters! LoRA might not be working.")
 
+                # Debug: Check LoRA parameter values to verify they're loaded
+                if len(lora_params) > 0:
+                    sample_lora_param = next(p for n, p in model[0].named_parameters() if 'lora_' in n)
+                    print(
+                        f"Sample LoRA parameter mean: {sample_lora_param.mean().item():.6f}, std: {sample_lora_param.std().item():.6f}")
+                    print(f"Strategy: {strategy_select['name']} - LoRA should be different for different strategies!")
+
                 optimizer = AdamW([
                     {'params': [p for n, p in model[0].named_parameters() if p.requires_grad],
                      'weight_decay': CONFIG['weight_decay'], 'lr': CONFIG['lr']},  # LoRA LR
@@ -643,13 +846,11 @@ def main():
                     # Higher LR for classification head
                 ])
                 # Use warmup + cosine annealing to help escape local optimum
-                from torch.optim.lr_scheduler import SequentialLR, LinearLR
+                from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR
                 warmup_epochs = 1
                 main_epochs = CONFIG['epochs'] - warmup_epochs
                 warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
                 cosine_scheduler = CosineAnnealingLR(optimizer, T_max=main_epochs)
-                scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
-                                         milestones=[warmup_epochs])
                 train_losses = []
                 start_epoch = 1
                 last_time_ckpt = time.time()
@@ -664,18 +865,8 @@ def main():
                 model = nn.Sequential(build_encoder(CONFIG), ClassificationHead(CONFIG['embed_dim'], n_classes)).to(
                     DEVICE)
 
-                # Load pretrained weights into encoder
-                if 'model_state_dict' in pretrained_checkpoint:
-                    # Extract encoder weights from pretrained model
-                    pretrained_state = pretrained_checkpoint['model_state_dict']
-                    encoder_state = {}
-                    for key, value in pretrained_state.items():
-                        if key.startswith('0.'):  # Encoder weights
-                            encoder_state[key[2:]] = value  # Remove '0.' prefix
-                    model[0].load_state_dict(encoder_state, strict=False)
-                else:
-                    # Handle case where checkpoint is just the model state
-                    model[0].load_state_dict(pretrained_checkpoint, strict=False)
+                # Load pretrained weights into encoder using the proper function
+                load_pretrained_encoder(model[0], strategy_select['ckpt'])
 
                 print("Pretrained encoder loaded successfully")
 
@@ -696,6 +887,13 @@ def main():
                 if len(trainable_lora_params) == 0:
                     print("WARNING: No trainable LoRA parameters! LoRA might not be working.")
 
+                # Debug: Check LoRA parameter values to verify they're loaded
+                if len(lora_params) > 0:
+                    sample_lora_param = next(p for n, p in model[0].named_parameters() if 'lora_' in n)
+                    print(
+                        f"Sample LoRA parameter mean: {sample_lora_param.mean().item():.6f}, std: {sample_lora_param.std().item():.6f}")
+                    print(f"Strategy: {strategy_select['name']} - LoRA should be different for different strategies!")
+
                 # Initialize fresh optimizer and scheduler for fine-tuning
                 optimizer = AdamW([
                     {'params': [p for n, p in model[0].named_parameters() if p.requires_grad],
@@ -704,13 +902,11 @@ def main():
                     # Higher LR for classification head
                 ])
                 # Use warmup + cosine annealing to help escape local optimum
-                from torch.optim.lr_scheduler import SequentialLR, LinearLR
+                from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR
                 warmup_epochs = 1
                 main_epochs = CONFIG['epochs'] - warmup_epochs
                 warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
                 cosine_scheduler = CosineAnnealingLR(optimizer, T_max=main_epochs)
-                scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
-                                         milestones=[warmup_epochs])
                 train_losses = []
                 start_epoch = 1
                 last_time_ckpt = time.time()
@@ -737,12 +933,23 @@ def main():
                 if epoch == 1:
                     print("Trainable parameters (requires_grad=True):")
                     lora_param_count = 0
+                    total_params = 0
                     for name, param in model.named_parameters():
                         if param.requires_grad:
                             print(f"  {name} | shape: {tuple(param.shape)}")
                             if 'lora_' in name:
                                 lora_param_count += 1
+                            total_params += param.numel()
                     print(f"Total LoRA parameters being trained: {lora_param_count}")
+                    print(f"Total trainable parameters: {total_params:,}")
+
+                    # Debug: Check if any parameters require gradients
+                    if total_params == 0:
+                        print("WARNING: No parameters require gradients! This will cause training to fail.")
+                        print("Checking all parameters:")
+                        for name, param in model.named_parameters():
+                            print(f"  {name}: requires_grad={param.requires_grad}")
+                        raise RuntimeError("No trainable parameters found!")
 
                     # Debug: Print classification head initial weights
                     print("Classification head initial weights:")
@@ -750,9 +957,30 @@ def main():
                         f"  Weight mean: {model[1].head.weight.mean().item():.4f}, std: {model[1].head.weight.std().item():.4f}")
                     print(f"  Bias: {model[1].head.bias.data.cpu().numpy()}")
 
+                    # Debug: Check dataset sizes and class distribution
+                    print(f"Dataset sizes - Train: {len(train_ds)}, Test: {len(test_ds)}")
+                    # Use a separate loader with num_workers=0 to avoid affecting tracking
+                    train_loader_debug = DataLoader(train_ds, batch_size=1, shuffle=False, num_workers=0)
+                    test_loader_debug = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=0)
+
+                    train_labels = []
+                    for _, labels in train_loader_debug:
+                        train_labels.extend(labels.numpy())
+                    train_labels = np.array(train_labels)
+
+                    test_labels = []
+                    for _, labels in test_loader_debug:
+                        test_labels.extend(labels.numpy())
+                    test_labels = np.array(test_labels)
+
+                    print(f"Train class distribution: {np.bincount(train_labels)}")
+                    print(f"Test class distribution: {np.bincount(test_labels)}")
+
                 for imgs, labels in train_loader:
                     imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
                     optimizer.zero_grad()
+
+                    # Use regular forward pass (gradient checkpointing was causing issues)
                     logits = model(imgs)
                     loss = criterion(logits, labels)
                     loss.backward()
@@ -794,31 +1022,111 @@ def main():
                     head_bias_change = torch.norm(model[1].head.bias.data - head_bias_before).item()
                     print(f"Head weight change: {head_weight_change:.6f}, Head bias change: {head_bias_change:.6f}")
 
-                    # Log parameter changes to W&B
-                    wandb.log({
-                        "head_weight_change": head_weight_change,
-                        "head_bias_change": head_bias_change,
-                        "total_lora_change": total_lora_change,
-                    })
+                    # Log parameter changes to W&B (only if not in sweep mode)
+                    if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
+                        wandb.log({
+                            "head_weight_change": head_weight_change,
+                            "head_bias_change": head_bias_change,
+                            "total_lora_change": total_lora_change,
+                        })
 
                 train_loss /= n_samples if n_samples > 0 else 1
                 train_losses.append(train_loss)
                 lora_lr = optimizer.param_groups[0]['lr']
+
+                # Evaluate on train set to track learning progress
+                model.eval()
+                train_labels = []
+                train_probs = []
+                with torch.no_grad():
+                    for imgs, labels in train_loader:
+                        imgs = imgs.to(DEVICE)
+                        logits = model(imgs)
+                        probs = torch.softmax(logits, dim=1).cpu().numpy()
+                        train_probs.append(probs)
+                        train_labels.append(labels.numpy())
+                train_probs_np = np.concatenate(train_probs, axis=0)
+                train_labels_np = np.concatenate(train_labels, axis=0)
+
+                # Compute train metrics
+                train_aucs = []
+                train_pr_aucs = []
+                for c in range(n_classes):
+                    y_true = (train_labels_np == c).astype(int)
+                    y_score = train_probs_np[:, c]
+                    try:
+                        auc = roc_auc_score(y_true, y_score)
+                    except ValueError:
+                        auc = float('nan')
+                    try:
+                        pr_auc = average_precision_score(y_true, y_score)
+                    except ValueError:
+                        pr_auc = float('nan')
+                    train_aucs.append(auc)
+                    train_pr_aucs.append(pr_auc)
+
+                # Print train metrics
+                print(f"  Train ROC AUC - Class 0: {train_aucs[0]:.4f}, Class 1: {train_aucs[1]:.4f}")
+                print(f"  Train PR AUC - Class 0: {train_pr_aucs[0]:.4f}, Class 1: {train_pr_aucs[1]:.4f}")
+
+                # Log train metrics to W&B (only if not in sweep mode)
+                if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
+                    wandb.log({
+                        "train_roc_auc_class_0": train_aucs[0],
+                        "train_roc_auc_class_1": train_aucs[1],
+                        "train_pr_auc_class_0": train_pr_aucs[0],
+                        "train_pr_auc_class_1": train_pr_aucs[1],
+                    })
+
+                # Early stopping check (stop if validation AUC hasn't improved for 5 epochs)
+                if len(train_losses) > 5:
+                    # Check if validation performance is improving
+                    if 'best_val_auc' not in locals():
+                        best_val_auc = 0
+                        patience_counter = 0
+
+                    current_val_auc = np.mean(aucs)  # Average AUC across classes
+                    if current_val_auc > best_val_auc:
+                        best_val_auc = current_val_auc
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+
+                    # Also check for overfitting (train improving but test degrading)
+                    if len(train_losses) > 10:
+                        if train_avg_auc > 0.8 and test_avg_auc < best_val_auc - 0.05:
+                            print(f"Early stopping at epoch {epoch} - overfitting detected!")
+                            print(
+                                f"Train AUC: {train_avg_auc:.4f}, Test AUC: {test_avg_auc:.4f}, Best Test AUC: {best_val_auc:.4f}")
+                            break
+
+                    if patience_counter >= 5:
+                        print(f"Early stopping at epoch {epoch} - validation AUC not improving for 5 epochs")
+                        print(f"Best validation AUC: {best_val_auc:.4f}")
+                        break
                 head_lr = optimizer.param_groups[1]['lr']
                 print(
                     f"{strategy_select['name']} Fold {fold} Epoch {epoch} Train Loss: {train_loss:.4f} LoRA_LR: {lora_lr:.2e} Head_LR: {head_lr:.2e}")
 
-                # Log to W&B
-                wandb.log({
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "lora_lr": lora_lr,
-                    "head_lr": head_lr,
-                    "fold": fold,
-                    "strategy": strategy_select['name']
-                })
+                # Log to W&B (only if not in sweep mode)
+                if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
+                    wandb.log({
+                        "epoch": epoch,
+                        "train_loss": train_loss,
+                        "lora_lr": lora_lr,
+                        "head_lr": head_lr,
+                        "fold": fold,
+                        "strategy": strategy_select['name']
+                    })
 
-                scheduler.step()
+                # Step the appropriate scheduler based on epoch
+                if epoch <= warmup_epochs:
+                    warmup_scheduler.step()
+                else:
+                    cosine_scheduler.step()
+
+                # Clean up memory after each epoch
+                cleanup_memory()
 
                 # Evaluate on test set after each epoch
                 model.eval()  # Set to evaluation mode
@@ -864,6 +1172,28 @@ def main():
                 print(f"  Test PR AUC - Class 0: {pr_aucs[0]:.4f}, Class 1: {pr_aucs[1]:.4f}")
                 print(f"  Test F1 - Class 0: {f1s[0]:.4f}, Class 1: {f1s[1]:.4f}")
 
+                # Compare train vs test performance
+                train_avg_auc = np.mean(train_aucs)
+                test_avg_auc = np.mean(aucs)
+                train_avg_pr_auc = np.mean(train_pr_aucs)
+                test_avg_pr_auc = np.mean(pr_aucs)
+
+                print(f"  Performance Summary:")
+                print(f"    Train Avg ROC AUC: {train_avg_auc:.4f}, Test Avg ROC AUC: {test_avg_auc:.4f}")
+                print(f"    Train Avg PR AUC: {train_avg_pr_auc:.4f}, Test Avg PR AUC: {test_avg_pr_auc:.4f}")
+
+                # Learning diagnosis
+                if train_avg_auc < 0.6:
+                    print(
+                        f"    ??  WARNING: Train ROC AUC is very low ({train_avg_auc:.4f}) - model may not be learning!")
+                elif train_avg_auc > 0.8 and test_avg_auc < 0.6:
+                    print(
+                        f"    ??  WARNING: Train ROC AUC ({train_avg_auc:.4f}) >> Test ROC AUC ({test_avg_auc:.4f}) - overfitting!")
+                elif train_avg_auc > 0.7 and test_avg_auc > 0.7:
+                    print(f"    ? GOOD: Both train and test performance are good!")
+                else:
+                    print(f"    ? Learning in progress...")
+
                 # Debug: Show prediction distributions and class balance
                 predictions = np.argmax(all_probs_np, axis=1)
                 print(f"  Test Predictions: Class 0: {np.sum(predictions == 0)}, Class 1: {np.sum(predictions == 1)}")
@@ -879,30 +1209,39 @@ def main():
                 print(f"    Min: {np.min(prob_diffs):.4f}, Max: {np.max(prob_diffs):.4f}")
                 print(f"    Samples with Class 1 > Class 0: {np.sum(prob_diffs > 0)}/{len(prob_diffs)}")
 
-                # Log test metrics to W&B
-                wandb.log({
-                    "test_roc_auc_class_0": aucs[0],
-                    "test_roc_auc_class_1": aucs[1],
-                    "test_pr_auc_class_0": pr_aucs[0],
-                    "test_pr_auc_class_1": pr_aucs[1],
-                    "test_f1_class_0": f1s[0],
-                    "test_f1_class_1": f1s[1],
-                    "prob_std": np.std(prob_diffs),
-                    "prob_mean": np.mean(prob_diffs),
-                    "class_0_predictions": np.sum(predictions == 0),
-                    "class_1_predictions": np.sum(predictions == 1),
-                    "prob_min": np.min(prob_diffs),
-                    "prob_max": np.max(prob_diffs),
-                    "class_0_prob_mean": np.mean(all_probs_np[:, 0]),
-                    "class_1_prob_mean": np.mean(all_probs_np[:, 1]),
-                })
+                # Log test metrics to W&B (only if not in sweep mode)
+                if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
+                    wandb.log({
+                        "test_roc_auc_class_0": aucs[0],
+                        "test_roc_auc_class_1": aucs[1],
+                        "test_pr_auc_class_0": pr_aucs[0],
+                        "test_pr_auc_class_1": pr_aucs[1],
+                        "test_f1_class_0": f1s[0],
+                        "test_f1_class_1": f1s[1],
+                        "train_avg_roc_auc": train_avg_auc,
+                        "test_avg_roc_auc": test_avg_auc,
+                        "train_avg_pr_auc": train_avg_pr_auc,
+                        "test_avg_pr_auc": test_avg_pr_auc,
+                        "prob_std": np.std(prob_diffs),
+                        "prob_mean": np.mean(prob_diffs),
+                        "class_0_predictions": np.sum(predictions == 0),
+                        "class_1_predictions": np.sum(predictions == 1),
+                        "prob_min": np.min(prob_diffs),
+                        "prob_max": np.max(prob_diffs),
+                        "class_0_prob_mean": np.mean(all_probs_np[:, 0]),
+                        "class_1_prob_mean": np.mean(all_probs_np[:, 1]),
+                    })
+
+                # Clean up memory after evaluation
+                cleanup_memory()
 
                 # Save checkpoint every epoch (with all states and metrics)
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
+                    'warmup_scheduler_state_dict': warmup_scheduler.state_dict(),
+                    'cosine_scheduler_state_dict': cosine_scheduler.state_dict(),
                     'train_losses': train_losses,
                     'aucs': aucs,
                     'pr_aucs': pr_aucs,
@@ -927,7 +1266,8 @@ def main():
                         'epoch': epoch,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
+                        'warmup_scheduler_state_dict': warmup_scheduler.state_dict(),
+                        'cosine_scheduler_state_dict': cosine_scheduler.state_dict(),
                         'train_losses': train_losses,
                         'aucs': aucs,
                         'pr_aucs': pr_aucs,
@@ -1010,8 +1350,9 @@ def main():
             # Save results
             save_json(results, result_path)
 
-            # Finish W&B run
-            wandb.finish()
+            # Finish W&B run (only if not in sweep mode)
+            if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
+                wandb.finish()
         elif strategy_select['eval_type'] == "knn":
             # Only use encoder, extract features, run KNN
             enc = build_encoder(CONFIG)
@@ -1039,8 +1380,16 @@ def main():
             # Save results
             save_json(results, result_path)
 
-            # Finish W&B run
-            wandb.finish()
+            # Print image loading summary for KNN
+            print(f"\nImage Loading Summary (KNN):")
+            train_total, train_black = count_images_in_dataset(train_ds, "train")
+            test_total, test_black = count_images_in_dataset(test_ds, "test")
+            print(f"Train dataset - Total checked: {train_total}, Black images: {train_black}")
+            print(f"Test dataset - Total checked: {test_total}, Black images: {test_black}")
+
+            # Finish W&B run (only if not in sweep mode)
+            if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
+                wandb.finish()
         else:
             raise NotImplementedError(f"Unknown eval_type: {strategy_select['eval_type']}")
 
@@ -1049,4 +1398,35 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description='LoRA Fine-tuning with Cross-dataset Evaluation')
+    parser.add_argument('--config', type=str, help='Path to config JSON file')
+    parser.add_argument('--strategy', type=str,
+                        choices=['retina_feature_finetune', 'imagenet_finetune', 'scratch'],
+                        help='Strategy to use')
+    parser.add_argument('--fold', type=int, default=0, help='Fold number')
+    parser.add_argument('--sweep_mode', action='store_true', help='Run in sweep mode')
+
+    args = parser.parse_args()
+
+    # Load config from file if provided
+    if args.config:
+        with open(args.config, 'r') as f:
+            config_from_file = json.load(f)
+            CONFIG.update(config_from_file)
+
+    # Set strategy if provided
+    if args.strategy:
+        strategy_name = args.strategy
+    else:
+        strategy_name = None
+
+    # Set fold if provided
+    if args.fold is not None:
+        fold_number = args.fold
+    else:
+        fold_number = 0
+
+    # Run main function
+    main(strategy_name=strategy_name, fold=fold_number, sweep_mode=args.sweep_mode)
