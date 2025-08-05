@@ -1,147 +1,120 @@
 #!/usr/bin/env python3
-"""
-Retina Patch-Based LoRA Fine-Tuning on Messidor Dataset
-Uses overlapping patches with distance-based weighting for high-resolution retina images.
-"""
+# -*- coding: utf-8 -*-
 
 import os
 import sys
 import json
-import time
+import logging
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
+from torchvision import transforms
 from PIL import Image
-import numpy as np
-import pandas as pd
+from tqdm.auto import tqdm
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score, confusion_matrix
+import time
 import matplotlib.pyplot as plt
-import glob
-import logging
-from typing import List, Tuple, Dict, Any
-import math
+from typing import Dict, Any, List, Tuple
+import argparse
 
-# Add the ijepa directory to Python path
-ijepa_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ijepa')
-sys.path.append(ijepa_path)
-
-# Import the Vision Transformer model
+# IJepa imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "ijepa")))
 from ijepa.src.models.vision_transformer import VisionTransformer
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ---------- Output Directories ----------
+OUTPUT_DIRS = {
+    'checkpoints': "/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/",
+    'results': "/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/",
+    'images': os.path.join('outputs', 'images'),
+}
+for d in OUTPUT_DIRS.values():
+    os.makedirs(d, exist_ok=True)
 
-# Device configuration
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {DEVICE}")
+# ---------- Config ----------
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
-# Configuration
+# Memory optimization settings
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 CONFIG = {
-    'patch_size': 224,  # Patch size for training (larger to reduce memory)
-    'stride': 200,  # Stride for overlapping patches (less overlap)
+    'img_size': (616, 616),
+    'patch_size': 14,
     'embed_dim': 1280,
     'depth': 32,
     'num_heads': 16,
-    'patch_size_vit': 14,  # ViT patch size (MUST match checkpoint)
-    'img_size_vit': 224,  # Input size for ViT (224x224 = 16x16 patches with patch_size_vit=14)
     'use_lora': True,
     'lora_r': 16,
     'lora_alpha': 16,
     'lora_dropout': 0.2,
+    'batch_size': 1,
+    'num_workers': 0,
     'lr': 1e-4,
     'weight_decay': 1e-2,
     'epochs': 20,
-    'batch_size': 1,  # Process one patch at a time
-    'num_workers': 0,
     'external_root': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/external_datasets',
     'checkpoint_path': '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_retina_finetune.pth',
-    'output_dir': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/outputs/retina_patch_messidor'
+    'patch_size_extract': 224,
+    'stride': 200,
 }
 
-# Create output directories
-OUTPUT_DIRS = {
-    'checkpoints': os.path.join(CONFIG['output_dir'], 'checkpoints'),
-    'images': os.path.join(CONFIG['output_dir'], 'images'),
-    'results': os.path.join(CONFIG['output_dir'], 'results')
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger()
 
-for dir_path in OUTPUT_DIRS.values():
-    os.makedirs(dir_path, exist_ok=True)
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# Memory cleanup function
+def cleanup_memory():
+    """Clean up GPU memory"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 class PatchExtractor:
-    """Extracts overlapping patches from retina images of any size."""
+    """Extract patches from retinal images with weights based on patch location."""
 
     def __init__(self, patch_size: int = 224, stride: int = 200):
         self.patch_size = patch_size
         self.stride = stride
-        print(f"Patch extractor initialized with {patch_size}x{patch_size} patches and {stride} stride")
 
     def extract_patches(self, image: Image.Image) -> List[Tuple[Image.Image, float]]:
-        """Extract patches from image with distance-based weights."""
-        # Get actual image dimensions
+        """Extract patches from image with weights based on distance from center."""
+        patches = []
         img_width, img_height = image.size
 
-        # Calculate number of patches for this specific image
-        num_patches_h = max(1, (img_height - self.patch_size) // self.stride + 1)
-        num_patches_w = max(1, (img_width - self.patch_size) // self.stride + 1)
+        # Calculate center of image
+        center_x, center_y = img_width // 2, img_height // 2
 
-        # Ensure we have at least one patch
-        if img_height < self.patch_size or img_width < self.patch_size:
-            # If image is smaller than patch size, resize the image
-            print(f"Image {img_width}x{img_height} is smaller than patch {self.patch_size}x{self.patch_size}, resizing")
-            image = image.resize((self.patch_size, self.patch_size), Image.Resampling.LANCZOS)
-            img_width, img_height = image.size
-            num_patches_h = 1
-            num_patches_w = 1
+        for y in range(0, img_height - self.patch_size + 1, self.stride):
+            for x in range(0, img_width - self.patch_size + 1, self.stride):
+                # Extract patch
+                patch = image.crop((x, y, x + self.patch_size, y + self.patch_size))
 
-        # Calculate patch centers for distance weighting
-        patch_centers = []
-        for i in range(num_patches_h):
-            for j in range(num_patches_w):
-                center_y = i * self.stride + self.patch_size // 2
-                center_x = j * self.stride + self.patch_size // 2
-                patch_centers.append((center_y, center_x))
+                # Calculate distance from center
+                patch_center_x = x + self.patch_size // 2
+                patch_center_y = y + self.patch_size // 2
+                distance = np.sqrt((patch_center_x - center_x) ** 2 + (patch_center_y - center_y) ** 2)
 
-        # Sort patches by distance to image center (closest first)
-        image_center = (img_height // 2, img_width // 2)
-        patch_distances = []
-        for center in patch_centers:
-            distance = math.sqrt((center[0] - image_center[0]) ** 2 + (center[1] - image_center[1]) ** 2)
-            patch_distances.append(distance)
+                # Weight based on distance (closer to center = higher weight)
+                max_distance = np.sqrt(center_x ** 2 + center_y ** 2)
+                weight = 1.0 - (distance / max_distance) * 0.5  # Weight between 0.5 and 1.0
 
-        # Sort patches by distance
-        sorted_indices = np.argsort(patch_distances)
-        patch_centers = [patch_centers[i] for i in sorted_indices]
-        patch_distances = [patch_distances[i] for i in sorted_indices]
-
-        # Extract patches
-        patches = []
-        for i, (center_y, center_x) in enumerate(patch_centers):
-            # Calculate patch coordinates
-            y1 = max(0, center_y - self.patch_size // 2)
-            y2 = min(img_height, y1 + self.patch_size)
-            x1 = max(0, center_x - self.patch_size // 2)
-            x2 = min(img_width, x1 + self.patch_size)
-
-            # Extract patch
-            patch = image.crop((x1, y1, x2, y2))
-
-            # If patch is smaller than expected, pad it
-            if patch.size != (self.patch_size, self.patch_size):
-                padded_patch = Image.new('RGB', (self.patch_size, self.patch_size), 'black')
-                padded_patch.paste(patch, (0, 0))
-                patch = padded_patch
-
-            # Calculate distance-based weight
-            distance = patch_distances[i]
-            image_radius = math.sqrt((img_height / 2) ** 2 + (img_width / 2) ** 2)  # Half-diagonal
-            weight = 1.0 / (1.0 + (distance / image_radius) ** 2)
-
-            patches.append((patch, weight))
+                patches.append((patch, weight))
 
         return patches
 
@@ -159,8 +132,15 @@ class MessidorPatchDataset(Dataset):
 
         # Expand dataset to include all patches
         self.expanded_data = []
+        total_images = len(self.df)
+        print(f"Initializing Messidor dataset: processing {total_images} images...")
+
         for idx, row in self.df.iterrows():
             img_name = row['image_id']
+
+            # Show progress every 10 images
+            if idx % 10 == 0:
+                print(f"Processing image {idx + 1}/{total_images} ({((idx + 1) / total_images) * 100:.1f}%)")
 
             # Debug: Print first few image names to verify
             if idx < 5:
@@ -230,6 +210,7 @@ class MessidorPatchDataset(Dataset):
                 })
                 self.black_image_count += 1
 
+        print(f"Dataset initialization completed!")
         print(f"Expanded dataset: {len(self.df)} images ? {len(self.expanded_data)} patches")
         print(f"Black images: {self.black_image_count}")
 
@@ -248,13 +229,116 @@ class MessidorPatchDataset(Dataset):
         weight = data['weight']
 
         # Apply transforms
-        patch_tensor = self.transform(patch)
+        patch = self.transform(patch)
 
-        return patch_tensor, label, weight
+        return patch, label, weight
+
+
+class IDRIDPatchDataset(Dataset):
+    """Dataset for IDRID with patch-based loading."""
+
+    def __init__(self, df: pd.DataFrame, img_dir: str, transform, patch_extractor: PatchExtractor):
+        self.df = df.reset_index(drop=True)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.patch_extractor = patch_extractor
+        self.black_image_count = 0
+        self.total_images_checked = 0
+
+        # Expand dataset to include all patches
+        self.expanded_data = []
+        total_images = len(self.df)
+        print(f"Initializing IDRID dataset: processing {total_images} images...")
+
+        for idx, row in self.df.iterrows():
+            img_name = row['Image name']
+
+            # Show progress every 10 images
+            if idx % 10 == 0:
+                print(f"Processing image {idx + 1}/{total_images} ({((idx + 1) / total_images) * 100:.1f}%)")
+
+            # Debug: Print first few image names to verify
+            if idx < 5:
+                print(f"Processing CSV row {idx}: image_id = '{img_name}'")
+
+            # Handle NaN values in labels
+            if pd.isna(row['Retinopathy grade']):
+                print(f"Skipping row {idx} with NaN label for image {img_name}")
+                continue
+
+            label = int(row['Retinopathy grade'])
+
+            # Binarize labels: 0 = no DR, 1+ = DR
+            label = 1 if label > 0 else 0
+
+            # Get patches for this image
+            # Add .jpg extension if not present
+            if not img_name.endswith('.jpg'):
+                img_name = img_name + '.jpg'
+
+            img_path = os.path.join(self.img_dir, img_name)
+
+            # Debug: Print first few paths to verify
+            if idx < 5:
+                print(f"  Looking for: {img_path}")
+
+            # Check if image file exists
+            if not os.path.exists(img_path):
+                print(f"Image file not found: {img_path}")
+                continue
+
+            try:
+                img = Image.open(img_path).convert('RGB')
+                patches = self.patch_extractor.extract_patches(img)
+
+                for patch, weight in patches:
+                    self.expanded_data.append({
+                        'patch': patch,
+                        'label': label,
+                        'weight': weight,
+                        'original_idx': idx,
+                        'img_name': img_name
+                    })
+            except Exception as e:
+                print(f"Error loading image {img_path}: {e}")
+                # Create a black patch as fallback
+                black_patch = Image.new('RGB', (self.patch_extractor.patch_size, self.patch_extractor.patch_size),
+                                        'black')
+                self.expanded_data.append({
+                    'patch': black_patch,
+                    'label': label,
+                    'weight': 1.0,
+                    'original_idx': idx,
+                    'img_name': img_name
+                })
+                self.black_image_count += 1
+
+        print(f"Dataset initialization completed!")
+        print(f"Expanded dataset: {len(self.df)} images ? {len(self.expanded_data)} patches")
+        print(f"Black images: {self.black_image_count}")
+
+        # Check label distribution
+        labels = [data['label'] for data in self.expanded_data]
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        print(f"Label distribution: {dict(zip(unique_labels, counts))}")
+
+    def __len__(self):
+        return len(self.expanded_data)
+
+    def __getitem__(self, idx):
+        data = self.expanded_data[idx]
+        patch = data['patch']
+        label = data['label']
+        weight = data['weight']
+
+        # Apply transforms
+        patch = self.transform(patch)
+
+        return patch, label, weight
 
 
 class ClassificationHead(nn.Module):
-    """Classification head for binary classification."""
+    """Classification head for the model."""
 
     def __init__(self, in_dim: int, n_classes: int = 2):
         super().__init__()
@@ -262,16 +346,15 @@ class ClassificationHead(nn.Module):
 
     def forward(self, x):
         if x.ndim == 3:
-            x = x[:, 0]  # Take CLS token
+            x = x.mean(dim=1)  # Global average pooling
         return self.head(x)
 
 
 def build_encoder(config: Dict[str, Any]) -> VisionTransformer:
-    """Build the Vision Transformer encoder."""
-    enc = VisionTransformer(
-        img_size=(config['img_size_vit'], config['img_size_vit']),  # Use fixed ViT input size
-        patch_size=config['patch_size_vit'],
-        in_chans=3,
+    """Build the vision transformer encoder."""
+    encoder = VisionTransformer(
+        img_size=config['img_size'],
+        patch_size=config['patch_size'],
         embed_dim=config['embed_dim'],
         depth=config['depth'],
         num_heads=config['num_heads'],
@@ -280,153 +363,90 @@ def build_encoder(config: Dict[str, Any]) -> VisionTransformer:
         lora_alpha=config['lora_alpha'],
         lora_dropout=config['lora_dropout']
     )
-    return enc
+    return encoder
 
 
 def load_pretrained_encoder(enc: VisionTransformer, ckpt_path: str):
-    """Load pretrained weights into encoder."""
-    if ckpt_path and os.path.isfile(ckpt_path):
-        state = torch.load(ckpt_path, map_location=DEVICE)
-        enc_state = state.get('enc', state)
+    """Load pretrained weights into the encoder."""
+    print(f"Loading pretrained weights from: {ckpt_path}")
 
-        # Load ALL parameters including LoRA parameters
-        # The encoder state dict contains all parameters including LoRA
-        filtered = enc_state
+    if not os.path.exists(ckpt_path):
+        print(f"Warning: Checkpoint not found at {ckpt_path}")
+        return
 
-        # Handle input channel mismatch
-        w = filtered.get('patch_embed.proj.weight')
-        if w is not None and w.shape[1] == 6 and enc.patch_embed.proj.weight.shape[1] == 3:
-            filtered['patch_embed.proj.weight'] = w[:, :3]
+    try:
+        checkpoint = torch.load(ckpt_path, map_location='cpu')
 
-        # Handle positional embedding size mismatch by interpolation
-        if 'pos_embed' in filtered:
-            old_pos_embed = filtered['pos_embed']
-            new_pos_embed = enc.pos_embed
-
-            if old_pos_embed.shape != new_pos_embed.shape:
-                print(f"Interpolating pos_embed from {old_pos_embed.shape} to {new_pos_embed.shape}")
-
-                # Remove cls token for interpolation
-                old_pos_embed_no_cls = old_pos_embed[:, 1:, :]  # Remove cls token
-                new_pos_embed_no_cls = new_pos_embed[:, 1:, :]  # Remove cls token
-
-                # Calculate old and new grid sizes (handle non-square cases)
-                old_num_patches = old_pos_embed_no_cls.shape[1]
-                new_num_patches = new_pos_embed_no_cls.shape[1]
-
-                # Find the closest square dimensions
-                old_size = int(math.sqrt(old_num_patches))
-                new_size = int(math.sqrt(new_num_patches))
-
-                # If not perfect squares, use the next larger square and pad
-                if old_size * old_size != old_num_patches:
-                    old_size = int(math.ceil(math.sqrt(old_num_patches)))
-                if new_size * new_size != new_num_patches:
-                    new_size = int(math.ceil(math.sqrt(new_num_patches)))
-
-                # Pad old embeddings to square
-                old_pad_size = old_size * old_size - old_num_patches
-                if old_pad_size > 0:
-                    old_pad = torch.zeros(1, old_pad_size, old_pos_embed_no_cls.shape[2],
-                                          device=old_pos_embed_no_cls.device)
-                    old_pos_embed_no_cls = torch.cat([old_pos_embed_no_cls, old_pad], dim=1)
-
-                # Pad new embeddings to square
-                new_pad_size = new_size * new_size - new_num_patches
-                if new_pad_size > 0:
-                    new_pad = torch.zeros(1, new_pad_size, new_pos_embed_no_cls.shape[2],
-                                          device=new_pos_embed_no_cls.device)
-                    new_pos_embed_no_cls = torch.cat([new_pos_embed_no_cls, new_pad], dim=1)
-
-                # Reshape to 2D grid
-                old_pos_embed_2d = old_pos_embed_no_cls.reshape(1, old_size, old_size, -1).permute(0, 3, 1, 2)
-                new_pos_embed_2d = new_pos_embed_no_cls.reshape(1, new_size, new_size, -1).permute(0, 3, 1, 2)
-
-                # Interpolate
-                interpolated = torch.nn.functional.interpolate(
-                    old_pos_embed_2d,
-                    size=(new_size, new_size),
-                    mode='bilinear',
-                    align_corners=False
-                )
-
-                # Reshape back
-                interpolated = interpolated.permute(0, 2, 3, 1).reshape(1, new_size * new_size, -1)
-
-                # Remove padding from interpolated result
-                if new_pad_size > 0:
-                    interpolated = interpolated[:, :new_num_patches, :]
-
-                # Add cls token back
-                cls_token = new_pos_embed[:, 0:1, :]
-                filtered['pos_embed'] = torch.cat([cls_token, interpolated], dim=1)
-
-        # Load state dict and report what was loaded
-        missing_keys, unexpected_keys = enc.load_state_dict(filtered, strict=False)
-        logger.info("Pretrained weights loaded into encoder")
-        logger.info(f"Loaded {len(filtered)} parameters")
-        logger.info(f"Missing keys: {len(missing_keys)}")
-        logger.info(f"Unexpected keys: {len(unexpected_keys)}")
-
-        # Debug: Check if LoRA parameters were loaded
-        lora_params_loaded = [k for k in filtered.keys() if k.startswith('lora_')]
-        logger.info(f"LoRA parameters loaded: {len(lora_params_loaded)}")
-        if lora_params_loaded:
-            logger.info(f"Sample LoRA params: {lora_params_loaded[:5]}")
+        # Handle different checkpoint formats
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        elif 'model' in checkpoint:
+            state_dict = checkpoint['model']
         else:
-            logger.warning("No LoRA parameters found in checkpoint!")
-            logger.info(f"Available parameter prefixes: {list(set([k.split('.')[0] for k in filtered.keys()]))}")
-            logger.info(f"First 10 loaded parameters: {list(filtered.keys())[:10]}")
-            logger.info(f"Total parameters in checkpoint: {len(filtered)}")
-    else:
-        logger.info("No pretrained checkpoint found; skipping load")
+            state_dict = checkpoint
+
+        # Filter encoder weights (exclude classification head)
+        encoder_state_dict = {}
+        for key, value in state_dict.items():
+            if not key.startswith('head.'):  # Exclude classification head
+                encoder_state_dict[key] = value
+
+        # Load weights
+        missing_keys, unexpected_keys = enc.load_state_dict(encoder_state_dict, strict=False)
+
+        if missing_keys:
+            print(f"Missing keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"Unexpected keys: {unexpected_keys}")
+
+        print("Pretrained weights loaded successfully")
+
+    except Exception as e:
+        print(f"Error loading pretrained weights: {e}")
 
 
-def freeze_lora_params(model: nn.Module):
-    """Freeze all parameters except LoRA."""
-    for p in model.parameters():
-        p.requires_grad = False
-    for n, p in model.named_parameters():
-        if 'lora_' in n:
-            p.requires_grad = True
+def freeze_lora_params(encoder: nn.Module):
+    """Freeze non-LoRA parameters in the encoder."""
+    print("Freezing non-LoRA parameters...")
+
+    for name, param in encoder.named_parameters():
+        if 'lora_' not in name:
+            param.requires_grad = False
+        else:
+            param.requires_grad = True
+            print(f"LoRA parameter {name} is trainable")
 
 
 def build_transforms():
-    """Build image transforms for patches."""
-    mean = [0.485, 0.456, 0.406]
-    std = [0.229, 0.224, 0.225]
+    """Build image transforms."""
     return transforms.Compose([
-        transforms.Resize((CONFIG['img_size_vit'], CONFIG['img_size_vit'])),  # Resize to ViT input size
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std)
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
 
 def evaluate_model(model: nn.Module, dataloader: DataLoader, device: torch.device) -> Dict[str, float]:
-    """Evaluate model and return metrics."""
+    """Evaluate the model and return metrics."""
     model.eval()
     all_labels = []
     all_probs = []
-    all_weights = []
 
     with torch.no_grad():
         for patches, labels, weights in dataloader:
             patches = patches.to(device)
             labels = labels.to(device)
-            weights = weights.to(device)
 
             logits = model(patches)
             probs = torch.softmax(logits, dim=1)
 
-            all_labels.append(labels.cpu().numpy())
-            all_probs.append(probs.cpu().numpy())
-            all_weights.append(weights.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
 
-    all_labels = np.concatenate(all_labels)
-    all_probs = np.concatenate(all_probs)
-    all_weights = np.concatenate(all_weights)
+    all_labels = np.array(all_labels)
+    all_probs = np.array(all_probs)
 
-    # Calculate weighted metrics
+    # Calculate metrics for each class
     aucs = []
     pr_aucs = []
     f1s = []
@@ -436,34 +456,44 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: torch.devic
         y_score = all_probs[:, c]
 
         try:
-            auc = roc_auc_score(y_true, y_score, sample_weight=all_weights)
-            pr_auc = average_precision_score(y_true, y_score, sample_weight=all_weights)
-            f1 = f1_score(y_true, np.argmax(all_probs, axis=1) == c, sample_weight=all_weights)
+            auc = roc_auc_score(y_true, y_score)
         except ValueError:
             auc = float('nan')
+
+        try:
+            pr_auc = average_precision_score(y_true, y_score)
+        except ValueError:
             pr_auc = float('nan')
+
+        try:
+            y_pred = (y_score > 0.5).astype(int)
+            f1 = f1_score(y_true, y_pred)
+        except ValueError:
             f1 = float('nan')
 
         aucs.append(auc)
         pr_aucs.append(pr_auc)
         f1s.append(f1)
 
+    # Calculate average metrics
+    avg_auc = np.nanmean(aucs)
+    avg_pr_auc = np.nanmean(pr_aucs)
+    avg_f1 = np.nanmean(f1s)
+
     return {
         'aucs': aucs,
         'pr_aucs': pr_aucs,
         'f1s': f1s,
-        'avg_auc': np.mean(aucs),
-        'avg_pr_auc': np.mean(pr_aucs),
-        'avg_f1': np.mean(f1s)
+        'avg_auc': avg_auc,
+        'avg_pr_auc': avg_pr_auc,
+        'avg_f1': avg_f1
     }
 
 
-def main():
-    """Main training function."""
-    print("? Retina Patch-Based LoRA Fine-Tuning on Messidor")
-    print(f"Configuration: {json.dumps(CONFIG, indent=2)}")
+def load_messidor_data():
+    """Load Messidor dataset with train/test split."""
+    print("Loading Messidor dataset...")
 
-    # Load Messidor dataset
     root = os.path.join(CONFIG['external_root'], 'messidor')
     img_dir = os.path.join(root, 'IMAGES')
     data_csv = os.path.join(root, 'messidor_data.csv')
@@ -503,6 +533,9 @@ def main():
     else:
         print(f"Image directory does not exist: {img_dir}")
 
+    # Binarize adjudicated_dr_grade
+    df['adjudicated_dr_grade'] = (df['adjudicated_dr_grade'] != 0).astype(int)
+
     # Create train/test split (80/20)
     np.random.seed(42)
     indices = np.random.permutation(len(df))
@@ -514,10 +547,91 @@ def main():
     test_df = df.iloc[test_indices].reset_index(drop=True)
 
     print(f"Train: {len(train_df)} samples, Test: {len(test_df)} samples")
+    print(f"Train label distribution: {train_df['adjudicated_dr_grade'].value_counts().sort_index().to_dict()}")
+    print(f"Test label distribution: {test_df['adjudicated_dr_grade'].value_counts().sort_index().to_dict()}")
+
+    return train_df, test_df, img_dir
+
+
+def load_idrid_data():
+    """Load IDRID dataset with predefined train/test split."""
+    print("Loading IDRID dataset...")
+
+    root = os.path.join(CONFIG['external_root'], 'IDRID', 'B. Disease Grading')
+    img_dir = os.path.join(root, '1. Original Images', 'a. Training Set')
+    train_csv = os.path.join(root, '2. Groundtruths', 'a. IDRiD_Disease Grading_Training Labels.csv')
+    test_csv = os.path.join(root, '2. Groundtruths', 'b. IDRiD_Disease Grading_Testing Labels.csv')
+
+    # Load and clean training data
+    df_train = pd.read_csv(train_csv)
+    df_train.columns = df_train.columns.str.strip()
+    df_train = df_train.loc[:, ~df_train.columns.str.contains('^Unnamed')]
+    df_train = df_train.dropna(axis=1, how='all')
+
+    # Load and clean test data
+    df_test = pd.read_csv(test_csv)
+    df_test.columns = df_test.columns.str.strip()
+    df_test = df_test.loc[:, ~df_test.columns.str.contains('^Unnamed')]
+    df_test = df_test.dropna(axis=1, how='all')
+
+    # Binarize labels
+    for df_split in [df_train, df_test]:
+        for col in ['Retinopathy grade', 'Risk of macular edema']:
+            if col in df_split.columns:
+                df_split[col] = (df_split[col] > 0).astype(int)
+
+    # Debug: Check label ranges
+    label_col = 'Retinopathy grade'
+    print(f"Training set label range: {df_train[label_col].min()} to {df_train[label_col].max()}")
+    print(f"Test set label range: {df_test[label_col].min()} to {df_test[label_col].max()}")
+    print(f"Training set label distribution: {df_train[label_col].value_counts().sort_index().to_dict()}")
+    print(f"Test set label distribution: {df_test[label_col].value_counts().sort_index().to_dict()}")
+
+    # Ensure labels are in correct range (0 to n_classes-1)
+    for df_split, split_name in [(df_train, 'train'), (df_test, 'test')]:
+        if df_split[label_col].min() < 0 or df_split[label_col].max() >= 2:
+            print(f"Warning: {split_name} set has labels outside [0,1] range. Fixing...")
+            df_split[label_col] = df_split[label_col].clip(0, 1).astype(int)
+            print(
+                f"After fixing: {split_name} set label range: {df_split[label_col].min()} to {df_split[label_col].max()}")
+
+    print("Using IDRID's predefined train/test splits")
+
+    return df_train, df_test, img_dir
+
+
+def main():
+    """Main training function."""
+    parser = argparse.ArgumentParser(description='Retina Patch-Based LoRA Fine-Tuning')
+    parser.add_argument('--dataset', type=str, choices=['messidor', 'idrid'], required=True,
+                        help='Dataset to use for training')
+    parser.add_argument('--epochs', type=int, default=30, help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+
+    args = parser.parse_args()
+
+    # Update config with command line arguments
+    CONFIG['epochs'] = args.epochs
+    CONFIG['lr'] = args.lr
+    CONFIG['batch_size'] = args.batch_size
+
+    print(f"? Retina Patch-Based LoRA Fine-Tuning on {args.dataset.upper()}")
+    print(f"Configuration: {json.dumps(CONFIG, indent=2)}")
+
+    # Load dataset based on selection
+    if args.dataset == 'messidor':
+        train_df, test_df, img_dir = load_messidor_data()
+        DatasetClass = MessidorPatchDataset
+    elif args.dataset == 'idrid':
+        train_df, test_df, img_dir = load_idrid_data()
+        DatasetClass = IDRIDPatchDataset
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
 
     # Create patch extractor
     patch_extractor = PatchExtractor(
-        patch_size=CONFIG['patch_size'],
+        patch_size=CONFIG['patch_size_extract'],
         stride=CONFIG['stride']
     )
 
@@ -525,8 +639,8 @@ def main():
     transform = build_transforms()
 
     # Create datasets
-    train_dataset = MessidorPatchDataset(train_df, img_dir, transform, patch_extractor)
-    test_dataset = MessidorPatchDataset(test_df, img_dir, transform, patch_extractor)
+    train_dataset = DatasetClass(train_df, img_dir, transform, patch_extractor)
+    test_dataset = DatasetClass(test_df, img_dir, transform, patch_extractor)
 
     # Create dataloaders
     train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'],
@@ -544,6 +658,11 @@ def main():
 
     # Freeze non-LoRA parameters
     freeze_lora_params(encoder)
+
+    # Ensure classification head is trainable
+    for name, param in classifier.named_parameters():
+        param.requires_grad = True
+        print(f"Classification head parameter {name} is trainable")
 
     # Count trainable parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -567,11 +686,15 @@ def main():
     best_auc = 0.0
     epoch_logs = []
 
+    print(f"\nStarting training for {CONFIG['epochs']} epochs...")
+    print("=" * 80)
+
     for epoch in range(CONFIG['epochs']):
         model.train()
         epoch_loss = 0.0
         num_batches = 0
 
+        # Training phase
         for batch_idx, (patches, labels, weights) in enumerate(train_loader):
             patches = patches.to(DEVICE)
             labels = labels.to(DEVICE)
@@ -591,15 +714,21 @@ def main():
             epoch_loss += weighted_loss.item()
             num_batches += 1
 
-        avg_loss = epoch_loss / num_batches
+        avg_train_loss = epoch_loss / num_batches
 
-        # Evaluate on test set
+        # Evaluate on train set (for monitoring)
+        train_metrics = evaluate_model(model, train_loader, DEVICE)
+
+        # Evaluate on test set (proper evaluation)
         test_metrics = evaluate_model(model, test_loader, DEVICE)
 
         # Log epoch performance
         epoch_log = {
             'epoch': epoch + 1,
-            'train_loss': avg_loss,
+            'train_loss': avg_train_loss,
+            'train_auc': train_metrics['avg_auc'],
+            'train_pr_auc': train_metrics['avg_pr_auc'],
+            'train_f1': train_metrics['avg_f1'],
             'test_auc': test_metrics['avg_auc'],
             'test_pr_auc': test_metrics['avg_pr_auc'],
             'test_f1': test_metrics['avg_f1'],
@@ -612,11 +741,12 @@ def main():
         }
         epoch_logs.append(epoch_log)
 
+        # Print comprehensive epoch results
         print(f"Epoch {epoch + 1}/{CONFIG['epochs']}:")
-        print(f"  Train Loss: {avg_loss:.4f}")
-        print(f"  Test AUC: {test_metrics['avg_auc']:.4f}")
-        print(f"  Test PR AUC: {test_metrics['avg_pr_auc']:.4f}")
-        print(f"  Test F1: {test_metrics['avg_f1']:.4f}")
+        print(f"  Train Loss: {avg_train_loss:.4f}")
+        print(f"  Train AUC: {train_metrics['avg_auc']:.4f} | Test AUC: {test_metrics['avg_auc']:.4f}")
+        print(f"  Train PR AUC: {train_metrics['avg_pr_auc']:.4f} | Test PR AUC: {test_metrics['avg_pr_auc']:.4f}")
+        print(f"  Train F1: {train_metrics['avg_f1']:.4f} | Test F1: {test_metrics['avg_f1']:.4f}")
         print(f"  Test AUC (Class 0): {test_metrics['aucs'][0]:.4f}")
         print(f"  Test AUC (Class 1): {test_metrics['aucs'][1]:.4f}")
         print(f"  Test PR AUC (Class 0): {test_metrics['pr_aucs'][0]:.4f}")
@@ -624,7 +754,7 @@ def main():
         print(f"  Test F1 (Class 0): {test_metrics['f1s'][0]:.4f}")
         print(f"  Test F1 (Class 1): {test_metrics['f1s'][1]:.4f}")
 
-        # Save best model
+        # Save best model based on test AUC
         if test_metrics['avg_auc'] > best_auc:
             best_auc = test_metrics['avg_auc']
             torch.save({
@@ -633,23 +763,24 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_auc': best_auc,
                 'config': CONFIG
-            }, os.path.join(OUTPUT_DIRS['checkpoints'], 'best_model.pth'))
-            print(f"  ? New best model! AUC: {best_auc:.4f}")
-        print()
+            }, os.path.join(OUTPUT_DIRS['checkpoints'], f'best_model_{args.dataset}.pth'))
+            print(f"  ? New best model! Test AUC: {best_auc:.4f}")
+        print("-" * 80)
 
     print(f"\nTraining completed! Best test AUC: {best_auc:.4f}")
 
     # Save performance log
     performance_log = {
+        'dataset': args.dataset,
         'config': CONFIG,
         'best_auc': best_auc,
         'epochs': epoch_logs
     }
 
-    with open(os.path.join(OUTPUT_DIRS['results'], 'performance_log.json'), 'w') as f:
+    with open(os.path.join(OUTPUT_DIRS['results'], f'performance_log_{args.dataset}.json'), 'w') as f:
         json.dump(performance_log, f, indent=2)
 
-    print(f"Performance log saved to {os.path.join(OUTPUT_DIRS['results'], 'performance_log.json')}")
+    print(f"Performance log saved to {os.path.join(OUTPUT_DIRS['results'], f'performance_log_{args.dataset}.json')}")
 
 
 if __name__ == '__main__':

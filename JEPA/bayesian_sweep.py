@@ -153,9 +153,10 @@ def run_single_experiment(config: Dict[str, Any], strategy: str, experiment_id: 
     """Run a single experiment with given config."""
 
     print(f"\n{'=' * 80}")
-    print(f"? Experiment {experiment_id}: {strategy}")
+    print(f"Experiment {experiment_id}: {strategy}")
     print(f"Config: {json.dumps(config, indent=2)}")
     print(f"{'=' * 80}")
+    print(f"Starting experiment at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Create temporary config file
     config_file = f"temp_config_{strategy}_{experiment_id}_{int(time.time())}.json"
@@ -174,6 +175,7 @@ def run_single_experiment(config: Dict[str, Any], strategy: str, experiment_id: 
         ]
 
         print(f"Running: {' '.join(cmd)}")
+        print(f"Process started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         # Run with real-time output
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
@@ -195,6 +197,9 @@ def run_single_experiment(config: Dict[str, Any], strategy: str, experiment_id: 
             stdout='\n'.join(output_lines),
             stderr=''
         )
+
+        print(
+            f"Process completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} with return code: {result.returncode}")
 
         # Parse results
         experiment_result = {
@@ -222,7 +227,7 @@ def run_single_experiment(config: Dict[str, Any], strategy: str, experiment_id: 
                         experiment_result['test_auc'] = (auc_0 + auc_1) / 2
                         print(f"Test AUC: {experiment_result['test_auc']:.4f}")
                     except:
-                        pass
+                        print(f"Could not parse Test AUC from line: {line}")
                 elif 'Train ROC AUC - Class 0:' in line:
                     try:
                         parts = line.split(',')
@@ -231,7 +236,7 @@ def run_single_experiment(config: Dict[str, Any], strategy: str, experiment_id: 
                         experiment_result['train_auc'] = (auc_0 + auc_1) / 2
                         print(f"Train AUC: {experiment_result['train_auc']:.4f}")
                     except:
-                        pass
+                        print(f"Could not parse Train AUC from line: {line}")
         else:
             print(f"Experiment failed with return code {result.returncode}")
             print(f"Error: {result.stderr}")
@@ -315,22 +320,18 @@ def run_bayesian_sweep(strategy: str, num_runs: int = 30, start_run: int = 1):
         for key, value in best_result['config'].items():
             print(f"  {key}: {value}")
 
-        # Save final results
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        final_results_file = f"final_bayesian_sweep_{strategy}_runs{start_run}-{start_run + num_runs - 1}_{timestamp}.json"
-        with open(final_results_file, 'w') as f:
-            json.dump({
-                'strategy': strategy,
-                'start_run': start_run,
-                'end_run': start_run + num_runs - 1,
-                'total_runs': len(results),
-                'successful_runs': len(valid_results),
-                'best_result': best_result,
-                'all_results': results,
-                'total_time': time.time() - start_time
-            }, f, indent=2)
+        # Save best parameters to simple JSON
+        best_params = {
+            'strategy': strategy,
+            'best_test_auc': best_result['test_auc'],
+            'best_train_auc': best_result['train_auc'],
+            'parameters': best_result['config']
+        }
 
-        print(f"\nResults saved to: {final_results_file}")
+        with open('best_parameters.json', 'w') as f:
+            json.dump(best_params, f, indent=2)
+
+        print(f"\nBest parameters saved to: best_parameters.json")
     else:
         print(f"\nNo successful experiments for {strategy}")
 
