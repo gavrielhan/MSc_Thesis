@@ -47,7 +47,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 CONFIG = {
-    'img_size': (616, 616),
+    'img_size': (448, 448),  # Changed to match new patch size
     'patch_size': 14,
     'embed_dim': 1280,
     'depth': 32,
@@ -63,8 +63,8 @@ CONFIG = {
     'epochs': 20,
     'external_root': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/external_datasets',
     'checkpoint_path': '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_retina_finetune.pth',
-    'patch_size_extract': 224,
-    'stride': 200,
+    'patch_size_extract': 448,  # Increased from 224 to reduce number of patches
+    'stride': 400,  # Increased from 200 to reduce overlap
 }
 
 logging.basicConfig(
@@ -605,7 +605,7 @@ def main():
     parser = argparse.ArgumentParser(description='Retina Patch-Based LoRA Fine-Tuning')
     parser.add_argument('--dataset', type=str, choices=['messidor', 'idrid'], required=True,
                         help='Dataset to use for training')
-    parser.add_argument('--epochs', type=int, default=30, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
 

@@ -1105,32 +1105,6 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
                         "train_pr_auc_class_1": train_pr_aucs[1],
                     })
 
-                # Early stopping check (stop if validation AUC hasn't improved for 5 epochs)
-                if len(train_losses) > 5:
-                    # Check if validation performance is improving
-                    if 'best_val_auc' not in locals():
-                        best_val_auc = 0
-                        patience_counter = 0
-
-                    current_val_auc = np.mean(aucs)  # Average AUC across classes
-                    if current_val_auc > best_val_auc:
-                        best_val_auc = current_val_auc
-                        patience_counter = 0
-                    else:
-                        patience_counter += 1
-
-                    # Also check for overfitting (train improving but test degrading)
-                    if len(train_losses) > 10:
-                        if train_avg_auc > 0.8 and test_avg_auc < best_val_auc - 0.05:
-                            print(f"Early stopping at epoch {epoch} - overfitting detected!")
-                            print(
-                                f"Train AUC: {train_avg_auc:.4f}, Test AUC: {test_avg_auc:.4f}, Best Test AUC: {best_val_auc:.4f}")
-                            break
-
-                    if patience_counter >= 5:
-                        print(f"Early stopping at epoch {epoch} - validation AUC not improving for 5 epochs")
-                        print(f"Best validation AUC: {best_val_auc:.4f}")
-                        break
                 head_lr = optimizer.param_groups[1]['lr']
                 print(
                     f"{strategy_select['name']} Fold {fold} Epoch {epoch} Train Loss: {train_loss:.4f} LoRA_LR: {lora_lr:.2e} Head_LR: {head_lr:.2e}")
