@@ -47,7 +47,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 CONFIG = {
-    'img_size': (448, 448),  # Changed to match new patch size
+    'img_size': (616, 616),  # Match the checkpoint's expected input size
     'patch_size': 14,
     'embed_dim': 1280,
     'depth': 32,
@@ -420,7 +420,7 @@ def freeze_lora_params(encoder: nn.Module):
 def build_transforms():
     """Build image transforms."""
     return transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize((616, 616)),  # Resize to match Vision Transformer input
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
