@@ -331,7 +331,33 @@ def run_bayesian_sweep(strategy: str, num_runs: int = 30, start_run: int = 1):
         with open('best_parameters.json', 'w') as f:
             json.dump(best_params, f, indent=2)
 
+        # Save all results with test metrics for comparison
+        all_results_summary = {
+            'strategy': strategy,
+            'total_runs': len(results),
+            'successful_runs': len(valid_results),
+            'best_result': best_params,
+            'all_results': [
+                {
+                    'experiment_id': r['experiment_id'],
+                    'test_auc': r.get('test_auc'),
+                    'train_auc': r.get('train_auc'),
+                    'config': r['config'],
+                    'timestamp': r.get('timestamp', ''),
+                    'success': r.get('test_auc') is not None
+                }
+                for r in results
+            ]
+        }
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        summary_file = f"bayesian_sweep_summary_{strategy}_{timestamp}.json"
+        with open(summary_file, 'w') as f:
+            json.dump(all_results_summary, f, indent=2)
+
         print(f"\nBest parameters saved to: best_parameters.json")
+        print(f"Complete results summary saved to: {summary_file}")
+        print(f"Summary includes {len(valid_results)} successful runs out of {len(results)} total runs")
     else:
         print(f"\nNo successful experiments for {strategy}")
 

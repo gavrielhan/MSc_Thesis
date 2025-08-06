@@ -63,8 +63,8 @@ CONFIG = {
     'epochs': 20,
     'external_root': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/external_datasets',
     'checkpoint_path': '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_retina_finetune.pth',
-    'patch_size_extract': 448,  # Increased from 224 to reduce number of patches
-    'stride': 400,  # Increased from 200 to reduce overlap
+    'patch_size_extract': 800,  # Much larger patches to dramatically reduce count
+    'stride': 800,  # No overlap for maximum speed
 }
 
 logging.basicConfig(
@@ -433,7 +433,8 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: torch.devic
     all_probs = []
 
     with torch.no_grad():
-        for patches, labels, weights in dataloader:
+        eval_pbar = tqdm(dataloader, desc="Evaluating", leave=False)
+        for patches, labels, weights in eval_pbar:
             patches = patches.to(device)
             labels = labels.to(device)
 
@@ -694,8 +695,12 @@ def main():
         epoch_loss = 0.0
         num_batches = 0
 
-        # Training phase
-        for batch_idx, (patches, labels, weights) in enumerate(train_loader):
+        print(f"\nEpoch {epoch + 1}/{CONFIG['epochs']} - Training Phase")
+        print(f"Training on {len(train_loader)} batches...")
+
+        # Training phase with progress bar
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1} Training", leave=False)
+        for batch_idx, (patches, labels, weights) in enumerate(train_pbar):
             patches = patches.to(DEVICE)
             labels = labels.to(DEVICE)
             weights = weights.to(DEVICE)
@@ -714,21 +719,22 @@ def main():
             epoch_loss += weighted_loss.item()
             num_batches += 1
 
+            # Update progress bar with current loss
+            train_pbar.set_postfix({
+                'Loss': f'{weighted_loss.item():.4f}',
+                'Batch': f'{batch_idx + 1}/{len(train_loader)}'
+            })
+
         avg_train_loss = epoch_loss / num_batches
 
-        # Evaluate on train set (for monitoring)
-        train_metrics = evaluate_model(model, train_loader, DEVICE)
-
-        # Evaluate on test set (proper evaluation)
+        # Evaluate on test set only
+        print(f"Evaluating on test set ({len(test_loader)} batches)...")
         test_metrics = evaluate_model(model, test_loader, DEVICE)
 
         # Log epoch performance
         epoch_log = {
             'epoch': epoch + 1,
             'train_loss': avg_train_loss,
-            'train_auc': train_metrics['avg_auc'],
-            'train_pr_auc': train_metrics['avg_pr_auc'],
-            'train_f1': train_metrics['avg_f1'],
             'test_auc': test_metrics['avg_auc'],
             'test_pr_auc': test_metrics['avg_pr_auc'],
             'test_f1': test_metrics['avg_f1'],
@@ -744,9 +750,9 @@ def main():
         # Print comprehensive epoch results
         print(f"Epoch {epoch + 1}/{CONFIG['epochs']}:")
         print(f"  Train Loss: {avg_train_loss:.4f}")
-        print(f"  Train AUC: {train_metrics['avg_auc']:.4f} | Test AUC: {test_metrics['avg_auc']:.4f}")
-        print(f"  Train PR AUC: {train_metrics['avg_pr_auc']:.4f} | Test PR AUC: {test_metrics['avg_pr_auc']:.4f}")
-        print(f"  Train F1: {train_metrics['avg_f1']:.4f} | Test F1: {test_metrics['avg_f1']:.4f}")
+        print(f"  Test AUC: {test_metrics['avg_auc']:.4f}")
+        print(f"  Test PR AUC: {test_metrics['avg_pr_auc']:.4f}")
+        print(f"  Test F1: {test_metrics['avg_f1']:.4f}")
         print(f"  Test AUC (Class 0): {test_metrics['aucs'][0]:.4f}")
         print(f"  Test AUC (Class 1): {test_metrics['aucs'][1]:.4f}")
         print(f"  Test PR AUC (Class 0): {test_metrics['pr_aucs'][0]:.4f}")
