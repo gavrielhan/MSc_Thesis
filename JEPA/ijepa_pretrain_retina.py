@@ -235,7 +235,7 @@ def save_loss_plot(train_losses, val_losses, epochs, filename, config, stage):
 def save_checkpoint(state, train_losses, val_losses, epoch_list, config, stage, filename=CHECKPOINT_PATH):
     torch.save(state, filename)
     logger.info(f"Checkpoint saved to {filename}")
-    save_loss_plot(train_losses, val_losses, epoch_list, 'checkpoint_pretrain_loss.png', config, stage)
+    save_loss_plot(train_losses, val_losses, epoch_list, 'outputs/images/checkpoint_pretrain_loss.png', config, stage)
     logger.info("Checkpoint loss plot saved to checkpoint_pretrain_loss.png")
 
 
