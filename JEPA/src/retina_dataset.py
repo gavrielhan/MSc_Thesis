@@ -53,16 +53,39 @@ def make_retina_dataset(
         rank=rank
     )
 
-    data_loader = DataLoader(
-        dataset,
-        collate_fn=collator,
-        sampler=dist_sampler,
-        batch_size=batch_size,
-        drop_last=drop_last,
-        pin_memory=pin_mem,
-        num_workers=num_workers,
-        persistent_workers=False
-    )
+    # Use the original collator (mask_collator) which handles both images and masks
+    # For batch_size=1, we need to ensure proper batching
+    if batch_size == 1:
+        # Custom collate that ensures proper batch format for mask collator
+        def single_batch_collate(batch):
+            # batch should be a list with one item
+            if len(batch) == 1:
+                # Return the single item as a batch
+                return [batch[0]]
+            else:
+                return batch
+
+        data_loader = DataLoader(
+            dataset,
+            collate_fn=lambda x: collator(single_batch_collate(x)),
+            sampler=dist_sampler,
+            batch_size=batch_size,
+            drop_last=drop_last,
+            pin_memory=pin_mem,
+            num_workers=num_workers,
+            persistent_workers=False
+        )
+    else:
+        data_loader = DataLoader(
+            dataset,
+            collate_fn=collator,  # This is the mask_collator that creates masks
+            sampler=dist_sampler,
+            batch_size=batch_size,
+            drop_last=drop_last,
+            pin_memory=pin_mem,
+            num_workers=num_workers,
+            persistent_workers=False
+        )
     logger.info('Retina unsupervised data loader created')
 
     return dataset, data_loader, dist_sampler
@@ -129,13 +152,13 @@ class RetinaDataset(Dataset):
             od_img = Image.open(od_path).convert('RGB')
         except:
             logger.warning(f"Could not load OD image: {od_path}")
-            od_img = Image.new('RGB', (616, 616), 'black')
+            od_img = Image.new('RGB', (224, 224), 'black')
 
         try:
             os_img = Image.open(os_path).convert('RGB')
         except:
             logger.warning(f"Could not load OS image: {os_path}")
-            os_img = Image.new('RGB', (616, 616), 'black')
+            os_img = Image.new('RGB', (224, 224), 'black')
 
         # Apply transforms
         if self.transform:
@@ -145,7 +168,8 @@ class RetinaDataset(Dataset):
             od_tensor = torch.from_numpy(np.array(od_img)).permute(2, 0, 1).float() / 255.0
             os_tensor = torch.from_numpy(np.array(os_img)).permute(2, 0, 1).float() / 255.0
 
-        # Concatenate OD and OS channels (6 channels total)
-        combined = torch.cat([od_tensor, os_tensor], dim=0)
-
-        return combined
+        # For I-JEPA pretraining, use only OD image (3 channels)
+        # The model expects (C, H, W) format with 3 channels
+        # Return the tensor in the format expected by the mask collator
+        # The mask collator will handle batching and create masks
+        return od_tensor  # (C, H, W)

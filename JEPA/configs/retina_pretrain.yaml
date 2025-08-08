@@ -1,10 +1,10 @@
 data:
-  batch_size: 1  # Memory constraint for retinal images
+  batch_size: 1  # Small batch size for retinal images
   color_jitter_strength: 0.0
   crop_scale:
   - 0.8
   - 1.0
-  crop_size: 616  # Retinal image size
+  crop_size: 224  # Match the pretrained model's expected size
   image_folder: /home/gavrielh/PycharmProjects/MSc_Thesis/JEPA  # Required by I-JEPA
   num_workers: 0  # Avoid multiprocessing issues
   pin_mem: true
@@ -37,17 +37,21 @@ meta:
   model_name: vit_huge
   pred_depth: 6  # Smaller predictor for efficiency
   pred_emb_dim: 384
-  read_checkpoint: /home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN1K-vit.h.14-300e.pth.tar  # Path to ImageNet pretrained model
+  read_checkpoint: /home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN22K-vit.h.14-900e.pth.tar  # Path to ImageNet pretrained model
   use_bfloat16: true
 optimization:
   ema:
   - 0.996
   - 1.0
   epochs: 100  # Fewer epochs for retinal domain
-  final_lr: 1.0e-06
+  final_lr: 5.0e-06  # Less aggressive decay - keep LR higher longer
   final_weight_decay: 0.4
   ipe_scale: 1.0
-  lr: 1.0e-05  # Lower learning rate for stability
+  lr: 2.0e-05  # Higher initial learning rate for medical domain
   start_lr: 1.0e-06
   warmup: 10
   weight_decay: 0.01
+  # Early stopping configuration
+  early_stopping:
+    patience: 10      # Stop after N epochs without improvement
+    min_delta: 1.0e-04  # Minimum improvement threshold
