@@ -333,16 +333,59 @@ def build_encoder(config):
 def load_pretrained_encoder(enc, ckpt_path):
     if ckpt_path and os.path.isfile(ckpt_path):
         state = torch.load(ckpt_path, map_location=DEVICE)
-        enc_state = state.get('enc', state)
+        # Detect encoder state dict inside common wrappers
+        if isinstance(state, dict):
+            if 'enc' in state and isinstance(state['enc'], dict):
+                enc_state = state['enc']
+            elif 'encoder' in state and isinstance(state['encoder'], dict):
+                enc_state = state['encoder']
+            elif 'model' in state and isinstance(state['model'], dict):
+                enc_state = state['model']
+            elif 'state_dict' in state and isinstance(state['state_dict'], dict):
+                enc_state = state['state_dict']
+            else:
+                enc_state = state
+        else:
+            enc_state = state
 
-        # Load ALL parameters including LoRA parameters
-        # The encoder state dict contains all parameters including LoRA
-        filtered = enc_state
+        # Strip possible DistributedDataParallel 'module.' prefix
+        def strip_module_prefix(sd):
+            return {(k[7:] if k.startswith('module.') else k): v for k, v in sd.items()}
 
-        # Handle input channel mismatch
+        if isinstance(enc_state, dict):
+            enc_state = strip_module_prefix(enc_state)
+
+        # Remap linear param keys when loading into LoRA-wrapped encoder
+        remapped = {}
+        for k, v in enc_state.items():
+            k2 = k
+            if '.attn.qkv.weight' in k2:
+                k2 = k2.replace('.attn.qkv.weight', '.attn.qkv.linear.weight')
+            if '.attn.qkv.bias' in k2:
+                k2 = k2.replace('.attn.qkv.bias', '.attn.qkv.linear.bias')
+            if '.attn.proj.weight' in k2:
+                k2 = k2.replace('.attn.proj.weight', '.attn.proj.linear.weight')
+            if '.attn.proj.bias' in k2:
+                k2 = k2.replace('.attn.proj.bias', '.attn.proj.linear.bias')
+            remapped[k2] = v
+
+        # Filter to encoder keys only (ignore predictor/optimizer/etc.)
+        enc_keys = set(enc.state_dict().keys())
+        filtered = {k: v for k, v in remapped.items() if
+                    k in enc_keys or k == 'patch_embed.proj.weight' or k == 'pos_embed'}
+
+        # Handle input channel mismatch (6->3): average OD and OS halves
         w = filtered.get('patch_embed.proj.weight')
         if w is not None and w.shape[1] == 6 and enc.patch_embed.proj.weight.shape[1] == 3:
-            filtered['patch_embed.proj.weight'] = w[:, :3]
+            filtered['patch_embed.proj.weight'] = 0.5 * (w[:, 0:3, :, :] + w[:, 3:6, :, :])
+
+        # Handle pos_embed length mismatch by dropping it (use model's own grid)
+        pe = filtered.get('pos_embed')
+        if pe is not None and hasattr(enc, 'pos_embed'):
+            if pe.shape != enc.pos_embed.shape:
+                logger.info(
+                    f"Dropping checkpoint pos_embed with shape {tuple(pe.shape)}; model expects {tuple(enc.pos_embed.shape)}")
+                filtered.pop('pos_embed', None)
 
         # Load state dict and report what was loaded
         missing_keys, unexpected_keys = enc.load_state_dict(filtered, strict=False)
@@ -351,16 +394,13 @@ def load_pretrained_encoder(enc, ckpt_path):
         logger.info(f"Missing keys: {len(missing_keys)}")
         logger.info(f"Unexpected keys: {len(unexpected_keys)}")
 
-        # Debug: Check if LoRA parameters were loaded
+        # Debug: Check if LoRA parameters were loaded (should be zero for non-LoRA checkpoints)
         lora_params_loaded = [k for k in filtered.keys() if k.startswith('lora_')]
         logger.info(f"LoRA parameters loaded: {len(lora_params_loaded)}")
         if lora_params_loaded:
             logger.info(f"Sample LoRA params: {lora_params_loaded[:5]}")
         else:
-            logger.warning("No LoRA parameters found in checkpoint!")
-            logger.info(f"Available parameter prefixes: {list(set([k.split('.')[0] for k in filtered.keys()]))}")
-            logger.info(f"First 10 loaded parameters: {list(filtered.keys())[:10]}")
-            logger.info(f"Total parameters in checkpoint: {len(filtered)}")
+            logger.info("No LoRA parameters in checkpoint (expected for non-LoRA pretrain)")
     else:
         logger.info("No pretrained checkpoint found; skipping load")
 
@@ -439,7 +479,7 @@ STRATEGIES = [
 # 1: imagenet_finetune
 # 2: retina_pretrain_finetune
 # 3: retina_feature_knn
-STRATEGY_INDEX = 0  # Change this to select different strategies
+STRATEGY_INDEX = 2  # Change this to select different strategies
 
 
 # ---------- Utility: Save/Load Results ----------
@@ -1404,7 +1444,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='LoRA Fine-tuning with Cross-dataset Evaluation')
     parser.add_argument('--config', type=str, help='Path to config JSON file')
     parser.add_argument('--strategy', type=str,
-                        choices=['retina_feature_finetune', 'imagenet_finetune', 'scratch'],
+                        choices=['retina_feature_finetune', 'imagenet_finetune', 'retina_pretrain_finetune',
+                                 'retina_feature_knn', 'scratch'],
                         help='Strategy to use')
     parser.add_argument('--fold', type=int, default=0, help='Fold number')
     parser.add_argument('--sweep_mode', action='store_true', help='Run in sweep mode')

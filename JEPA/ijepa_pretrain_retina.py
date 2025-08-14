@@ -21,6 +21,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import time
 import inspect
+import copy
 
 # Import IJepa and optional loader
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "ijepa")))
@@ -46,7 +47,7 @@ CONFIG['epochs'] = 100
 CONFIG['num_workers'] = 0
 CONFIG['batch_size'] = 1
 CONFIG['use_lora'] = False  # Ensure LoRA is not used during pretraining
-CONFIG['lr'] = 1e-5  # Lower learning rate for stability
+CONFIG['lr'] = 5.0e-5  # Lower learning rate for stability
 print("Batch size:", CONFIG['batch_size'])
 
 logging.basicConfig(
@@ -101,6 +102,41 @@ def build_transforms(mean, std):
         transforms.ToTensor(),
         transforms.Normalize(mean, std)
     ])
+
+
+def sanity_check_black_images(paths, sample_size=200, threshold=10.0):
+    """Sample up to sample_size pairs and check mean brightness.
+    threshold is in [0,255] scale; below means "very dark/black".
+    """
+    total_checked = 0
+    black_count = 0
+    examples = []
+    for i, (od_path, os_path) in enumerate(paths[:sample_size]):
+        try:
+            od = Image.open(od_path).convert('RGB')
+            os_ = Image.open(os_path).convert('RGB')
+            od_mean = np.array(od).mean()
+            os_mean = np.array(os_).mean()
+            total_checked += 2
+            if od_mean < threshold:
+                black_count += 1
+                if len(examples) < 3:
+                    examples.append(od_path)
+            if os_mean < threshold:
+                black_count += 1
+                if len(examples) < 3:
+                    examples.append(os_path)
+        except Exception:
+            # Treat unreadable images as black
+            black_count += 2
+            total_checked += 2
+    pct = (black_count / max(1, total_checked)) * 100.0
+    logger.info(f"[SANITY] Checked {total_checked} eyes; black/dark: {black_count} ({pct:.1f}%).")
+    if examples:
+        logger.info(f"[SANITY] Example dark files: {examples}")
+    if pct > 50.0:
+        logger.warning("[SANITY] More than 50% of sampled images are very dark; please verify dataset paths and preprocessing.")
+    return pct
 
 
 def build_encoder_and_predictor(config):
@@ -200,18 +236,25 @@ def build_masked_dataloaders(paths, transform, config):
 # ---------- Checkpoint Utilities ----------
 CHECKPOINT_PATH = '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_pretrain_newrun.pth'
 MAX_TRAIN_SECONDS = 11.5 * 3600  # 11.5 hours in seconds
+os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
+
+IMAGES_DIR = 'outputs/images'
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
 
 def get_grad_scaler():
     amp_grad_scaler = getattr(getattr(torch, 'amp', None), 'GradScaler', None)
+    # If bfloat16 is supported, we won't use GradScaler (not needed for bf16)
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return None
+    # Otherwise (fp32 or fp16), return a GradScaler if available
     if amp_grad_scaler is not None:
         sig = inspect.signature(amp_grad_scaler)
         if 'device_type' in sig.parameters:
             return amp_grad_scaler(device_type='cuda')
         else:
             return amp_grad_scaler()
-    else:
-        return torch.cuda.amp.GradScaler()
+    return torch.cuda.amp.GradScaler()
 
 
 def save_loss_plot(train_losses, val_losses, epochs, filename, config, stage):
@@ -235,7 +278,7 @@ def save_loss_plot(train_losses, val_losses, epochs, filename, config, stage):
 def save_checkpoint(state, train_losses, val_losses, epoch_list, config, stage, filename=CHECKPOINT_PATH):
     torch.save(state, filename)
     logger.info(f"Checkpoint saved to {filename}")
-    save_loss_plot(train_losses, val_losses, epoch_list, 'outputs/images/checkpoint_pretrain_loss.png', config, stage)
+    save_loss_plot(train_losses, val_losses, epoch_list, os.path.join(IMAGES_DIR, 'checkpoint_pretrain_loss.png'), config, stage)
     logger.info("Checkpoint loss plot saved to checkpoint_pretrain_loss.png")
 
 
@@ -247,6 +290,7 @@ def load_checkpoint(filename=CHECKPOINT_PATH):
 
 
 def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch=1, elapsed_time=0):
+    import signal
     # Debug: print which parameters do not require grad
     for name, param in enc.named_parameters():
         if not param.requires_grad:
@@ -261,6 +305,34 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=config['epochs'])
     scaler = get_grad_scaler()
+    # Create EMA target encoder
+    target_enc = copy.deepcopy(enc).to(DEVICE)
+    for p in target_enc.parameters():
+        p.requires_grad = False
+    ema_momentum = 0.99
+    # Periodic time-based checkpointing (every 30 minutes)
+    time_ckpt_interval = 2 * 3600
+    last_time_ckpt = time.time()
+    def write_time_checkpoint(epoch_completed):
+        torch.save({
+            'enc': enc.state_dict(),
+            'pred': pred.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scaler': None if scaler is None else scaler.state_dict(),
+            'epoch': epoch_completed,
+            'stage': 'pretrain',
+        }, CHECKPOINT_PATH)
+        logger.info(f"Checkpoint overwritten at {CHECKPOINT_PATH}")
+    # Save on SIGTERM
+    def _handle_sigterm(signum, frame):
+        logger.info("SIGTERM received: saving last checkpoint and exiting")
+        write_time_checkpoint(max(start_epoch, 1)-1)
+        sys.exit(0)
+    try:
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    except Exception:
+        pass
     best_val = float('inf')
     masked_train_losses, masked_val_losses = [], []
     start_time = time.time()
@@ -283,18 +355,21 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                 print(f"Inf detected in input images at batch {i}!")
             if torch.isnan(imgs).any():
                 print(f"NaN detected in input images at batch {i}!")
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(torch.cuda.is_available() and torch.cuda.is_bf16_supported())):
                 z = enc(imgs, m_enc)
                 out = pred(z, m_enc, m_pred)
                 if torch.isnan(out).any():
                     print(f"NaN detected in model output at batch {i}!")
                 with torch.no_grad():
-                    h = F.layer_norm(enc(imgs), (z.size(-1),))
+                    h = F.layer_norm(target_enc(imgs), (z.size(-1),))
                     t = apply_masks(h, m_pred).repeat(len(m_enc), 1, 1)
-                loss = F.mse_loss(out, t) / accum_steps
+                loss = F.smooth_l1_loss(out, t) / accum_steps
                 if torch.isnan(loss):
                     print(f"NaN detected in loss at batch {i}!")
-            scaler.scale(loss).backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             # 5. Check for NaNs in gradients
             for name, param in enc.named_parameters():
                 if param.grad is not None and torch.isnan(param.grad).any():
@@ -308,9 +383,16 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                 # Add gradient clipping
                 torch.nn.utils.clip_grad_norm_(enc.parameters(), max_norm=1.0)
                 torch.nn.utils.clip_grad_norm_(pred.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 optimizer.zero_grad()
+                # EMA update for target encoder
+                with torch.no_grad():
+                    for p_online, p_target in zip(enc.parameters(), target_enc.parameters()):
+                        p_target.data.mul_(ema_momentum).add_((1 - ema_momentum) * p_online.data)
             # Check for time limit
             total_elapsed = elapsed_time + (time.time() - start_time)
             if total_elapsed >= MAX_TRAIN_SECONDS:
@@ -321,7 +403,7 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                     'pred': pred.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
-                    'scaler': scaler.state_dict(),
+                    'scaler': None if scaler is None else scaler.state_dict(),
                     'epoch': epoch - 1,  # last completed epoch
                     'elapsed_time': total_elapsed,
                     'stage': 'pretrain',
@@ -333,11 +415,22 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                     'pretrain')
                 logger.info("Reached max training time. Exiting.")
                 sys.exit(0)
+            # Periodic time-based checkpoint
+            now = time.time()
+            if now - last_time_ckpt >= time_ckpt_interval:
+                write_time_checkpoint(epoch_completed=max(epoch-1, start_epoch-1))
+                last_time_ckpt = now
         # Final step if leftover gradients
         if len(loader_train) % accum_steps != 0:
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad()
+            with torch.no_grad():
+                for p_online, p_target in zip(enc.parameters(), target_enc.parameters()):
+                    p_target.data.mul_(ema_momentum).add_((1 - ema_momentum) * p_online.data)
         val_losses = []
         enc.eval();
         pred.eval()
@@ -351,14 +444,14 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                     print(f"Inf detected in validation input images at batch {i}!")
                 if torch.isnan(imgs).any():
                     print(f"NaN detected in validation input images at batch {i}!")
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(torch.cuda.is_available() and torch.cuda.is_bf16_supported())):
                     z = enc(imgs, m_enc)
                     out = pred(z, m_enc, m_pred)
                     if torch.isnan(out).any():
                         print(f"NaN detected in validation model output at batch {i}!")
-                    h = F.layer_norm(enc(imgs), (z.size(-1),))
+                    h = F.layer_norm(target_enc(imgs), (z.size(-1),))
                     t = apply_masks(h, m_pred).repeat(len(m_enc), 1, 1)
-                    l = F.mse_loss(out, t)
+                    l = F.smooth_l1_loss(out, t)
                     if torch.isnan(l):
                         print(f"NaN detected in validation loss at batch {i}!")
                 val_losses.append(l.item())
@@ -375,7 +468,7 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                     imgs = imgs.to(DEVICE)
                     m_enc = [m.to(DEVICE) for m in m_enc]
                     m_pred = [m.to(DEVICE) for m in m_pred]
-                    h = F.layer_norm(enc(imgs), (enc(imgs).size(-1),))
+                    h = F.layer_norm(target_enc(imgs), (enc(imgs).size(-1),))
                     t = apply_masks(h, m_pred).repeat(len(m_enc), 1, 1)
                     all_targets.append(t.cpu().numpy().ravel())  # flatten to 1D
                 if i > 10:  # limit to 10 batches for speed
@@ -401,6 +494,10 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
 def main():
     man_df = pd.read_csv(CONFIG['manifest_csv'])
     paths_all = man_df[['od_path', 'os_path']].values
+    # Sanity check for dark images
+    sanity_check_black_images(paths_all, sample_size=200, threshold=10.0)
+
+    # Prefer cached stats; compute once if missing
     stats_file = 'image_stats_pretrain.json'
     if os.path.exists(stats_file):
         with open(stats_file, 'r') as f:
@@ -429,8 +526,13 @@ def main():
         enc, pred = build_encoder_and_predictor(CONFIG)
         enc.load_state_dict(checkpoint['enc'])
         pred.load_state_dict(checkpoint['pred'])
-        freeze_lora_params(enc)
-        logger.info("Encoder LoRA parameters unfrozen.")
+        if CONFIG['use_lora']:
+            freeze_lora_params(enc)
+            logger.info("Encoder LoRA-only trainable params enabled.")
+        else:
+            for p in enc.parameters():
+                p.requires_grad = True
+            logger.info("Encoder set to full-train mode (no LoRA).")
     else:
         # No retina pretrain checkpoint, start from ImageNet checkpoint
         imagenet_ckpt = os.path.expanduser(
@@ -455,8 +557,13 @@ def main():
                 filtered['patch_embed.proj.weight'] = w.repeat(1, 2, 1, 1)[:, :6]
             enc.load_state_dict(filtered, strict=False)
             logger.info("Pretrained ImageNet weights loaded into encoder")
-        freeze_lora_params(enc)
-        logger.info("Encoder initialized from ImageNet checkpoint (if provided).")
+        if CONFIG['use_lora']:
+            freeze_lora_params(enc)
+            logger.info("Encoder initialized with LoRA-only trainable params.")
+        else:
+            for p in enc.parameters():
+                p.requires_grad = True
+            logger.info("Encoder initialized in full-train mode (no LoRA).")
     # Print data pipeline summary
     print(
         f"Data pipeline: batch_size={CONFIG['batch_size']}, img_size={CONFIG['img_size']}, normalization=mean/std {CONFIG.get('mean', '[default]')}/{CONFIG.get('std', '[default]')}")

@@ -6,170 +6,504 @@
 #
 
 import os
-import pandas as pd
+
+# -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
+try:
+    # -- WARNING: IF DOING DISTRIBUTED TRAINING ON A NON-SLURM CLUSTER, MAKE
+    # --          SURE TO UPDATE THIS TO GET LOCAL-RANK ON NODE, OR ENSURE
+    # --          THAT YOUR JOBS ARE LAUNCHED WITH ONLY 1 DEVICE VISIBLE
+    # --          TO EACH PROCESS
+    os.environ['CUDA_VISIBLE_DEVICES'] = os.environ['SLURM_LOCALID']
+except Exception:
+    pass
+
+import copy
+import logging
+import sys
+import yaml
+import time
+import json
+
 import numpy as np
-from PIL import Image
+
 import torch
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from logging import getLogger
+import torch.multiprocessing as mp
+import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
+
+from src.masks.multiblock import MaskCollator as MBMaskCollator
+from src.masks.utils import apply_masks
+from src.utils.distributed import (
+    init_distributed,
+    AllReduce
+)
+from src.utils.logging import (
+    CSVLogger,
+    gpu_timer,
+    grad_logger,
+    AverageMeter)
+from src.utils.tensors import repeat_interleave_batch
+from src.datasets.imagenet1k import make_imagenet1k
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from src.retina_dataset import make_retina_dataset
+
+from src.helper import (
+    load_checkpoint,
+    init_model,
+    init_opt)
+from src.transforms import make_transforms
+
+# --
+log_timings = True
+log_freq = 10
+checkpoint_freq = 50
+# --
 
 _GLOBAL_SEED = 0
-logger = getLogger()
+np.random.seed(_GLOBAL_SEED)
+torch.manual_seed(_GLOBAL_SEED)
+torch.backends.cudnn.benchmark = True
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+logger = logging.getLogger()
 
 
-def make_retina_dataset(
-        transform,
-        batch_size,
-        collator=None,
-        pin_mem=True,
-        num_workers=0,
-        world_size=1,
-        rank=0,
-        root_path=None,
-        training=True,
-        copy_data=False,
-        drop_last=True,
-        manifest_csv=None,
-        image_folder=None  # Added to match I-JEPA interface
-):
-    """
-    Create retinal dataset following I-JEPA interface
+def main(args, resume_preempt=False):
+    # ----------------------------------------------------------------------- #
+    #  PASSED IN PARAMS FROM CONFIG FILE
+    # ----------------------------------------------------------------------- #
 
-    Args:
-        manifest_csv: Path to CSV with columns ['od_path', 'os_path']
-    """
-    dataset = RetinaDataset(
-        root=root_path,
-        manifest_csv=manifest_csv,
-        transform=transform,
-        train=training
-    )
-    logger.info(f'Retina dataset created with {len(dataset)} samples')
-
-    dist_sampler = DistributedSampler(
-        dataset=dataset,
-        num_replicas=world_size,
-        rank=rank
-    )
-
-    # Use the original collator (mask_collator) which handles both images and masks
-    # For batch_size=1, we need to ensure proper batching
-    if batch_size == 1:
-        # Custom collate that ensures proper batch format for mask collator
-        def single_batch_collate(batch):
-            # batch should be a list with one item
-            if len(batch) == 1:
-                # Return the single item as a batch
-                return [batch[0]]
-            else:
-                return batch
-
-        data_loader = DataLoader(
-            dataset,
-            collate_fn=lambda x: collator(single_batch_collate(x)),
-            sampler=dist_sampler,
-            batch_size=batch_size,
-            drop_last=drop_last,
-            pin_memory=pin_mem,
-            num_workers=num_workers,
-            persistent_workers=False
-        )
+    # -- META
+    use_bfloat16 = args['meta']['use_bfloat16']
+    model_name = args['meta']['model_name']
+    load_model = args['meta']['load_checkpoint'] or resume_preempt
+    r_file = args['meta']['read_checkpoint']
+    copy_data = args['meta']['copy_data']
+    pred_depth = args['meta']['pred_depth']
+    pred_emb_dim = args['meta']['pred_emb_dim']
+    if not torch.cuda.is_available():
+        device = torch.device('cpu')
     else:
-        data_loader = DataLoader(
-            dataset,
-            collate_fn=collator,  # This is the mask_collator that creates masks
-            sampler=dist_sampler,
+        device = torch.device('cuda:0')
+        torch.cuda.set_device(device)
+
+    # -- DATA
+    use_gaussian_blur = args['data']['use_gaussian_blur']
+    use_horizontal_flip = args['data']['use_horizontal_flip']
+    use_color_distortion = args['data']['use_color_distortion']
+    color_jitter = args['data']['color_jitter_strength']
+    # --
+    batch_size = args['data']['batch_size']
+    pin_mem = args['data']['pin_mem']
+    num_workers = args['data']['num_workers']
+    root_path = args['data']['root_path']
+    image_folder = args['data']['image_folder']
+    crop_size = args['data']['crop_size']
+    crop_scale = args['data']['crop_scale']
+    # --
+
+    # -- MASK
+    allow_overlap = args['mask']['allow_overlap']  # whether to allow overlap b/w context and target blocks
+    patch_size = args['mask']['patch_size']  # patch-size for model training
+    num_enc_masks = args['mask']['num_enc_masks']  # number of context blocks
+    min_keep = args['mask']['min_keep']  # min number of patches in context block
+    enc_mask_scale = args['mask']['enc_mask_scale']  # scale of context blocks
+    num_pred_masks = args['mask']['num_pred_masks']  # number of target blocks
+    pred_mask_scale = args['mask']['pred_mask_scale']  # scale of target blocks
+    aspect_ratio = args['mask']['aspect_ratio']  # aspect ratio of target blocks
+    # --
+
+    # -- OPTIMIZATION
+    ema = args['optimization']['ema']
+    ipe_scale = args['optimization']['ipe_scale']  # scheduler scale factor (def: 1.0)
+    wd = float(args['optimization']['weight_decay'])
+    final_wd = float(args['optimization']['final_weight_decay'])
+    num_epochs = args['optimization']['epochs']
+    warmup = args['optimization']['warmup']
+    start_lr = args['optimization']['start_lr']
+    lr = args['optimization']['lr']
+    final_lr = args['optimization']['final_lr']
+    # -- Early stopping
+    early_stopping_config = args['optimization'].get('early_stopping', {})
+    patience = early_stopping_config.get('patience', 10)
+    min_delta = early_stopping_config.get('min_delta', 1e-4)
+
+    # -- LOGGING
+    folder = args['logging']['folder']
+    tag = args['logging']['write_tag']
+
+    dump = os.path.join(folder, 'params-ijepa.yaml')
+    with open(dump, 'w') as f:
+        yaml.dump(args, f)
+    # ----------------------------------------------------------------------- #
+
+    try:
+        mp.set_start_method('spawn')
+    except Exception:
+        pass
+
+    # -- init torch distributed backend
+    world_size, rank = init_distributed()
+    logger.info(f'Initialized (rank/world-size) {rank}/{world_size}')
+    if rank > 0:
+        logger.setLevel(logging.ERROR)
+
+    # -- log/checkpointing paths
+    log_file = os.path.join(folder, f'{tag}_r{rank}.csv')
+    save_path = os.path.join(folder, f'{tag}' + '-ep{epoch}.pth.tar')
+    latest_path = os.path.join(folder, f'{tag}-latest.pth.tar')
+    load_path = None
+    if load_model:
+        load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
+
+    # -- make csv_logger
+    csv_logger = CSVLogger(log_file,
+                           ('%d', 'epoch'),
+                           ('%d', 'itr'),
+                           ('%.5f', 'loss'),
+                           ('%.5f', 'mask-A'),
+                           ('%.5f', 'mask-B'),
+                           ('%d', 'time (ms)'))
+
+    # -- init model
+    encoder, predictor = init_model(
+        device=device,
+        patch_size=patch_size,
+        crop_size=crop_size,
+        pred_depth=pred_depth,
+        pred_emb_dim=pred_emb_dim,
+        model_name=model_name,
+        read_checkpoint_path=r_file,
+        do_backbone_init=(not load_model and r_file is not None))
+    target_encoder = copy.deepcopy(encoder)
+
+    # -- make data transforms
+    mask_collator = MBMaskCollator(
+        input_size=crop_size,
+        patch_size=patch_size,
+        pred_mask_scale=pred_mask_scale,
+        enc_mask_scale=enc_mask_scale,
+        aspect_ratio=aspect_ratio,
+        nenc=num_enc_masks,
+        npred=num_pred_masks,
+        allow_overlap=allow_overlap,
+        min_keep=min_keep)
+
+    # Compute retina stats if requested and export to env for transforms
+    if use_retina:
+        stats_path = args.get('data', {}).get('stats_path')
+        env_stats = os.environ.get('RETINA_STATS_JSON_PATH')
+        if env_stats:
+            stats_path = env_stats
+        if not stats_path:
+            stats_path = os.path.join(root_path, 'image_stats.json')
+        mean = std = None
+        try:
+            if os.path.isfile(stats_path):
+                with open(stats_path, 'r') as f:
+                    stats = json.load(f)
+                mean = stats.get('mean')
+                std = stats.get('std')
+                logger.info(f"[NORM] Loaded retina stats from {stats_path}")
+        except Exception as e:
+            logger.info(f"[NORM] Failed to read stats from {stats_path}: {e}")
+        if mean is None or std is None:
+            from src.retina_dataset import compute_image_stats
+            manifest_csv = os.path.join(root_path, 'retina_manifest.csv')
+            mean, std = compute_image_stats(manifest_csv, crop_size, cache_path=stats_path)
+        os.environ['RETINA_NORM_MEAN_JSON'] = json.dumps(mean)
+        os.environ['RETINA_NORM_STD_JSON'] = json.dumps(std)
+        logger.info(f"[NORM] Retina stats: mean={mean}, std={std} (source={stats_path})")
+
+    transform = make_transforms(
+        crop_size=crop_size,
+        crop_scale=crop_scale,
+        gaussian_blur=use_gaussian_blur,
+        horizontal_flip=use_horizontal_flip,
+        color_distortion=use_color_distortion,
+        color_jitter=color_jitter)
+
+    # -- init data-loaders/samplers
+    # Check if we should use retinal dataset
+    use_retina = args.get('data', {}).get('use_retina', False)
+
+    if use_retina:
+        manifest_csv = os.path.join(root_path, 'retina_manifest.csv')
+        _, unsupervised_loader, unsupervised_sampler = make_retina_dataset(
+            transform=transform,
             batch_size=batch_size,
-            drop_last=drop_last,
-            pin_memory=pin_mem,
+            collator=mask_collator,
+            pin_mem=pin_mem,
+            training=True,
             num_workers=num_workers,
-            persistent_workers=False
-        )
-    logger.info('Retina unsupervised data loader created')
+            world_size=world_size,
+            rank=rank,
+            root_path=root_path,
+            image_folder=image_folder,
+            copy_data=copy_data,
+            drop_last=True,
+            manifest_csv=manifest_csv)
+    else:
+        _, unsupervised_loader, unsupervised_sampler = make_imagenet1k(
+            transform=transform,
+            batch_size=batch_size,
+            collator=mask_collator,
+            pin_mem=pin_mem,
+            training=True,
+            num_workers=num_workers,
+            world_size=world_size,
+            rank=rank,
+            root_path=root_path,
+            image_folder=image_folder,
+            copy_data=copy_data,
+            drop_last=True)
+    ipe = len(unsupervised_loader)
 
-    return dataset, data_loader, dist_sampler
+    # -- init optimizer and scheduler
+    optimizer, scaler, scheduler, wd_scheduler = init_opt(
+        encoder=encoder,
+        predictor=predictor,
+        wd=wd,
+        final_wd=final_wd,
+        start_lr=start_lr,
+        ref_lr=lr,
+        final_lr=final_lr,
+        iterations_per_epoch=ipe,
+        warmup=warmup,
+        num_epochs=num_epochs,
+        ipe_scale=ipe_scale,
+        use_bfloat16=use_bfloat16)
+    encoder = DistributedDataParallel(encoder, static_graph=True)
+    predictor = DistributedDataParallel(predictor, static_graph=True)
+    target_encoder = DistributedDataParallel(target_encoder)
+    for p in target_encoder.parameters():
+        p.requires_grad = False
 
+    # -- momentum schedule
+    momentum_scheduler = (ema[0] + i * (ema[1] - ema[0]) / (ipe * num_epochs * ipe_scale)
+                          for i in range(int(ipe * num_epochs * ipe_scale) + 1))
 
-class RetinaDataset(Dataset):
-    """
-    Retinal dataset that loads OD+OS image pairs and concatenates them
-    """
+    start_epoch = 0
+    resume_best_loss = float('inf')
+    # -- load training checkpoint
+    if load_model:
+        encoder, predictor, target_encoder, optimizer, scaler, start_epoch = load_checkpoint(
+            device=device,
+            r_path=load_path,
+            encoder=encoder,
+            predictor=predictor,
+            target_encoder=target_encoder,
+            opt=optimizer,
+            scaler=scaler)
 
-    def __init__(
-            self,
-            root,
-            manifest_csv,
-            transform=None,
-            train=True,
-            test_split=0.2
-    ):
-        """
-        Args:
-            root: Root directory containing images
-            manifest_csv: CSV with columns ['od_path', 'os_path']
-            transform: Image transforms
-            train: Whether this is training set
-            test_split: Fraction of data to use for test
-        """
-        self.root = root
-        self.transform = transform
-        self.train = train
-
-        # Load manifest - look for it in the root directory
-        if manifest_csv:
-            self.manifest_path = manifest_csv
-        else:
-            self.manifest_path = os.path.join(root, 'retina_manifest.csv')
-
+        # Try to load the loss from checkpoint for early stopping
         try:
-            self.df = pd.read_csv(self.manifest_path)
-            logger.info(f"Loaded {len(self.df)} image pairs from {self.manifest_path}")
-        except FileNotFoundError:
-            logger.error(f"Manifest CSV not found: {self.manifest_path}")
-            raise
+            checkpoint = torch.load(load_path, map_location=torch.device('cpu'))
+            if 'loss' in checkpoint:
+                resume_best_loss = checkpoint['loss']
+                logger.info(f'Resuming training with previous best loss: {resume_best_loss:.6f}')
+        except Exception as e:
+            logger.info(f'Could not load previous loss from checkpoint: {e}')
 
-        # Split into train/test
-        if train:
-            self.df = self.df.iloc[:int(len(self.df) * (1 - test_split))]
+        for _ in range(start_epoch * ipe):
+            scheduler.step()
+            wd_scheduler.step()
+            next(momentum_scheduler)
+            mask_collator.step()
+
+    def save_checkpoint(epoch):
+        save_dict = {
+            'encoder': encoder.state_dict(),
+            'predictor': predictor.state_dict(),
+            'target_encoder': target_encoder.state_dict(),
+            'opt': optimizer.state_dict(),
+            'scaler': None if scaler is None else scaler.state_dict(),
+            'epoch': epoch,
+            'loss': loss_meter.avg,
+            'batch_size': batch_size,
+            'world_size': world_size,
+            'lr': lr
+        }
+        if rank == 0:
+            torch.save(save_dict, latest_path)
+            if (epoch + 1) % checkpoint_freq == 0:
+                torch.save(save_dict, save_path.format(epoch=f'{epoch + 1}'))
+
+    # -- TRAINING LOOP
+    start_time = time.time()
+    MAX_TRAIN_SECONDS = 11.5 * 3600  # 11.5 hours timeout
+
+    # -- Early stopping setup
+    best_loss = resume_best_loss if load_model and resume_best_loss != float('inf') else float('inf')
+    no_improve_epochs = 0
+    # patience and min_delta are now loaded from config above
+
+    logger.info(f'Early stopping initialized: patience={patience}, min_delta={min_delta}, best_loss={best_loss:.6f}')
+
+    def save_best_checkpoint(epoch, loss, is_best=False):
+        save_dict = {
+            'encoder': encoder.state_dict(),
+            'predictor': predictor.state_dict(),
+            'target_encoder': target_encoder.state_dict(),
+            'opt': optimizer.state_dict(),
+            'scaler': None if scaler is None else scaler.state_dict(),
+            'epoch': epoch,
+            'loss': loss,
+            'batch_size': batch_size,
+            'world_size': world_size,
+            'lr': lr
+        }
+        if rank == 0:
+            if is_best:
+                best_path = os.path.join(folder, f'{tag}-best.pth.tar')
+                torch.save(save_dict, best_path)
+                logger.info(f'Saved best checkpoint at epoch {epoch} with loss {loss:.6f} to {best_path}')
+
+    for epoch in range(start_epoch, num_epochs):
+        logger.info('Epoch %d' % (epoch + 1))
+
+        # -- update distributed-data-loader epoch
+        unsupervised_sampler.set_epoch(epoch)
+
+        loss_meter = AverageMeter()
+        maskA_meter = AverageMeter()
+        maskB_meter = AverageMeter()
+        time_meter = AverageMeter()
+
+        for itr, (udata, masks_enc, masks_pred) in enumerate(unsupervised_loader):
+
+            def load_imgs():
+                # -- unsupervised imgs
+                imgs = udata[0].to(device, non_blocking=True)
+                # Ensure we have batch dimension for single batch
+                if len(imgs.shape) == 3:
+                    imgs = imgs.unsqueeze(0)  # Add batch dimension: (C,H,W) -> (1,C,H,W)
+                masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
+                masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
+                return (imgs, masks_1, masks_2)
+
+            imgs, masks_enc, masks_pred = load_imgs()
+            maskA_meter.update(len(masks_enc[0][0]))
+            maskB_meter.update(len(masks_pred[0][0]))
+
+            def train_step():
+                _new_lr = scheduler.step()
+                _new_wd = wd_scheduler.step()
+
+                # --
+
+                def forward_target():
+                    with torch.no_grad():
+                        h = target_encoder(imgs)
+                        h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim
+                        B = len(h)
+                        # -- create targets (masked regions of h)
+                        h = apply_masks(h, masks_pred)
+                        h = repeat_interleave_batch(h, B, repeat=len(masks_enc))
+                        return h
+
+                def forward_context():
+                    z = encoder(imgs, masks_enc)
+                    z = predictor(z, masks_enc, masks_pred)
+                    return z
+
+                def loss_fn(z, h):
+                    loss = F.smooth_l1_loss(z, h)
+                    loss = AllReduce.apply(loss)
+                    return loss
+
+                # Step 1. Forward
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
+                    h = forward_target()
+                    z = forward_context()
+                    loss = loss_fn(z, h)
+
+                #  Step 2. Backward & step
+                if use_bfloat16:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
+                grad_stats = grad_logger(encoder.named_parameters())
+                optimizer.zero_grad()
+
+                # Step 3. momentum update of target encoder
+                with torch.no_grad():
+                    m = next(momentum_scheduler)
+                    for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
+                        param_k.data.mul_(m).add_((1. - m) * param_q.detach().data)
+
+                return (float(loss), _new_lr, _new_wd, grad_stats)
+
+            (loss, _new_lr, _new_wd, grad_stats), etime = gpu_timer(train_step)
+            loss_meter.update(loss)
+            time_meter.update(etime)
+
+            # -- Check timeout
+            total_elapsed = time.time() - start_time
+            if total_elapsed >= MAX_TRAIN_SECONDS:
+                logger.info(
+                    f"Reached max training time ({MAX_TRAIN_SECONDS / 3600:.1f} hours). Saving checkpoint and exiting.")
+                save_checkpoint(epoch)
+                sys.exit(0)
+
+            # -- Logging
+            def log_stats():
+                csv_logger.log(epoch + 1, itr, loss, maskA_meter.val, maskB_meter.val, etime)
+                if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
+                    logger.info('[%d, %5d] loss: %.3f '
+                                'masks: %.1f %.1f '
+                                '[wd: %.2e] [lr: %.2e] '
+                                '[mem: %.2e] '
+                                '(%.1f ms)'
+                                % (epoch + 1, itr,
+                                   loss_meter.avg,
+                                   maskA_meter.avg,
+                                   maskB_meter.avg,
+                                   _new_wd,
+                                   _new_lr,
+                                   torch.cuda.max_memory_allocated() / 1024. ** 2,
+                                   time_meter.avg))
+
+                    if grad_stats is not None:
+                        logger.info('[%d, %5d] grad_stats: [%.2e %.2e] (%.2e, %.2e)'
+                                    % (epoch + 1, itr,
+                                       grad_stats.first_layer,
+                                       grad_stats.last_layer,
+                                       grad_stats.min,
+                                       grad_stats.max))
+
+            log_stats()
+
+            assert not np.isnan(loss), 'loss is nan'
+
+        # -- Save Checkpoint after every epoch
+        current_loss = loss_meter.avg
+        logger.info('avg. loss %.3f' % current_loss)
+        save_checkpoint(epoch + 1)
+
+        # -- Early stopping check
+        if current_loss < best_loss - min_delta:
+            best_loss = current_loss
+            no_improve_epochs = 0
+            save_best_checkpoint(epoch + 1, current_loss, is_best=True)
+            logger.info(
+                f'New best loss: {current_loss:.6f} (improvement: {(best_loss + min_delta - current_loss):.6f})')
         else:
-            self.df = self.df.iloc[int(len(self.df) * (1 - test_split)):]
+            no_improve_epochs += 1
+            logger.info(
+                f'No improvement for {no_improve_epochs}/{patience} epochs (current: {current_loss:.6f}, best: {best_loss:.6f})')
 
-        logger.info(f"Using {'train' if train else 'test'} split: {len(self.df)} samples")
+            if no_improve_epochs >= patience:
+                logger.info(f'Early stopping triggered after {no_improve_epochs} epochs without improvement')
+                logger.info(f'Best loss achieved: {best_loss:.6f} at epoch {epoch + 1 - no_improve_epochs}')
+                logger.info(f'Final checkpoint saved. Training stopped early.')
+                break
 
-    def __len__(self):
-        return len(self.df)
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        od_path = row['od_path']
-        os_path = row['os_path']
-        registration_code = row['RegistrationCode']
-        date = row['date']
-
-        # Load images
-        try:
-            od_img = Image.open(od_path).convert('RGB')
-        except:
-            logger.warning(f"Could not load OD image: {od_path}")
-            od_img = Image.new('RGB', (224, 224), 'black')
-
-        try:
-            os_img = Image.open(os_path).convert('RGB')
-        except:
-            logger.warning(f"Could not load OS image: {os_path}")
-            os_img = Image.new('RGB', (224, 224), 'black')
-
-        # Apply transforms
-        if self.transform:
-            od_tensor = self.transform(od_img)
-            os_tensor = self.transform(os_img)
-        else:
-            od_tensor = torch.from_numpy(np.array(od_img)).permute(2, 0, 1).float() / 255.0
-            os_tensor = torch.from_numpy(np.array(os_img)).permute(2, 0, 1).float() / 255.0
-
-        # For I-JEPA pretraining, use only OD image (3 channels)
-        # The model expects (C, H, W) format with 3 channels
-        # Return the tensor in the format expected by the mask collator
-        # The mask collator will handle batching and create masks
-        return od_tensor  # (C, H, W)
+if __name__ == "__main__":
+    main()
