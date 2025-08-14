@@ -1,20 +1,20 @@
 data:
-  batch_size: 1  # Small batch size for retinal images
+  batch_size: 1  # Memory constraint for retinal images
   color_jitter_strength: 0.0
   crop_scale:
   - 0.8
   - 1.0
-  crop_size: 224  # Match the pretrained model's expected size
-  image_folder: /home/gavrielh/PycharmProjects/MSc_Thesis/JEPA  # Required by I-JEPA
+  crop_size: 616  # Retinal image size
+  image_folder: retina_images/
   num_workers: 0  # Avoid multiprocessing issues
   pin_mem: true
-  root_path: /home/gavrielh/PycharmProjects/MSc_Thesis/JEPA
+  root_path: /home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/external_datasets
   use_color_distortion: false
   use_gaussian_blur: false
   use_horizontal_flip: true  # Retinal images can be flipped
   use_retina: true  # Use retinal dataset instead of ImageNet
 logging:
-  folder: /net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/
+  folder: /net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/retina_pretrain_logs/
   write_tag: retina_jepa
 mask:
   allow_overlap: false
@@ -22,36 +22,32 @@ mask:
   - 0.2
   - 5.0  # Allow wide/narrow masks for retinal vessels
   enc_mask_scale:
-  - 0.2
-  - 0.6  # 20-60% visible for context
+  - 0.4
+  - 0.8  # 40-80% visible for context
   min_keep: 2
   num_enc_masks: 2  # Multiple context regions
   num_pred_masks: 2  # Multiple target regions
   patch_size: 14
   pred_mask_scale:
-  - 0.2
-  - 0.6  # 20-60% to predict
+  - 0.4
+  - 0.8  # easier prediction early on
 meta:
   copy_data: false
-  load_checkpoint: true  # Load pretrained ImageNet checkpoint
+  load_checkpoint: false  # Start from backbone (read_checkpoint) without resuming training checkpoint
   model_name: vit_huge
   pred_depth: 6  # Smaller predictor for efficiency
   pred_emb_dim: 384
-  read_checkpoint: /home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN22K-vit.h.14-900e.pth.tar  # Path to ImageNet pretrained model
+  read_checkpoint: /PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN1K-vit.h.14-300e.pth.tar  # Path to ImageNet pretrained model
   use_bfloat16: true
 optimization:
   ema:
   - 0.996
   - 1.0
   epochs: 100  # Fewer epochs for retinal domain
-  final_lr: 5.0e-06  # Less aggressive decay - keep LR higher longer
-  final_weight_decay: 0.4
+  final_lr: 1.0e-06
+  final_weight_decay: 0.04  # lower final WD to avoid over-regularization
   ipe_scale: 1.0
-  lr: 2.0e-05  # Higher initial learning rate for medical domain
+  lr: 1.0e-04 # Increased LR to encourage learning
   start_lr: 1.0e-06
-  warmup: 10
-  weight_decay: 0.01
-  # Early stopping configuration
-  early_stopping:
-    patience: 10      # Stop after N epochs without improvement
-    min_delta: 1.0e-04  # Minimum improvement threshold
+  warmup: 2
+  weight_decay: 0.0001
