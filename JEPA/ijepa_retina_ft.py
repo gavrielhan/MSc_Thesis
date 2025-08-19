@@ -23,6 +23,11 @@ from sklearn.metrics import mean_squared_error, r2_score
 import matplotlib.pyplot as plt
 import time
 import inspect
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.decomposition import PCA
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 
 # Import IJepa and optional loader
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "ijepa")))
@@ -86,6 +91,12 @@ with open('config.json', 'w') as f:
 logger.info("Configuration saved to config.json")
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Outputs (plots/json) directory
+OUTPUT_ROOT = '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/outputs'
+IMAGES_DIR = os.path.join(OUTPUT_ROOT, 'images')
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
 # ---------- Helpers & Builders ----------
 def compute_image_stats(paths, config):
@@ -220,6 +231,24 @@ class RetinaImageDataset(Dataset):
         od_t = self.transform(od)
         os_t = self.transform(os_)
         return torch.cat([od_t, os_t], dim=0)
+
+
+def match_encoder_input_channels(encoder: nn.Module, imgs: torch.Tensor) -> torch.Tensor:
+    try:
+        target_c = encoder.patch_embed.proj.weight.shape[1]
+    except Exception:
+        return imgs
+    c = imgs.shape[1]
+    if c == target_c:
+        return imgs
+    if target_c == 6 and c == 3:
+        return torch.cat([imgs, imgs], dim=1)
+    if target_c == 3 and c == 6:
+        return 0.5 * (imgs[:, 0:3, ...] + imgs[:, 3:6, ...])
+    if c > target_c:
+        return imgs[:, :target_c, ...]
+    reps = max(1, target_c // max(1, c))
+    return imgs.repeat(1, reps, 1, 1)[:, :target_c, ...]
 
 
 class RegressionHead(nn.Module):
@@ -449,10 +478,197 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=main_epochs)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
     scaler = get_grad_scaler()
+    # ---- Demographic maps and eval dataset ----
+    def build_demo_maps():
+        try:
+            from LabData.DataLoaders.BodyMeasuresLoader import BodyMeasuresLoader
+        except Exception as e:
+            logger.warning(f"BodyMeasuresLoader not available ({e}); demographic evaluation disabled")
+            return None
+        try:
+            study_ids = [10, 1001, 1002]
+            bm = BodyMeasuresLoader().get_data(study_ids=study_ids, groupby_reg='first')
+            df_meta = bm.df.join(bm.df_metadata)
+            df_meta = df_meta.reset_index().rename(columns={'index': 'RegistrationCode'})
+            df_meta['RegistrationCode'] = df_meta['RegistrationCode'].astype(str)
+            sex_col = next((c for c in df_meta.columns if 'sex' in c.lower() or 'gender' in c.lower()), None)
+            bmi_col = next((c for c in df_meta.columns if 'bmi' in c.lower()), None)
+            if sex_col:
+                df_meta = df_meta.dropna(subset=[sex_col])
+                sex_map = (
+                    df_meta.set_index('RegistrationCode')[sex_col]
+                    .astype('category').cat.codes.to_dict()
+                )
+            else:
+                sex_map = {}
+            if bmi_col:
+                bmi_series = df_meta.set_index('RegistrationCode')[bmi_col].astype(float)
+                bmi_median = bmi_series.median(skipna=True)
+                bmi_series = bmi_series.fillna(bmi_median)
+                bmi_map = bmi_series.to_dict()
+            else:
+                bmi_map = {}
+            age_col = next((c for c in df_meta.columns if c.lower() == 'age'), None)
+            if age_col is None and 'yob' in df_meta.columns:
+                current_year = time.localtime().tm_year
+                age_series = (current_year - pd.to_numeric(df_meta['yob'], errors='coerce')).astype(float)
+                df_meta = df_meta.assign(_age=age_series)
+                age_map = df_meta.set_index('RegistrationCode')['_age'].dropna().to_dict()
+            elif age_col is not None:
+                age_series = df_meta.set_index('RegistrationCode')[age_col].astype(float)
+                age_map = age_series.dropna().to_dict()
+            else:
+                age_map = {}
+            sex_map = {str(k): v for k, v in sex_map.items()}
+            bmi_map = {str(k): v for k, v in bmi_map.items()}
+            age_map = {str(k): v for k, v in age_map.items()}
+            return {'sex_map': sex_map, 'bmi_map': bmi_map, 'age_map': age_map}
+        except Exception as e:
+            logger.warning(f"Failed to build demographic maps: {e}; demographic evaluation disabled")
+            return None
+    demo_maps = build_demo_maps()
+
+    # Build eval dataset from the supervised train manifest (first DataLoader's dataset) if available
+    eval_loader = None
+    try:
+        # Reuse the supervised train paths by reading the manifest again
+        man_df = pd.read_csv(config['manifest_csv'])
+        cols = [c for c in ['od_path', 'os_path', 'RegistrationCode'] if c in man_df.columns]
+        eval_df = man_df[cols].dropna(subset=['RegistrationCode']).reset_index(drop=True)
+        class EvalDS(Dataset):
+            def __init__(self, df, transform):
+                self.df = df.reset_index(drop=True)
+                self.t = transform
+            def __len__(self): return len(self.df)
+            def __getitem__(self, idx):
+                row = self.df.iloc[idx]
+                od_path = row['od_path']; os_path = row.get('os_path', None)
+                rc = str(row['RegistrationCode']) if 'RegistrationCode' in row else None
+                try:
+                    od = Image.open(od_path).convert('RGB')
+                except Exception:
+                    od = Image.new('RGB', config['img_size'], 'black')
+                if os_path is not None:
+                    try:
+                        os_ = Image.open(os_path).convert('RGB')
+                    except Exception:
+                        os_ = Image.new('RGB', config['img_size'], 'black')
+                else:
+                    os_ = od.copy()
+                od_t = self.t(od); os_t = self.t(os_)
+                img6 = torch.cat([od_t, os_t], dim=0)
+                return img6, rc
+        # Keep it light
+        if len(eval_df) > 1000:
+            eval_df = eval_df.sample(n=1000, random_state=42).reset_index(drop=True)
+        mean, std = (0.485,0.456,0.406), (0.229,0.224,0.225)
+        eval_trsf = build_transforms(mean, std)
+        eval_loader = DataLoader(EvalDS(eval_df, eval_trsf), batch_size=config['batch_size'], shuffle=False, num_workers=0)
+    except Exception as e:
+        logger.info(f"Eval loader not built: {e}")
+
+    def evaluate_demographics(encoder, loader, maps):
+        if loader is None or maps is None:
+            return None
+        encoder.eval()
+        feats = []
+        regs = []
+        with torch.no_grad():
+            for imgs, rc in loader:
+                imgs = imgs.to(DEVICE)
+                imgs = match_encoder_input_channels(encoder, imgs)
+                z = encoder(imgs)
+                if z.ndim == 3:
+                    z = z.mean(dim=1)
+                feats.append(z.cpu().numpy())
+                regs.extend(list(rc))
+        if not feats:
+            return None
+        X = np.concatenate(feats, axis=0)
+        def fit_auc(vals):
+            y = np.array([maps.get('sex_map',{}).get(r, np.nan) if vals=='sex' else
+                          maps.get('bmi_map',{}).get(r, np.nan) if vals=='bmi' else
+                          maps.get('age_map',{}).get(r, np.nan) for r in regs], dtype=float)
+            m = ~np.isnan(y)
+            if m.sum() < 10:
+                return None
+            # binarize at median if continuous
+            if vals in ('bmi','age'):
+                thr = np.median(y[m])
+                yb = (y[m] >= thr).astype(int)
+            else:
+                u = np.unique(y[m]); yb = (y[m] == u.max()).astype(int)
+            Xs = StandardScaler().fit_transform(X[m])
+            try:
+                clf = LogisticRegression(max_iter=200)
+                clf.fit(Xs, yb)
+                prob = clf.predict_proba(Xs)[:,1]
+                return float(roc_auc_score(yb, prob))
+            except Exception:
+                return None
+        return {
+            'sex_auc': fit_auc('sex'),
+            'bmi_auc': fit_auc('bmi'),
+            'age_auc': fit_auc('age')
+        }
+
+    def create_pca_plots(encoder, loader, maps, prefix):
+        try:
+            if loader is None or maps is None:
+                return
+            encoder.eval()
+            feats = []; regs = []
+            with torch.no_grad():
+                for imgs, rc in loader:
+                    imgs = imgs.to(DEVICE)
+                    imgs = match_encoder_input_channels(encoder, imgs)
+                    z = encoder(imgs)
+                    if z.ndim == 3:
+                        z = z.mean(dim=1)
+                    feats.append(z.cpu().numpy()); regs.extend(list(rc))
+            if not feats:
+                return
+            X = np.concatenate(feats, axis=0)
+            if X.shape[0] < 10:
+                return
+            X2 = PCA(n_components=2, random_state=42).fit_transform(StandardScaler().fit_transform(X))
+            # Sex
+            sex_vals = [maps['sex_map'].get(str(r), None) for r in regs]
+            try:
+                mask = np.array([v is not None for v in sex_vals])
+                if mask.any():
+                    s = np.array([int(v) for v in np.array(sex_vals, dtype=object)[mask]])
+                    plt.figure(figsize=(6,5))
+                    for label, color, name in [(0,'tab:blue','Class 0'), (1,'tab:orange','Class 1')]:
+                        sel = np.where(mask)[0][s==label]
+                        plt.scatter(X2[sel,0], X2[sel,1], s=6, alpha=0.7, c=color, label=name)
+                    plt.legend(title='Sex'); plt.title(f'PCA ({prefix}) - Sex')
+                    plt.tight_layout(); plt.savefig(os.path.join(IMAGES_DIR, f'pca_{prefix}_sex_ft.png')); plt.close()
+            except Exception:
+                pass
+            # Continuous helper
+            def cont_plot(vals, title, fname):
+                v = np.array(vals, dtype=float); m = ~np.isnan(v)
+                if not m.any(): return
+                norm = mcolors.Normalize(vmin=np.nanpercentile(v[m],5), vmax=np.nanpercentile(v[m],95))
+                colors = cm.viridis(norm(v[m]))
+                fig, ax = plt.subplots(figsize=(6,5))
+                ax.scatter(X2[m,0], X2[m,1], s=6, alpha=0.8, c=colors)
+                sm = cm.ScalarMappable(cmap=cm.viridis, norm=norm); sm.set_array([])
+                fig.colorbar(sm, ax=ax).set_label(title)
+                ax.set_title(f'PCA ({prefix}) - {title}')
+                fig.tight_layout(); fig.savefig(os.path.join(IMAGES_DIR, fname)); plt.close(fig)
+            cont_plot([maps['age_map'].get(str(r), np.nan) for r in regs], 'Age', f'pca_{prefix}_age_ft.png')
+            cont_plot([maps['bmi_map'].get(str(r), np.nan) for r in regs], 'BMI', f'pca_{prefix}_bmi_ft.png')
+            logger.info(f'PCA ({prefix}) plots saved (finetune)')
+        except Exception as e:
+            logger.info(f'PCA plotting failed (finetune {prefix}): {e}')
     sup_train_losses, sup_val_losses = [], []
     sup_train_r2s, sup_val_r2s = [], []  # List of lists: r2 per feature per epoch
     start_time = time.time()  # Always reset when entering the function
     accum_steps = 2
+    # PCA BEFORE finetune
+    create_pca_plots(enc, eval_loader, demo_maps, prefix='before')
     for epoch in range(start_epoch, config['epochs']+1):
         enc.train(); head.train()  # Changed from enc.eval() to enc.train()
         train_losses = []
@@ -486,6 +702,11 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_
                     'elapsed_time': total_elapsed,
                 }, CHECKPOINT_PATH)
                 logger.info(f"Reached max training time. Checkpoint saved to {CHECKPOINT_PATH}. Exiting.")
+                # PCA AFTER (timeout)
+                try:
+                    create_pca_plots(enc, eval_loader, demo_maps, prefix='after')
+                except Exception:
+                    pass
                 sys.exit(0)
         # Final step if leftover gradients
         if len(sup_loaders['train']) % accum_steps != 0:
@@ -524,7 +745,33 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_
         logger.info(f"Sup E{epoch} Train MSE={np.mean(train_mse):.4f} Val MSE={np.mean(val_mse):.4f}")
         for i, feat in enumerate(feature_cols):
             logger.info(f"  Feature {feat}: Train MSE={train_mse[i]:.4f} Val MSE={val_mse[i]:.4f} Train R2={train_r2[i]:.4f} Val R2={val_r2[i]:.4f}")
+        # Demographic AUCs per epoch
+        demo = evaluate_demographics(enc, eval_loader, demo_maps)
+        if demo:
+            logger.info(f"  Demographics AUCs: sex={demo.get('sex_auc')}, bmi={demo.get('bmi_auc')}, age={demo.get('age_auc')}")
+            # Append to JSON
+            try:
+                metrics_path = os.path.join(OUTPUT_ROOT, 'retina_finetune_epoch_metrics.json')
+                entry = {
+                    'epoch': epoch,
+                    'train_mse_mean': float(np.mean(train_mse)) if train_mse.size else None,
+                    'val_mse_mean': float(np.mean(val_mse)) if val_mse.size else None,
+                    **demo,
+                }
+                if os.path.exists(metrics_path):
+                    with open(metrics_path, 'r') as f:
+                        hist = json.load(f)
+                else:
+                    hist = []
+                hist.append(entry)
+                with open(metrics_path, 'w') as f:
+                    json.dump(hist, f, indent=2)
+                logger.info(f"Saved finetune epoch metrics to {metrics_path}")
+            except Exception as e:
+                logger.info(f"Failed to write finetune metrics JSON: {e}")
         scheduler.step()
+    # PCA AFTER finetune
+    create_pca_plots(enc, eval_loader, demo_maps, prefix='after')
     epochs = list(range(start_epoch, config['epochs']+1))
     # Plot R2 per feature over epochs
     sup_train_r2s = np.array(sup_train_r2s)

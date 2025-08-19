@@ -469,7 +469,7 @@ STRATEGIES = [
     },
     {
         "name": "retina_feature_knn",
-        "ckpt": "/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_retina_finetune.pth",
+        "ckpt": "/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_pretrain_newrun.pth",
         "eval_type": "knn"
     }
 ]
@@ -1395,15 +1395,71 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
             if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
                 wandb.finish()
         elif strategy_select['eval_type'] == "knn":
-            # Only use encoder, extract features, run KNN
-            enc = build_encoder(CONFIG)
+            # Decide whether checkpoint has LoRA params
+            has_lora = False
+            try:
+                ckpt_raw = torch.load(strategy_select['ckpt'], map_location=torch.device('cpu'))
+                state_like = None
+                if isinstance(ckpt_raw, dict):
+                    for key in ['enc', 'encoder', 'state_dict', 'model']:
+                        if key in ckpt_raw and isinstance(ckpt_raw[key], dict):
+                            state_like = ckpt_raw[key]
+                            break
+                    if state_like is None:
+                        state_like = ckpt_raw
+                else:
+                    state_like = {}
+                for k in state_like.keys():
+                    if ('lora_' in k) or ('loraA' in k) or ('loraB' in k) or ('lora_A' in k) or ('lora_B' in k):
+                        has_lora = True
+                        break
+            except Exception:
+                has_lora = False
+
+            # Build encoder: disable LoRA if checkpoint has no LoRA params
+            cfg_knn = dict(CONFIG)
+            if not has_lora:
+                cfg_knn['use_lora'] = False
+                cfg_knn['lora_r'] = 0
+                cfg_knn['lora_alpha'] = 0
+                cfg_knn['lora_dropout'] = 0.0
+                print("[KNN] No LoRA params detected in checkpoint; building encoder without LoRA")
+            else:
+                print("[KNN] LoRA params detected; building encoder with LoRA support")
+
+            enc = build_encoder(cfg_knn)
             load_pretrained_encoder(enc, strategy_select['ckpt'])
             enc.to(DEVICE)
-            freeze_lora_params(enc)
+
+            # Only freeze LoRA if LoRA is enabled
+            if cfg_knn.get('use_lora', False):
+                freeze_lora_params(enc)
+
+            # Quick sanity forward to surface silent issues early
+            try:
+                enc.eval()
+                with torch.no_grad():
+                    sample_loader = train_loader if 'train_loader' in locals() else test_loader
+                    for imgs, _ in sample_loader:
+                        _ = enc(imgs.to(DEVICE))
+                        break
+                print("[KNN] Forward sanity check passed")
+            except Exception as e:
+                print(f"[KNN] Forward sanity check failed: {e}")
+                return
+
             aucs, all_labels, all_probs = knn_evaluate(enc, train_loader, test_loader, n_classes, DEVICE, k=5)
             results["aucs"] = aucs
             results["all_labels"] = all_labels.tolist()
             results["all_probs"] = all_probs.tolist()
+            # Print AUCs to console
+            print("[KNN] ROC AUC per class:")
+            for c, auc in enumerate(aucs):
+                print(f"  Class {c}: {auc:.4f}")
+            try:
+                print(f"  Mean ROC AUC: {np.nanmean(aucs):.4f}")
+            except Exception:
+                pass
             # Save ROC AUC plot
             plt.figure(figsize=(6, 4))
             bars = plt.bar([f'class_{c}' for c in range(n_classes)], aucs, color='blue', alpha=0.7)
@@ -1415,11 +1471,14 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
                 plt.text(bar.get_x() + bar.get_width() / 2, y, f'{auc:.2f}', ha='center', va='bottom', fontsize=10,
                          fontweight='bold')
             plt.tight_layout()
-            plt.savefig(os.path.join(OUTPUT_DIRS['images'],
-                                     f'roc_auc_{strategy_select["name"]}_{train_dataset}_fold{fold}.png'))
+            plot_path = os.path.join(OUTPUT_DIRS['images'],
+                                     f'roc_auc_{strategy_select["name"]}_{train_dataset}_fold{fold}.png')
+            plt.savefig(plot_path)
             plt.close()
             # Save results
             save_json(results, result_path)
+            print(f"[KNN] Saved results to {result_path}")
+            print(f"[KNN] Saved ROC plot to {plot_path}")
 
             # Print image loading summary for KNN
             print(f"\nImage Loading Summary (KNN):")

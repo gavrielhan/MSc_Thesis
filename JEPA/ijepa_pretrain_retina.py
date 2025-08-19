@@ -22,12 +22,43 @@ import matplotlib.pyplot as plt
 import time
 import inspect
 import copy
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.decomposition import PCA
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 
 # Import IJepa and optional loader
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "ijepa")))
 from ijepa.src.models.vision_transformer import VisionTransformer, VisionTransformerPredictor
 from ijepa.src.masks.multiblock import MaskCollator
 from ijepa.src.masks.utils import apply_masks
+
+
+def match_encoder_input_channels(encoder: nn.Module, imgs: torch.Tensor) -> torch.Tensor:
+    """Adjust batch tensor channels to match encoder's expected in_chans.
+    If encoder expects 6 and input is 3, duplicate (OD as OS). If encoder expects 3 and input is 6, average halves.
+    """
+    try:
+        target_c = encoder.patch_embed.proj.weight.shape[1]
+    except Exception:
+        return imgs
+    c = imgs.shape[1]
+    if c == target_c:
+        return imgs
+    if target_c == 6 and c == 3:
+        return torch.cat([imgs, imgs], dim=1)
+    if target_c == 3 and c == 6:
+        return 0.5 * (imgs[:, 0:3, ...] + imgs[:, 3:6, ...])
+    # Fallbacks
+    if c > target_c:
+        return imgs[:, :target_c, ...]
+    if c < target_c:
+        reps = target_c // c
+        return imgs.repeat(1, reps, 1, 1)[:, :target_c, ...]
+    return imgs
+
 
 # ---------- Configuration & Reproducibility ----------
 SEED = 16
@@ -41,7 +72,7 @@ torch.backends.cudnn.benchmark = False
 # Load existing config
 with open('config.json', 'r') as f:
     CONFIG = json.load(f)
-CONFIG['img_size'] = tuple(CONFIG['img_size'])
+CONFIG['img_size'] = (602, 602)
 
 CONFIG['epochs'] = 100
 CONFIG['num_workers'] = 0
@@ -135,7 +166,8 @@ def sanity_check_black_images(paths, sample_size=200, threshold=10.0):
     if examples:
         logger.info(f"[SANITY] Example dark files: {examples}")
     if pct > 50.0:
-        logger.warning("[SANITY] More than 50% of sampled images are very dark; please verify dataset paths and preprocessing.")
+        logger.warning(
+            "[SANITY] More than 50% of sampled images are very dark; please verify dataset paths and preprocessing.")
     return pct
 
 
@@ -238,7 +270,9 @@ CHECKPOINT_PATH = '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavr
 MAX_TRAIN_SECONDS = 11.5 * 3600  # 11.5 hours in seconds
 os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
 
-IMAGES_DIR = 'outputs/images'
+OUTPUT_ROOT = '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/outputs'
+IMAGES_DIR = os.path.join(OUTPUT_ROOT, 'images')
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
 
@@ -254,7 +288,7 @@ def get_grad_scaler():
             return amp_grad_scaler(device_type='cuda')
         else:
             return amp_grad_scaler()
-    return torch.cuda.amp.GradScaler()
+        return torch.cuda.amp.GradScaler()
 
 
 def save_loss_plot(train_losses, val_losses, epochs, filename, config, stage):
@@ -278,7 +312,8 @@ def save_loss_plot(train_losses, val_losses, epochs, filename, config, stage):
 def save_checkpoint(state, train_losses, val_losses, epoch_list, config, stage, filename=CHECKPOINT_PATH):
     torch.save(state, filename)
     logger.info(f"Checkpoint saved to {filename}")
-    save_loss_plot(train_losses, val_losses, epoch_list, os.path.join(IMAGES_DIR, 'checkpoint_pretrain_loss.png'), config, stage)
+    save_loss_plot(train_losses, val_losses, epoch_list, os.path.join(IMAGES_DIR, 'checkpoint_pretrain_loss.png'),
+                   config, stage)
     logger.info("Checkpoint loss plot saved to checkpoint_pretrain_loss.png")
 
 
@@ -289,7 +324,7 @@ def load_checkpoint(filename=CHECKPOINT_PATH):
     return None
 
 
-def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch=1, elapsed_time=0):
+def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch=1, elapsed_time=0, demo_eval=None):
     import signal
     # Debug: print which parameters do not require grad
     for name, param in enc.named_parameters():
@@ -310,9 +345,10 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
     for p in target_enc.parameters():
         p.requires_grad = False
     ema_momentum = 0.99
-    # Periodic time-based checkpointing (every 30 minutes)
+    # Periodic time-based checkpointing (every 2 hours)
     time_ckpt_interval = 2 * 3600
     last_time_ckpt = time.time()
+
     def write_time_checkpoint(epoch_completed):
         torch.save({
             'enc': enc.state_dict(),
@@ -324,11 +360,13 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
             'stage': 'pretrain',
         }, CHECKPOINT_PATH)
         logger.info(f"Checkpoint overwritten at {CHECKPOINT_PATH}")
+
     # Save on SIGTERM
     def _handle_sigterm(signum, frame):
         logger.info("SIGTERM received: saving last checkpoint and exiting")
-        write_time_checkpoint(max(start_epoch, 1)-1)
+        write_time_checkpoint(max(start_epoch, 1) - 1)
         sys.exit(0)
+
     try:
         signal.signal(signal.SIGTERM, _handle_sigterm)
     except Exception:
@@ -337,6 +375,10 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
     masked_train_losses, masked_val_losses = [], []
     start_time = time.time()
     accum_steps = 2
+    # Unpack demo eval tuple
+    eval_loader = eval_maps = metrics_path = None
+    if isinstance(demo_eval, tuple) and len(demo_eval) == 3:
+        eval_loader, eval_maps, metrics_path = demo_eval
     for epoch in range(start_epoch, config['epochs'] + 1):
         enc.train();
         pred.train()
@@ -355,7 +397,8 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                 print(f"Inf detected in input images at batch {i}!")
             if torch.isnan(imgs).any():
                 print(f"NaN detected in input images at batch {i}!")
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(torch.cuda.is_available() and torch.cuda.is_bf16_supported())):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16,
+                                    enabled=(torch.cuda.is_available() and torch.cuda.is_bf16_supported())):
                 z = enc(imgs, m_enc)
                 out = pred(z, m_enc, m_pred)
                 if torch.isnan(out).any():
@@ -413,12 +456,79 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                     epoch_list,
                     config,
                     'pretrain')
+                # PCA plots AFTER training (timeout)
+                try:
+                    if eval_loader is not None and eval_maps is not None:
+                        def _pca_after():
+                            enc.eval()
+                            feats = []
+                            regs = []
+                            with torch.no_grad():
+                                for imgs, regcode in eval_loader:
+                                    imgs = imgs.to(DEVICE)
+                                    imgs = match_encoder_input_channels(enc, imgs)
+                                    z = enc(imgs)
+                                    if z.ndim == 3:
+                                        z = z.mean(dim=1)
+                                    feats.append(z.cpu().numpy())
+                                    regs.extend(list(regcode))
+                            if feats:
+                                X = np.concatenate(feats, axis=0)
+                                Xs = StandardScaler().fit_transform(X)
+                                X2 = PCA(n_components=2, random_state=42).fit_transform(Xs)
+
+                                # reuse plotting helper by re-importing create_pca_plots via closure not available here; inline minimal
+                                def cont_plot(vals, title, fname):
+                                    v = np.array(vals, dtype=float)
+                                    m = ~np.isnan(v)
+                                    if not m.any():
+                                        return
+                                    norm = mcolors.Normalize(vmin=np.nanpercentile(v[m], 5),
+                                                             vmax=np.nanpercentile(v[m], 95))
+                                    colors = cm.viridis(norm(v[m]))
+                                    fig, ax = plt.subplots(figsize=(6, 5))
+                                    ax.scatter(X2[m, 0], X2[m, 1], s=6, alpha=0.8, c=colors)
+                                    sm = cm.ScalarMappable(cmap=cm.viridis, norm=norm)
+                                    sm.set_array([])
+                                    fig.colorbar(sm, ax=ax).set_label(title)
+                                    ax.set_title(f'PCA (after) - {title}')
+                                    fig.tight_layout()
+                                    fig.savefig(os.path.join(IMAGES_DIR, fname))
+                                    plt.close(fig)
+
+                                # Sex
+                                sex_vals = [eval_maps['sex_map'].get(rc, None) for rc in regs]
+                                try:
+                                    mask = np.array([v is not None for v in sex_vals])
+                                    if mask.any():
+                                        s = np.array([int(v) for v in np.array(sex_vals, dtype=object)[mask]])
+                                        plt.figure(figsize=(6, 5))
+                                        for label, color, name in [(0, 'tab:blue', 'Class 0'),
+                                                                   (1, 'tab:orange', 'Class 1')]:
+                                            sel_idx = np.where(mask)[0][s == label]
+                                            plt.scatter(X2[sel_idx, 0], X2[sel_idx, 1], s=6, alpha=0.7, c=color,
+                                                        label=name)
+                                        plt.legend(title='Sex')
+                                        plt.title('PCA (after) - Sex')
+                                        plt.tight_layout()
+                                        plt.savefig(os.path.join(IMAGES_DIR, 'pca_after_sex.png'))
+                                        plt.close()
+                                except Exception:
+                                    pass
+                                cont_plot([eval_maps['age_map'].get(rc, None) for rc in regs], 'Age',
+                                          'pca_after_age.png')
+                                cont_plot([eval_maps['bmi_map'].get(rc, None) for rc in regs], 'BMI',
+                                          'pca_after_bmi.png')
+
+                        _pca_after()
+                except Exception as e:
+                    logger.info(f"PCA (after-timeout) failed: {e}")
                 logger.info("Reached max training time. Exiting.")
                 sys.exit(0)
             # Periodic time-based checkpoint
             now = time.time()
             if now - last_time_ckpt >= time_ckpt_interval:
-                write_time_checkpoint(epoch_completed=max(epoch-1, start_epoch-1))
+                write_time_checkpoint(epoch_completed=max(epoch - 1, start_epoch - 1))
                 last_time_ckpt = now
         # Final step if leftover gradients
         if len(loader_train) % accum_steps != 0:
@@ -444,7 +554,8 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
                     print(f"Inf detected in validation input images at batch {i}!")
                 if torch.isnan(imgs).any():
                     print(f"NaN detected in validation input images at batch {i}!")
-                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(torch.cuda.is_available() and torch.cuda.is_bf16_supported())):
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16,
+                                        enabled=(torch.cuda.is_available() and torch.cuda.is_bf16_supported())):
                     z = enc(imgs, m_enc)
                     out = pred(z, m_enc, m_pred)
                     if torch.isnan(out).any():
@@ -459,6 +570,38 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
         mv = np.mean(val_losses)
         masked_train_losses.append(mt)
         masked_val_losses.append(mv)
+        # Per-epoch demographic evaluation
+        epoch_metrics = {
+            'epoch': epoch,
+            'train_mse': float(mt),
+            'val_mse': float(mv),
+        }
+        if eval_loader is not None and eval_maps is not None:
+            demo_res = None
+            try:
+                # Use online encoder features (no masks) for demographics
+                def _extractor(x):
+                    return enc(x)
+
+                demo_res = evaluate_demographics(enc, eval_loader, eval_maps)
+            except Exception as e:
+                logger.info(f"Demographic eval failed: {e}")
+            if demo_res:
+                epoch_metrics.update(demo_res)
+        # Append to metrics JSON
+        if metrics_path:
+            try:
+                if os.path.exists(metrics_path):
+                    with open(metrics_path, 'r') as f:
+                        hist = json.load(f)
+                else:
+                    hist = []
+                hist.append(epoch_metrics)
+                with open(metrics_path, 'w') as f:
+                    json.dump(hist, f, indent=2)
+                logger.info(f"Saved epoch metrics to {metrics_path}")
+            except Exception as e:
+                logger.info(f"Failed to write metrics JSON: {e}")
         # Compute and print relative MSE (MSE / variance of target)
         # Use a batch of targets from validation set for variance estimate
         try:
@@ -484,11 +627,6 @@ def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch
         scheduler.step()
         if mv < best_val:
             best_val = mv
-    epochs = list(range(start_epoch, config['epochs'] + 1))
-    save_loss_plot(masked_train_losses, masked_val_losses, epochs, 'masked_pretrain_loss.png', config,
-                   'masked pretrain')
-    logger.info("Saved masked pretrain loss curve to masked_pretrain_loss.png")
-    logger.info("Masked pretraining complete.")
 
 
 def main():
@@ -511,7 +649,183 @@ def main():
         logger.info(f"Computed and saved image stats to {stats_file}")
     trsf = build_transforms(mean, std)
 
-    print("Model config:", CONFIG)
+    # ---------------- Demographic metadata maps ----------------
+    def build_demo_maps():
+        try:
+            from LabData.DataLoaders.BodyMeasuresLoader import BodyMeasuresLoader
+        except Exception as e:
+            logger.warning(f"BodyMeasuresLoader not available ({e}); demographic evaluation disabled")
+            return None
+        try:
+            study_ids = [10, 1001, 1002]
+            bm = BodyMeasuresLoader().get_data(study_ids=study_ids, groupby_reg='first')
+            df_meta = bm.df.join(bm.df_metadata)
+            df_meta = df_meta.reset_index().rename(columns={'index': 'RegistrationCode'})
+            # Ensure RegistrationCode is str for consistent keying
+            df_meta['RegistrationCode'] = df_meta['RegistrationCode'].astype(str)
+            # Find sex and BMI columns
+            sex_col = next((c for c in df_meta.columns if 'sex' in c.lower() or 'gender' in c.lower()), None)
+            bmi_col = next((c for c in df_meta.columns if 'bmi' in c.lower()), None)
+            # Sex
+            if sex_col:
+                df_meta = df_meta.dropna(subset=[sex_col])
+                sex_map = (
+                    df_meta.set_index('RegistrationCode')[sex_col]
+                    .astype('category')
+                    .cat.codes
+                    .to_dict()
+                )
+            else:
+                sex_map = {}
+            # BMI
+            if bmi_col:
+                bmi_series = df_meta.set_index('RegistrationCode')[bmi_col].astype(float)
+                bmi_median = bmi_series.median(skipna=True)
+                bmi_series = bmi_series.fillna(bmi_median)
+                bmi_map = bmi_series.to_dict()
+            else:
+                bmi_map = {}
+            # Age
+            age_col = next((c for c in df_meta.columns if c.lower() == 'age'), None)
+            if age_col is None and 'yob' in df_meta.columns:
+                current_year = time.localtime().tm_year
+                age_series = (current_year - pd.to_numeric(df_meta['yob'], errors='coerce')).astype(float)
+                df_meta = df_meta.assign(_age=age_series)
+                age_map = df_meta.set_index('RegistrationCode')['_age'].dropna().to_dict()
+            elif age_col is not None:
+                age_series = df_meta.set_index('RegistrationCode')[age_col].astype(float)
+                age_map = age_series.dropna().to_dict()
+            else:
+                age_map = {}
+            # Ensure dict keys are str
+            sex_map = {str(k): v for k, v in sex_map.items()}
+            bmi_map = {str(k): v for k, v in bmi_map.items()}
+            age_map = {str(k): v for k, v in age_map.items()}
+            return {
+                'sex_map': sex_map,
+                'bmi_map': bmi_map,
+                'age_map': age_map,
+            }
+        except Exception as e:
+            logger.warning(f"Failed to build demographic maps: {e}; demographic evaluation disabled")
+            return None
+
+    demo_maps = build_demo_maps()
+
+    # ---------------- Evaluation dataset for demographics ----------------
+    class EvalDataset(Dataset):
+        def __init__(self, df_manifest, transform):
+            self.df = df_manifest.reset_index(drop=True)
+            self.transform = transform
+
+        def __len__(self):
+            return len(self.df)
+
+        def __getitem__(self, idx):
+            row = self.df.iloc[idx]
+            od_path = row['od_path']
+            os_path = row.get('os_path', None)
+            regcode = row.get('RegistrationCode', None)
+            if regcode is not None:
+                regcode = str(regcode)
+            try:
+                od_img = Image.open(od_path).convert('RGB')
+            except Exception:
+                od_img = Image.new('RGB', CONFIG['img_size'], 'black')
+            if os_path is not None:
+                try:
+                    os_img = Image.open(os_path).convert('RGB')
+                except Exception:
+                    os_img = Image.new('RGB', CONFIG['img_size'], 'black')
+            else:
+                os_img = od_img.copy()
+            od_t = self.transform(od_img)
+            os_t = self.transform(os_img)
+            img6 = torch.cat([od_t, os_t], dim=0)
+            return img6, regcode
+
+    # Sample a subset for quick evaluation
+    if demo_maps is not None and 'RegistrationCode' in man_df.columns:
+        # include os_path if available to build 6-ch inputs
+        cols = [c for c in ['od_path', 'os_path', 'RegistrationCode'] if c in man_df.columns]
+        eval_df = man_df[cols].copy()
+        # Drop rows without RegistrationCode
+        eval_df = eval_df.dropna(subset=['RegistrationCode']).reset_index(drop=True)
+        # Sample up to N examples
+        max_eval = 1000
+        if len(eval_df) > max_eval:
+            eval_df = eval_df.sample(n=max_eval, random_state=42).reset_index(drop=True)
+        eval_loader = DataLoader(EvalDataset(eval_df, trsf), batch_size=CONFIG['batch_size'], shuffle=False,
+                                 num_workers=0)
+    else:
+        eval_loader = None
+
+    # Function to extract features and compute AUCs
+    def evaluate_demographics(encoder, loader, maps):
+        if loader is None or maps is None:
+            return None
+        encoder.eval()
+        feats = []
+        labels = {'sex': [], 'bmi_high': [], 'age_high': []}
+        with torch.no_grad():
+            for imgs, regcode in loader:
+                imgs = imgs.to(DEVICE)
+                imgs = match_encoder_input_channels(encoder, imgs)
+                z = encoder(imgs)  # (B, N, D)
+                if z.ndim == 3:
+                    z = z.mean(dim=1)  # global average over tokens
+                feats.append(z.cpu().numpy())
+                # Map labels
+                for rc in regcode:
+                    rc_val = rc
+                    # Sex
+                    sex_val = maps['sex_map'].get(rc_val, None)
+                    labels['sex'].append(sex_val)
+                    # BMI
+                    bmi_val = maps['bmi_map'].get(rc_val, None)
+                    labels['bmi_high'].append(bmi_val)
+                    # Age
+                    age_val = maps['age_map'].get(rc_val, None)
+                    labels['age_high'].append(age_val)
+        X = np.concatenate(feats, axis=0) if feats else np.empty((0, encoder.embed_dim))
+        results = {}
+        if X.shape[0] == 0:
+            return None
+
+        # Helper to train logistic regression AUC for a binary target derived by thresholding at median
+        def fit_auc(y_cont_or_bin, name):
+            y = np.array(y_cont_or_bin)
+            mask = ~pd.isna(y)
+            Xm = X[mask]
+            ym = y[mask]
+            if Xm.shape[0] < 10:
+                return None
+            # If not binary, binarize at median
+            unique_vals = np.unique(ym)
+            if unique_vals.size > 2:
+                thr = np.median(ym)
+                ym = (ym >= thr).astype(int)
+            else:
+                # ensure 0/1
+                ym = (ym == unique_vals.max()).astype(int)
+            # Standardize features
+            scaler = StandardScaler()
+            Xs = scaler.fit_transform(Xm)
+            try:
+                clf = LogisticRegression(max_iter=200)
+                clf.fit(Xs, ym)
+                y_prob = clf.predict_proba(Xs)[:, 1]
+                auc = roc_auc_score(ym, y_prob)
+                return float(auc)
+            except Exception as e:
+                logger.info(f"AUC fit failed for {name}: {e}")
+                return None
+
+        results['sex_auc'] = fit_auc(labels['sex'], 'sex')
+        results['bmi_auc'] = fit_auc(labels['bmi_high'], 'bmi')
+        results['age_auc'] = fit_auc(labels['age_high'], 'age')
+        return results
+
     # Always define stage, epoch, elapsed_time before use
     stage = None
     epoch = 1
@@ -580,8 +894,87 @@ def main():
             enc.load_state_dict(checkpoint['enc'])
             pred.load_state_dict(checkpoint['pred'])
             elapsed_time = 0
+            # PCA plots BEFORE training
 
-        run_masked_pretrain(enc, pred, loader_train, loader_val, CONFIG, start_epoch=epoch, elapsed_time=elapsed_time)
+        def create_pca_plots(encoder, loader, maps, prefix):
+            try:
+                if loader is None or maps is None:
+                    return
+                encoder.eval()
+                feats = []
+                regs = []
+                with torch.no_grad():
+                    for imgs, regcode in loader:
+                        imgs = imgs.to(DEVICE)
+                        z = encoder(imgs)
+                        if z.ndim == 3:
+                            z = z.mean(dim=1)
+                        feats.append(z.cpu().numpy())
+                        regs.extend(list(regcode))
+                if not feats:
+                    return
+                X = np.concatenate(feats, axis=0)
+                if X.shape[0] < 10:
+                    return
+                # Standardize and reduce to 2D
+                Xs = StandardScaler().fit_transform(X)
+                X2 = PCA(n_components=2, random_state=42).fit_transform(Xs)
+                # Helpers to map values
+                sex_vals = [maps['sex_map'].get(rc, None) for rc in regs]
+                age_vals = [maps['age_map'].get(rc, None) for rc in regs]
+                bmi_vals = [maps['bmi_map'].get(rc, None) for rc in regs]
+                os.makedirs(IMAGES_DIR, exist_ok=True)
+                # Sex (binary)
+                try:
+                    mask = np.array([v is not None for v in sex_vals])
+                    if mask.any():
+                        s = np.array([int(v) for v in np.array(sex_vals, dtype=object)[mask]])
+                        plt.figure(figsize=(6, 5))
+                        for label, color, name in [(0, 'tab:blue', 'Class 0'), (1, 'tab:orange', 'Class 1')]:
+                            sel = mask.copy()
+                            sel_idx = np.where(mask)[0][s == label]
+                            plt.scatter(X2[sel_idx, 0], X2[sel_idx, 1], s=6, alpha=0.7, c=color, label=name)
+                        plt.legend(title='Sex')
+                        plt.title(f'PCA ({prefix}) - Sex')
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(IMAGES_DIR, f'pca_{prefix}_sex.png'))
+                        plt.close()
+                except Exception as e:
+                    logger.info(f'PCA sex plot failed: {e}')
+
+                # Continuous helper
+                def cont_plot(vals, title, fname):
+                    try:
+                        v = np.array(vals, dtype=float)
+                        m = ~np.isnan(v)
+                        if not m.any():
+                            return
+                        norm = mcolors.Normalize(vmin=np.nanpercentile(v[m], 5), vmax=np.nanpercentile(v[m], 95))
+                        colors = cm.viridis(norm(v[m]))
+                        fig, ax = plt.subplots(figsize=(6, 5))
+                        ax.scatter(X2[m, 0], X2[m, 1], s=6, alpha=0.8, c=colors)
+                        sm = cm.ScalarMappable(cmap=cm.viridis, norm=norm)
+                        sm.set_array([])
+                        fig.colorbar(sm, ax=ax).set_label(title)
+                        ax.set_title(f'PCA ({prefix}) - {title}')
+                        fig.tight_layout()
+                        fig.savefig(os.path.join(IMAGES_DIR, fname))
+                        plt.close(fig)
+                    except Exception as e:
+                        logger.info(f'PCA {title} plot failed: {e}')
+
+                cont_plot(age_vals, 'Age', f'pca_{prefix}_age.png')
+                cont_plot(bmi_vals, 'BMI', f'pca_{prefix}_bmi.png')
+                logger.info(f'PCA ({prefix}) plots saved')
+            except Exception as e:
+                logger.info(f'PCA plotting failed: {e}')
+
+        create_pca_plots(enc, eval_loader, demo_maps, prefix='before')
+
+        # Path for accumulating results
+        metrics_path = os.path.join(OUTPUT_ROOT, 'retina_pretrain_epoch_metrics.json')
+        run_masked_pretrain(enc, pred, loader_train, loader_val, CONFIG, start_epoch=epoch, elapsed_time=elapsed_time,
+                            demo_eval=(eval_loader, demo_maps, metrics_path))
 
 
 if __name__ == '__main__':
