@@ -631,7 +631,12 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_
             X = np.concatenate(feats, axis=0)
             if X.shape[0] < 10:
                 return
-            X2 = PCA(n_components=2, random_state=42).fit_transform(StandardScaler().fit_transform(X))
+            Xs = StandardScaler().fit_transform(X)
+            pca = PCA(n_components=2, random_state=42)
+            X2 = pca.fit_transform(Xs)
+            evr = pca.explained_variance_ratio_
+            xlab = f'PC1 ({evr[0]*100:.1f}%)'
+            ylab = f'PC2 ({evr[1]*100:.1f}%)'
             # Sex
             sex_vals = [maps['sex_map'].get(str(r), None) for r in regs]
             try:
@@ -643,6 +648,7 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_
                         sel = np.where(mask)[0][s==label]
                         plt.scatter(X2[sel,0], X2[sel,1], s=6, alpha=0.7, c=color, label=name)
                     plt.legend(title='Sex'); plt.title(f'PCA ({prefix}) - Sex')
+                    plt.xlabel(xlab); plt.ylabel(ylab)
                     plt.tight_layout(); plt.savefig(os.path.join(IMAGES_DIR, f'pca_{prefix}_sex_ft.png')); plt.close()
             except Exception:
                 pass
@@ -657,6 +663,7 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_
                 sm = cm.ScalarMappable(cmap=cm.viridis, norm=norm); sm.set_array([])
                 fig.colorbar(sm, ax=ax).set_label(title)
                 ax.set_title(f'PCA ({prefix}) - {title}')
+                ax.set_xlabel(xlab); ax.set_ylabel(ylab)
                 fig.tight_layout(); fig.savefig(os.path.join(IMAGES_DIR, fname)); plt.close(fig)
             cont_plot([maps['age_map'].get(str(r), np.nan) for r in regs], 'Age', f'pca_{prefix}_age_ft.png')
             cont_plot([maps['bmi_map'].get(str(r), np.nan) for r in regs], 'BMI', f'pca_{prefix}_bmi_ft.png')
