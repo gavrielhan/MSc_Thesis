@@ -705,8 +705,8 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_
                 # PCA AFTER (timeout)
                 try:
                     create_pca_plots(enc, eval_loader, demo_maps, prefix='after')
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.info(f"PCA (after-timeout) failed: {e}")
                 sys.exit(0)
         # Final step if leftover gradients
         if len(sup_loaders['train']) % accum_steps != 0:
@@ -752,10 +752,21 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_
             # Append to JSON
             try:
                 metrics_path = os.path.join(OUTPUT_ROOT, 'retina_finetune_epoch_metrics.json')
+                # Top-5 features by lowest validation MSE
+                top5 = []
+                if val_targets_np.size > 0 and len(val_mse) > 0:
+                    top_idx = np.argsort(val_mse)[:5]
+                    for idx in top_idx:
+                        top5.append({
+                            'feature': feature_cols[idx],
+                            'val_mse': float(val_mse[idx]),
+                            'val_r2': float(val_r2[idx])
+                        })
                 entry = {
                     'epoch': epoch,
                     'train_mse_mean': float(np.mean(train_mse)) if train_mse.size else None,
                     'val_mse_mean': float(np.mean(val_mse)) if val_mse.size else None,
+                    'top5_features_by_val_mse': top5,
                     **demo,
                 }
                 if os.path.exists(metrics_path):
@@ -886,6 +897,15 @@ def main():
             enc.load_state_dict(checkpoint['enc'])
             head.load_state_dict(checkpoint['head'])
         total_start_time = time.time()  # Reset time counter on resume or new run
+        # BEFORE PCA and baseline AUC only if NOT resuming from finetune checkpoint
+        do_before = not (checkpoint is not None and stage == 'finetune')
+        if do_before:
+            # Build eval helpers inside finetune run
+            try:
+                # Recreate demo maps and eval loader similar to inside run_supervised_finetune
+                pass
+            except Exception:
+                pass
         run_supervised_finetune(enc, head, sup_loaders, CONFIG, n_features, feature_cols, start_epoch=epoch, elapsed_time=elapsed_time)
 
 if __name__ == '__main__':
