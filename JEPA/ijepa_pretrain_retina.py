@@ -25,6 +25,7 @@ import copy
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
 from sklearn.decomposition import PCA
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
@@ -324,317 +325,297 @@ def load_checkpoint(filename=CHECKPOINT_PATH):
     return None
 
 
-def run_masked_pretrain(enc, pred, loader_train, loader_val, config, start_epoch=1, elapsed_time=0, demo_eval=None):
+def run_masked_pretrain(enc, pred, loader_train, loader_val, config,
+                        start_epoch=1, elapsed_time=0, demo_eval=None):
     import signal
-    # Debug: print which parameters do not require grad
-    for name, param in enc.named_parameters():
-        if not param.requires_grad:
+    # ---- debug: which params are frozen
+    for name, p in enc.named_parameters():
+        if not p.requires_grad:
             print(f"Encoder param {name} does not require grad")
-    for name, param in pred.named_parameters():
-        if not param.requires_grad:
+    for name, p in pred.named_parameters():
+        if not p.requires_grad:
             print(f"Predictor param {name} does not require grad")
+
     optimizer = AdamW(
-        [{'params': [p for n, p in list(enc.named_parameters()) + list(pred.named_parameters()) if p.requires_grad],
+        [{'params': [p for _, p in list(enc.named_parameters()) + list(pred.named_parameters()) if p.requires_grad],
           'weight_decay': config['weight_decay']}],
         lr=config['lr']
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=config['epochs'])
     scaler = get_grad_scaler()
-    # Create EMA target encoder
+
+    # ---- EMA target encoder
     target_enc = copy.deepcopy(enc).to(DEVICE)
     for p in target_enc.parameters():
         p.requires_grad = False
     ema_momentum = 0.99
-    # Periodic time-based checkpointing (every 2 hours)
-    time_ckpt_interval = 2 * 3600
-    last_time_ckpt = time.time()
 
-    def write_time_checkpoint(epoch_completed):
-        torch.save({
+    # ---- unpack demo eval tuple
+    eval_loader = eval_maps = metrics_path = None
+    if isinstance(demo_eval, tuple) and len(demo_eval) == 3:
+        eval_loader, eval_maps, metrics_path = demo_eval
+
+    # ---- signal-aware graceful stop
+    stop_now = False
+    did_shutdown = False
+
+    def _request_stop(signum, frame):
+        nonlocal stop_now
+        stop_now = True
+        logger.info(f"Signal {signum} received; will stop after current step.")
+
+    for sig in (getattr(signal, "SIGTERM", None),
+                getattr(signal, "SIGINT", None),
+                getattr(signal, "SIGQUIT", None)):
+        if sig is not None:
+            try:
+                signal.signal(sig, _request_stop)
+            except Exception:
+                pass  # environments may disallow handlers
+
+    def _pca_after():
+        """Make PCA plots using the ONLINE encoder (no masks)."""
+        if eval_loader is None or eval_maps is None:
+            return
+        try:
+            enc.eval()
+            feats, regs = [], []
+            with torch.no_grad():
+                for imgs, regcode in eval_loader:
+                    imgs = imgs.to(DEVICE)
+                    imgs = match_encoder_input_channels(enc, imgs)
+                    z = enc(imgs)
+                    if z.ndim == 3:
+                        z = z.mean(dim=1)
+                    feats.append(z.cpu().numpy())
+                    regs.extend(list(regcode))
+            if not feats:
+                return
+            X = np.concatenate(feats, axis=0)
+            Xs = StandardScaler().fit_transform(X)
+            pca = PCA(n_components=2, random_state=42)
+            X2 = pca.fit_transform(Xs)
+            evr = pca.explained_variance_ratio_
+            xlab = f'PC1 ({evr[0]*100:.1f}%)'
+            ylab = f'PC2 ({evr[1]*100:.1f}%)'
+
+            # Sex (discrete)
+            try:
+                sex_vals = [eval_maps.get('sex_map', {}).get(str(r), None) for r in regs]
+                mask = np.array([v is not None for v in sex_vals])
+                if mask.any():
+                    s = np.array([int(v) for v in np.array(sex_vals, dtype=object)[mask]])
+                    plt.figure(figsize=(6, 5))
+                    for label, color, name in [(0, 'tab:blue', 'Class 0'),
+                                               (1, 'tab:orange', 'Class 1')]:
+                        sel = np.where(mask)[0][s == label]
+                        plt.scatter(X2[sel, 0], X2[sel, 1], s=6, alpha=0.7, c=color, label=name)
+                    plt.legend(title='Sex'); plt.title('PCA (after) - Sex')
+                    plt.xlabel(xlab); plt.ylabel(ylab)
+                    plt.tight_layout(); plt.savefig(os.path.join(IMAGES_DIR, 'pca_after_sex.png')); plt.close()
+            except Exception:
+                pass
+
+            # Continuous helpers
+            def _cont(vals, title, fname):
+                v = np.array(vals, dtype=float); m = ~np.isnan(v)
+                if not m.any(): return
+                norm = mcolors.Normalize(vmin=np.nanpercentile(v[m], 5), vmax=np.nanpercentile(v[m], 95))
+                colors = cm.viridis(norm(v[m]))
+                fig, ax = plt.subplots(figsize=(6, 5))
+                ax.scatter(X2[m, 0], X2[m, 1], s=6, alpha=0.8, c=colors)
+                sm = cm.ScalarMappable(cmap=cm.viridis, norm=norm); sm.set_array([])
+                fig.colorbar(sm, ax=ax).set_label(title)
+                ax.set_title(f'PCA (after) - {title}')
+                ax.set_xlabel(xlab); ax.set_ylabel(ylab)
+                fig.tight_layout(); fig.savefig(os.path.join(IMAGES_DIR, fname)); plt.close(fig)
+
+            _cont([eval_maps.get('age_map', {}).get(str(r), np.nan) for r in regs], 'Age', 'pca_after_age.png')
+            _cont([eval_maps.get('bmi_map', {}).get(str(r), np.nan) for r in regs], 'BMI', 'pca_after_bmi.png')
+            logger.info("Saved PCA (after) plots.")
+        except Exception as e:
+            logger.warning(f"PCA (after) failed: {e}")
+
+    def _graceful_shutdown(last_completed_epoch, masked_train_losses, masked_val_losses, start_time_local):
+        """Save checkpoint (up to last completed epoch) + PCA, then return from trainer."""
+        nonlocal did_shutdown
+        if did_shutdown:
+            return
+        did_shutdown = True
+        total_elapsed = elapsed_time + (time.time() - start_time_local)
+        epoch_list = list(range(start_epoch, last_completed_epoch + 1)) if last_completed_epoch >= start_epoch else []
+        save_checkpoint({
             'enc': enc.state_dict(),
             'pred': pred.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'scaler': None if scaler is None else scaler.state_dict(),
-            'epoch': epoch_completed,
+            'epoch': last_completed_epoch,        # last fully completed epoch
+            'elapsed_time': total_elapsed,
             'stage': 'pretrain',
-        }, CHECKPOINT_PATH)
-        logger.info(f"Checkpoint overwritten at {CHECKPOINT_PATH}")
+        }, masked_train_losses, masked_val_losses, epoch_list, config, 'pretrain')
+        _pca_after()
 
-    # Save on SIGTERM
-    def _handle_sigterm(signum, frame):
-        logger.info("SIGTERM received: saving last checkpoint and exiting")
-        write_time_checkpoint(max(start_epoch, 1) - 1)
-        sys.exit(0)
-
-    try:
-        signal.signal(signal.SIGTERM, _handle_sigterm)
-    except Exception:
-        pass
+    # ---- training loop
     best_val = float('inf')
     masked_train_losses, masked_val_losses = [], []
     start_time = time.time()
     accum_steps = 2
-    # Unpack demo eval tuple
-    eval_loader = eval_maps = metrics_path = None
-    if isinstance(demo_eval, tuple) and len(demo_eval) == 3:
-        eval_loader, eval_maps, metrics_path = demo_eval
+
     for epoch in range(start_epoch, config['epochs'] + 1):
-        enc.train();
-        pred.train()
+        enc.train(); pred.train()
         train_losses = []
         optimizer.zero_grad()
+
         for i, (imgs, m_enc, m_pred) in enumerate(tqdm(loader_train, desc=f"Pretrain E{epoch}")):
             imgs = imgs.to(DEVICE)
             m_enc = [m.to(DEVICE) for m in m_enc]
             m_pred = [m.to(DEVICE) for m in m_pred]
-            # Print image stats for the first batch of each epoch
+
+            # print first-batch stats
             if i == 0:
-                print(
-                    f"Batch {i} image stats: min={imgs.min().item():.4f}, max={imgs.max().item():.4f}, mean={imgs.mean().item():.4f}")
-            # 4. Check for Infs in input images
-            if torch.isinf(imgs).any():
-                print(f"Inf detected in input images at batch {i}!")
-            if torch.isnan(imgs).any():
-                print(f"NaN detected in input images at batch {i}!")
+                print(f"Batch {i} image stats: min={imgs.min().item():.4f}, "
+                      f"max={imgs.max().item():.4f}, mean={imgs.mean().item():.4f}")
+            if torch.isinf(imgs).any():  print(f"Inf detected in input images at batch {i}!")
+            if torch.isnan(imgs).any():  print(f"NaN detected in input images at batch {i}!")
+
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16,
                                     enabled=(torch.cuda.is_available() and torch.cuda.is_bf16_supported())):
                 z = enc(imgs, m_enc)
                 out = pred(z, m_enc, m_pred)
-                if torch.isnan(out).any():
-                    print(f"NaN detected in model output at batch {i}!")
+                if torch.isnan(out).any(): print(f"NaN detected in model output at batch {i}!")
                 with torch.no_grad():
                     h = F.layer_norm(target_enc(imgs), (z.size(-1),))
                     t = apply_masks(h, m_pred).repeat(len(m_enc), 1, 1)
                 loss = F.smooth_l1_loss(out, t) / accum_steps
-                if torch.isnan(loss):
-                    print(f"NaN detected in loss at batch {i}!")
-            if scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            # 5. Check for NaNs in gradients
-            for name, param in enc.named_parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
+                if torch.isnan(loss): print(f"NaN detected in loss at batch {i}!")
+
+            if scaler is not None: scaler.scale(loss).backward()
+            else:                   loss.backward()
+
+            # grad checks
+            for name, p in enc.named_parameters():
+                if p.grad is not None and torch.isnan(p.grad).any():
                     print(f"NaN detected in encoder gradient: {name}")
-            for name, param in pred.named_parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
+            for name, p in pred.named_parameters():
+                if p.grad is not None and torch.isnan(p.grad).any():
                     print(f"NaN detected in predictor gradient: {name}")
-            train_losses.append(loss.item() * accum_steps)  # store unscaled loss
-            # Gradient accumulation
+
+            train_losses.append(loss.item() * accum_steps)
+
             if (i + 1) % accum_steps == 0:
-                # Add gradient clipping
-                torch.nn.utils.clip_grad_norm_(enc.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(pred.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(enc.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(pred.parameters(), 1.0)
                 if scaler is not None:
-                    scaler.step(optimizer)
-                    scaler.update()
+                    scaler.step(optimizer); scaler.update()
                 else:
                     optimizer.step()
                 optimizer.zero_grad()
-                # EMA update for target encoder
+                # EMA update
                 with torch.no_grad():
                     for p_online, p_target in zip(enc.parameters(), target_enc.parameters()):
                         p_target.data.mul_(ema_momentum).add_((1 - ema_momentum) * p_online.data)
-            # Check for time limit
+
+            # time/signal stop (shutdown up to last completed epoch)
             total_elapsed = elapsed_time + (time.time() - start_time)
-            if total_elapsed >= MAX_TRAIN_SECONDS:
-                # Save only up to the last completed epoch
-                epoch_list = list(range(start_epoch, epoch))  # up to epoch-1
-                save_checkpoint({
-                    'enc': enc.state_dict(),
-                    'pred': pred.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'scaler': None if scaler is None else scaler.state_dict(),
-                    'epoch': epoch - 1,  # last completed epoch
-                    'elapsed_time': total_elapsed,
-                    'stage': 'pretrain',
-                },
-                    masked_train_losses,  # up to last completed epoch
-                    masked_val_losses,
-                    epoch_list,
-                    config,
-                    'pretrain')
-                # PCA plots AFTER training (timeout)
-                try:
-                    if eval_loader is not None and eval_maps is not None:
-                        def _pca_after():
-                            enc.eval()
-                            feats = []
-                            regs = []
-                            with torch.no_grad():
-                                for imgs, regcode in eval_loader:
-                                    imgs = imgs.to(DEVICE)
-                                    imgs = match_encoder_input_channels(enc, imgs)
-                                    z = enc(imgs)
-                                    if z.ndim == 3:
-                                        z = z.mean(dim=1)
-                                    feats.append(z.cpu().numpy())
-                                    regs.extend(list(regcode))
-                            if feats:
-                                X = np.concatenate(feats, axis=0)
-                                Xs = StandardScaler().fit_transform(X)
-                                pca = PCA(n_components=2, random_state=42)
-                                X2 = pca.fit_transform(Xs)
-                                evr = pca.explained_variance_ratio_
-                                xlab = f'PC1 ({evr[0] * 100:.1f}%)'
-                                ylab = f'PC2 ({evr[1] * 100:.1f}%)'
+            if stop_now or total_elapsed >= MAX_TRAIN_SECONDS:
+                _graceful_shutdown(epoch - 1, masked_train_losses, masked_val_losses, start_time)
+                return
 
-                                # reuse plotting helper by re-importing create_pca_plots via closure not available here; inline minimal
-                                def cont_plot(vals, title, fname):
-                                    v = np.array(vals, dtype=float)
-                                    m = ~np.isnan(v)
-                                    if not m.any():
-                                        return
-                                    norm = mcolors.Normalize(vmin=np.nanpercentile(v[m], 5),
-                                                             vmax=np.nanpercentile(v[m], 95))
-                                    colors = cm.viridis(norm(v[m]))
-                                    fig, ax = plt.subplots(figsize=(6, 5))
-                                    ax.scatter(X2[m, 0], X2[m, 1], s=6, alpha=0.8, c=colors)
-                                    sm = cm.ScalarMappable(cmap=cm.viridis, norm=norm)
-                                    sm.set_array([])
-                                    fig.colorbar(sm, ax=ax).set_label(title)
-                                    ax.set_title(f'PCA (after) - {title}')
-                                    ax.set_xlabel(xlab);
-                                    ax.set_ylabel(ylab)
-                                    fig.tight_layout()
-                                    fig.savefig(os.path.join(IMAGES_DIR, fname))
-                                    plt.close(fig)
-
-                                # Sex
-                                sex_vals = [eval_maps['sex_map'].get(rc, None) for rc in regs]
-                                try:
-                                    mask = np.array([v is not None for v in sex_vals])
-                                    if mask.any():
-                                        s = np.array([int(v) for v in np.array(sex_vals, dtype=object)[mask]])
-                                        plt.figure(figsize=(6, 5))
-                                        for label, color, name in [(0, 'tab:blue', 'Class 0'),
-                                                                   (1, 'tab:orange', 'Class 1')]:
-                                            sel_idx = np.where(mask)[0][s == label]
-                                            plt.scatter(X2[sel_idx, 0], X2[sel_idx, 1], s=6, alpha=0.7, c=color,
-                                                        label=name)
-                                        plt.legend(title='Sex')
-                                        plt.title(f'PCA (after) - Sex')
-                                        plt.xlabel(xlab);
-                                        plt.ylabel(ylab)
-                                        plt.tight_layout()
-                                        plt.savefig(os.path.join(IMAGES_DIR, 'pca_after_sex.png'))
-                                        plt.close()
-                                except Exception:
-                                    pass
-                                cont_plot([eval_maps['age_map'].get(rc, None) for rc in regs], 'Age',
-                                          'pca_after_age.png')
-                                cont_plot([eval_maps['bmi_map'].get(rc, None) for rc in regs], 'BMI',
-                                          'pca_after_bmi.png')
-
-                        _pca_after()
-                except Exception as e:
-                    logger.info(f"PCA (after-timeout) failed: {e}")
-                logger.info("Reached max training time. Exiting.")
-                sys.exit(0)
-            # Periodic time-based checkpoint
-            now = time.time()
-            if now - last_time_ckpt >= time_ckpt_interval:
-                write_time_checkpoint(epoch_completed=max(epoch - 1, start_epoch - 1))
-                last_time_ckpt = now
-        # Final step if leftover gradients
+        # leftover step
         if len(loader_train) % accum_steps != 0:
             if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.step(optimizer); scaler.update()
             else:
                 optimizer.step()
             optimizer.zero_grad()
             with torch.no_grad():
                 for p_online, p_target in zip(enc.parameters(), target_enc.parameters()):
                     p_target.data.mul_(ema_momentum).add_((1 - ema_momentum) * p_online.data)
+
+        # validation
+        enc.eval(); pred.eval()
         val_losses = []
-        enc.eval();
-        pred.eval()
         with torch.no_grad():
             for i, (imgs, m_enc, m_pred) in enumerate(loader_val):
                 imgs = imgs.to(DEVICE)
                 m_enc = [m.to(DEVICE) for m in m_enc]
                 m_pred = [m.to(DEVICE) for m in m_pred]
-                # 4. Check for Infs in input images during validation
-                if torch.isinf(imgs).any():
-                    print(f"Inf detected in validation input images at batch {i}!")
-                if torch.isnan(imgs).any():
-                    print(f"NaN detected in validation input images at batch {i}!")
+                if torch.isinf(imgs).any():  print(f"Inf detected in validation input images at batch {i}!")
+                if torch.isnan(imgs).any():  print(f"NaN detected in validation input images at batch {i}!")
                 with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16,
                                         enabled=(torch.cuda.is_available() and torch.cuda.is_bf16_supported())):
                     z = enc(imgs, m_enc)
                     out = pred(z, m_enc, m_pred)
-                    if torch.isnan(out).any():
-                        print(f"NaN detected in validation model output at batch {i}!")
+                    if torch.isnan(out).any(): print(f"NaN detected in validation model output at batch {i}!")
                     h = F.layer_norm(target_enc(imgs), (z.size(-1),))
                     t = apply_masks(h, m_pred).repeat(len(m_enc), 1, 1)
                     l = F.smooth_l1_loss(out, t)
-                    if torch.isnan(l):
-                        print(f"NaN detected in validation loss at batch {i}!")
+                    if torch.isnan(l): print(f"NaN detected in validation loss at batch {i}!")
                 val_losses.append(l.item())
-        mt = np.mean(train_losses);
-        mv = np.mean(val_losses)
-        masked_train_losses.append(mt)
-        masked_val_losses.append(mv)
-        # Per-epoch demographic evaluation
-        epoch_metrics = {
-            'epoch': epoch,
-            'train_mse': float(mt),
-            'val_mse': float(mv),
-        }
-        if eval_loader is not None and eval_maps is not None:
-            demo_res = None
-            try:
-                # Use online encoder features (no masks) for demographics
-                def _extractor(x):
-                    return enc(x)
 
-                demo_res = evaluate_demographics(enc, eval_loader, eval_maps)
+        mt = float(np.mean(train_losses)); mv = float(np.mean(val_losses))
+        masked_train_losses.append(mt); masked_val_losses.append(mv)
+
+        # per-epoch demo AUCs (5-fold CV)
+        if eval_loader is not None and eval_maps is not None:
+            try:
+                demo_res = evaluate_demographics_cv(enc, eval_loader, eval_maps)
             except Exception as e:
+                demo_res = None
                 logger.info(f"Demographic eval failed: {e}")
             if demo_res:
-                epoch_metrics.update(demo_res)
-        # Append to metrics JSON
-        if metrics_path:
-            try:
-                if os.path.exists(metrics_path):
-                    with open(metrics_path, 'r') as f:
-                        hist = json.load(f)
-                else:
-                    hist = []
-                hist.append(epoch_metrics)
-                with open(metrics_path, 'w') as f:
-                    json.dump(hist, f, indent=2)
-                logger.info(f"Saved epoch metrics to {metrics_path}")
-            except Exception as e:
-                logger.info(f"Failed to write metrics JSON: {e}")
-        # Compute and print relative MSE (MSE / variance of target)
-        # Use a batch of targets from validation set for variance estimate
+                # prints one compact line with folds/n/pos-rate
+                logger.info(_fmt_demo_cv(f"E{epoch}", demo_res))
+                # persist to JSON if metrics_path provided
+                if metrics_path:
+                    try:
+                        if os.path.exists(metrics_path):
+                            with open(metrics_path, 'r') as f:
+                                hist = json.load(f)
+                        else:
+                            hist = []
+                        entry = {'epoch': epoch, 'train_mse': mt, 'val_mse': mv, **demo_res}
+                        hist.append(entry)
+                        with open(metrics_path, 'w') as f:
+                            json.dump(hist, f, indent=2)
+                        logger.info(f"Saved epoch metrics to {metrics_path}")
+                    except Exception as e:
+                        logger.info(f"Failed to write metrics JSON: {e}")
+
+        # relative MSE diagnostic
         try:
             all_targets = []
-            for i, (imgs, m_enc, m_pred) in enumerate(loader_val):
+            for j, (imgs, m_enc, m_pred) in enumerate(loader_val):
                 with torch.no_grad():
                     imgs = imgs.to(DEVICE)
                     m_enc = [m.to(DEVICE) for m in m_enc]
                     m_pred = [m.to(DEVICE) for m in m_pred]
                     h = F.layer_norm(target_enc(imgs), (enc(imgs).size(-1),))
                     t = apply_masks(h, m_pred).repeat(len(m_enc), 1, 1)
-                    all_targets.append(t.cpu().numpy().ravel())  # flatten to 1D
-                if i > 10:  # limit to 10 batches for speed
+                    all_targets.append(t.cpu().numpy().ravel())
+                if j > 10:  # limit work
                     break
-            all_targets = np.concatenate(all_targets, axis=0)  # now 1D
-            target_var = np.var(all_targets)
-            rel_train_mse = mt / target_var if target_var > 0 else float('nan')
-            rel_val_mse = mv / target_var if target_var > 0 else float('nan')
-            logger.info(f"Pretrain E{epoch} Relative Train MSE={rel_train_mse:.4f} Relative Val MSE={rel_val_mse:.4f}")
+            all_targets = np.concatenate(all_targets, axis=0)
+            target_var = float(np.var(all_targets)) if all_targets.size else float('nan')
+            rel_train = mt / target_var if target_var and target_var > 0 else float('nan')
+            rel_val   = mv / target_var if target_var and target_var > 0 else float('nan')
+            logger.info(f"Pretrain E{epoch} Relative Train MSE={rel_train:.4f} Relative Val MSE={rel_val:.4f}")
         except Exception as e:
             logger.warning(f"Could not compute relative MSE: {e}")
+
         logger.info(f"Pretrain E{epoch} Train MSE={mt:.4f} Val MSE={mv:.4f}")
         scheduler.step()
-        if mv < best_val:
-            best_val = mv
+        best_val = min(best_val, mv)
+
+        # time/signal stop right after finishing the epoch (now the epoch is completed)
+        total_elapsed = elapsed_time + (time.time() - start_time)
+        if stop_now or total_elapsed >= MAX_TRAIN_SECONDS:
+            _graceful_shutdown(epoch, masked_train_losses, masked_val_losses, start_time)
+            return
+
+    # normal completion
+    _pca_after()
 
 
 def build_demo_maps():
@@ -757,61 +738,266 @@ def main():
     except Exception as e:
         logger.info(f"Eval setup failed: {e}")
 
-    # Function to extract features and compute AUCs
-    def evaluate_demographics(encoder, loader, maps):
-        if loader is None or maps is None:
-            return None
-        encoder.eval()
-        feats = []
-        labels = {'sex': [], 'bmi_high': [], 'age_high': []}
-        regs_all = []
-        with torch.no_grad():
-            for imgs, regcode in loader:
-                imgs = imgs.to(DEVICE)
-                imgs = match_encoder_input_channels(encoder, imgs)
-                z = encoder(imgs)
-                if z.ndim == 3:
-                    z = z.mean(dim=1)
-                feats.append(z.cpu().numpy())
-                regs_all.extend(list(regcode))
-                for rc in regcode:
-                    rc_val = rc
-                    labels['sex'].append(maps.get('sex_map', {}).get(rc_val, None))
-                    labels['bmi_high'].append(maps.get('bmi_map', {}).get(rc_val, None))
-                    labels['age_high'].append(maps.get('age_map', {}).get(rc_val, None))
-        X = np.concatenate(feats, axis=0) if feats else np.empty((0, getattr(encoder, 'embed_dim', 0)))
-        if X.shape[0] == 0:
-            return None
+    # ---- Resume or initialize encoder/predictor ----
+    stage = None
+    epoch = 1
+    elapsed_time = 0
+    checkpoint = load_checkpoint()
+    # Always prefer resuming from retina pretrain checkpoint if available
+    if checkpoint is not None:
+        logger.info("Found retina pretrain checkpoint, resuming training from it.")
+        stage = checkpoint.get('stage', None)
+        epoch = checkpoint.get('epoch', 1)
+        elapsed_time = 0  # Reset elapsed time on resume
+        enc, pred = build_encoder_and_predictor(CONFIG)
+        enc.load_state_dict(checkpoint['enc'])
+        pred.load_state_dict(checkpoint['pred'])
+        if CONFIG['use_lora']:
+            freeze_lora_params(enc)
+            logger.info("Encoder LoRA-only trainable params enabled.")
+        else:
+            for p in enc.parameters():
+                p.requires_grad = True
+            logger.info("Encoder set to full-train mode (no LoRA).")
+    else:
+        # No retina pretrain checkpoint, start from ImageNet checkpoint
+        imagenet_ckpt = os.path.expanduser(
+            '~/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN22K-vit.h.14-900e.pth.tar')
+        if os.path.isfile(imagenet_ckpt):
+            logger.info(f"No retina pretrain checkpoint found, initializing from ImageNet checkpoint: {imagenet_ckpt}")
+        else:
+            logger.info("No retina pretrain checkpoint or ImageNet checkpoint found, starting from scratch.")
+        stage = None
+        epoch = 1
+        elapsed_time = 0
+        enc, pred = build_encoder_and_predictor(CONFIG)
+        # Only load ImageNet checkpoint if it exists
+        if os.path.isfile(imagenet_ckpt):
+            state = torch.load(imagenet_ckpt, map_location=DEVICE)
+            filtered = {k: v for k, v in state.items()
+                        if k.startswith('patch_embed.') or k.startswith('blocks.')
+                        or k in ('cls_token', 'pos_embed')}
+            w = filtered.get('patch_embed.proj.weight')
+            if w is not None and w.shape[1] == 3 and enc.patch_embed.proj.weight.shape[1] == 6:
+                filtered['patch_embed.proj.weight'] = w.repeat(1, 2, 1, 1)[:, :6]
+            enc.load_state_dict(filtered, strict=False)
+            logger.info("Pretrained ImageNet weights loaded into encoder")
+        if CONFIG['use_lora']:
+            freeze_lora_params(enc)
+            logger.info("Encoder initialized with LoRA-only trainable params.")
+        else:
+            for p in enc.parameters():
+                p.requires_grad = True
+            logger.info("Encoder initialized in full-train mode (no LoRA).")
 
-        def fit_auc(y_cont_or_bin):
-            y = np.array(y_cont_or_bin)
-            mask = ~pd.isna(y)
-            Xm = X[mask]
-            ym = y[mask]
-            if Xm.shape[0] < 10:
-                return None
-            unique_vals = np.unique(ym)
-            if unique_vals.size > 2:
-                thr = np.median(ym)
-                ym = (ym >= thr).astype(int)
-            else:
-                ym = (ym == unique_vals.max()).astype(int)
-            scaler = StandardScaler()
-            Xs = scaler.fit_transform(Xm)
+    # Print data pipeline summary
+    print(
+        f"Data pipeline: batch_size={CONFIG['batch_size']}, img_size={CONFIG['img_size']}, normalization=mean/std {CONFIG.get('mean', '[default]')}/{CONFIG.get('std', '[default]')}")
+
+    # ---- Build loaders ----
+    tr_paths, val_paths = train_test_split(
+        paths_all, test_size=0.2, random_state=CONFIG['seed']
+    )
+    paths = {'train': tr_paths, 'val': val_paths}
+    loader_train, loader_val = build_masked_dataloaders(paths, trsf, CONFIG)
+    load_pretrained_encoder(enc, CONFIG)
+    if checkpoint is not None and stage == 'pretrain':
+        enc.load_state_dict(checkpoint['enc'])
+        pred.load_state_dict(checkpoint['pred'])
+        elapsed_time = 0
+
+    # ---- Metrics and diagnostics ----
+    metrics_path = os.path.join(OUTPUT_ROOT, 'retina_pretrain_epoch_metrics.json')
+    try:
+        if not os.path.exists(metrics_path):
+            with open(metrics_path, 'w') as f:
+                json.dump([], f)
+    except Exception:
+        pass
+    # Diagnostics: overlap
+    try:
+        if eval_loader is not None and demo_maps is not None and 'sex_map' in demo_maps:
+            regs = set(eval_loader.dataset.df.get('RegistrationCode', pd.Series([], dtype=str)))
+            meta_regs = set(demo_maps['sex_map'].keys())
+            logger.info(f"[DEMO] RegistrationCode overlap: {len(regs & meta_regs)} / {len(regs)}")
+    except Exception:
+        pass
+
+    # BEFORE PCA and baseline AUC only if NOT resuming from retina checkpoint
+    do_before = not (checkpoint is not None and stage == 'pretrain')
+    if do_before:
+        create_pca_plots(enc, eval_loader, demo_maps, prefix='before')
+        # Baseline epoch-0 AUCs
+        # Baseline epoch-0 AUCs
+        if eval_loader is not None and demo_maps is not None:
             try:
-                clf = LogisticRegression(max_iter=200)
-                clf.fit(Xs, ym)
-                y_prob = clf.predict_proba(Xs)[:, 1]
-                auc = roc_auc_score(ym, y_prob)
-                return float(auc)
-            except Exception:
-                return None
+                base = evaluate_demographics_cv(enc, eval_loader, demo_maps)
+                if base:
+                    # print to console
+                    logger.info("[DEMO] Baseline (epoch 0) " + _fmt_demo_cv("",base))
 
-        return {
-            'sex_auc': fit_auc(labels['sex']),
-            'bmi_auc': fit_auc(labels['bmi_high']),
-            'age_auc': fit_auc(labels['age_high'])
-        }
+                    # keep saving to JSON as before
+                    if os.path.exists(metrics_path):
+                        with open(metrics_path, 'r') as f:
+                            hist = json.load(f)
+                    else:
+                        hist = []
+                    base_entry = {'epoch': 0, 'train_mse': None, 'val_mse': None}
+                    base_entry.update(base)
+                    hist.append(base_entry)
+                    with open(metrics_path, 'w') as f:
+                        json.dump(hist, f, indent=2)
+                    logger.info("Saved baseline (epoch 0) demographic AUCs")
+            except Exception as e:
+                logger.info(f"Baseline demographics failed: {e}")
+
+    # ---- Run training ----
+    run_masked_pretrain(
+        enc, pred, loader_train, loader_val, CONFIG,
+        start_epoch=epoch, elapsed_time=elapsed_time,
+        demo_eval=(eval_loader, demo_maps, metrics_path)
+    )
+
+
+def evaluate_demographics_cv(encoder, loader, maps, n_splits=5, random_state=42):
+    """
+    5-fold CV linear probe AUCs for sex / BMI(high) / Age(high).
+    Returns mean AUC in legacy keys (sex_auc, bmi_auc, age_auc) plus *_auc_std, *_aucs (per-fold),
+    and diagnostics (n, pos_rate).
+    """
+    if loader is None or maps is None:
+        return None
+
+    # ---- Extract embeddings once ----
+    encoder.eval()
+    feats, regs = [], []
+    with torch.no_grad():
+        for imgs, regcode in loader:
+            imgs = imgs.to(DEVICE)
+            # match 3/6 chans as in your helper
+            try:
+                target_c = encoder.patch_embed.proj.weight.shape[1]
+                c = imgs.shape[1]
+                if target_c == 6 and c == 3:
+                    imgs = torch.cat([imgs, imgs], dim=1)
+                elif target_c == 3 and c == 6:
+                    imgs = 0.5 * (imgs[:, 0:3] + imgs[:, 3:6])
+                elif c > target_c:
+                    imgs = imgs[:, :target_c]
+                elif c < target_c:
+                    imgs = imgs.repeat(1, target_c // c + 1, 1, 1)[:, :target_c]
+            except Exception:
+                pass
+            z = encoder(imgs)
+            if z.ndim == 3:  # (B,T,D)
+                z = z.mean(dim=1)
+            feats.append(z.cpu().numpy())
+            regs.extend(list(regcode))
+    if not feats:
+        return None
+    X = np.concatenate(feats, axis=0)
+
+    # ---- Build raw targets ----
+    sex_raw = np.array([maps.get('sex_map', {}).get(r, np.nan) for r in regs], dtype=float)
+    bmi_raw = np.array([maps.get('bmi_map', {}).get(r, np.nan) for r in regs], dtype=float)
+    age_raw = np.array([maps.get('age_map', {}).get(r, np.nan) for r in regs], dtype=float)
+
+    def cv_auc(kind, y_raw, continuous=False):
+        # mask valid rows
+        m = ~np.isnan(y_raw)
+        Xv = X[m]
+        yv = y_raw[m]
+
+        res = {f'{kind}_auc': None, f'{kind}_auc_std': None, f'{kind}_aucs': [],
+               f'{kind}_n': int(Xv.shape[0]), f'{kind}_pos_rate': None}
+
+        if Xv.shape[0] < 20:  # need enough for 5 folds
+            return res
+
+        # prepare labels
+        if continuous:
+            # we compute the median on the TRAIN split within each fold (no leakage)
+            def binarize(y, thr): return (y >= thr).astype(int)
+        else:
+            u = np.unique(yv)
+            if u.size < 2:
+                return res
+            # make sure labels are 0/1 with the larger code as positive
+            yv = (yv == u.max()).astype(int)
+
+        # stratified CV (on the binarized labels)
+        # For continuous case we need provisional labels to build splits;
+        # use global median only to define the split, but *train* uses fold median.
+        if continuous:
+            y_for_split = (yv >= np.median(yv)).astype(int)
+        else:
+            y_for_split = yv.copy()
+
+        if len(np.unique(y_for_split)) < 2:
+            return res
+
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+        aucs = []
+        pos_rates = []
+
+        for train_idx, val_idx in skf.split(Xv, y_for_split):
+            Xtr, Xte = Xv[train_idx], Xv[val_idx]
+            if continuous:
+                thr = np.median(yv[train_idx])
+                ytr = (yv[train_idx] >= thr).astype(int)
+                yte = (yv[val_idx]   >= thr).astype(int)
+            else:
+                ytr = yv[train_idx]
+                yte = yv[val_idx]
+
+            # guard against single-class folds
+            if len(np.unique(ytr)) < 2 or len(np.unique(yte)) < 2:
+                continue
+
+            scaler = StandardScaler().fit(Xtr)
+            Xtr = scaler.transform(Xtr)
+            Xte = scaler.transform(Xte)
+
+            clf = LogisticRegression(
+                solver="liblinear",      # robust on small folds
+                max_iter=2000,
+                C=1.0,
+                class_weight="balanced"
+            )
+            clf.fit(Xtr, ytr)
+            prob = clf.predict_proba(Xte)[:, 1]
+            aucs.append(roc_auc_score(yte, prob))
+            pos_rates.append(float(np.mean(yte)))
+
+        if len(aucs) == 0:
+            return res
+
+        res[f'{kind}_auc'] = float(np.mean(aucs))
+        res[f'{kind}_auc_std'] = float(np.std(aucs))
+        res[f'{kind}_aucs'] = [float(a) for a in aucs]
+        res[f'{kind}_pos_rate'] = float(np.mean(pos_rates)) if pos_rates else None
+        return res
+
+    out = {}
+    out.update(cv_auc('sex', sex_raw, continuous=False))
+    out.update(cv_auc('bmi', bmi_raw,  continuous=True))
+    out.update(cv_auc('age', age_raw,  continuous=True))
+    return out
+
+def _fmt_demo_cv(prefix, d):
+    def one(kind):
+        m = d.get(f'{kind}_auc')
+        s = d.get(f'{kind}_auc_std')
+        n = d.get(f'{kind}_n')
+        pr = d.get(f'{kind}_pos_rate')
+        folds = d.get(f'{kind}_aucs')
+        if m is None:
+            return f"{kind}: AUC=NA, n={n}, pos={'NA' if pr is None else f'{pr:.1%}'}"
+        folds_str = "NA" if not folds else "[" + ", ".join(f"{x:.3f}" for x in folds) + "]"
+        pr_str = "NA" if pr is None else f"{pr:.1%}"
+        return f"{kind}: AUC={m:.3f}±{(s or 0):.3f} folds={folds_str}, n={n}, pos={pr_str}"
+    return f"[DEMO] {prefix} " + " | ".join([one('sex'), one('bmi'), one('age')])
+
 
 
 def create_pca_plots(encoder, loader, maps, prefix):
@@ -886,140 +1072,8 @@ def create_pca_plots(encoder, loader, maps, prefix):
         logger.info(f'PCA ({prefix}) plots saved')
     except Exception as e:
         logger.info(f'PCA plotting failed: {e}')
+    # end of PCA plotting helper
 
-
-# Always define stage, epoch, elapsed_time before use
-stage = None
-epoch = 1
-elapsed_time = 0
-checkpoint = load_checkpoint()
-# Always prefer resuming from retina pretrain checkpoint if available
-if checkpoint is not None:
-    logger.info("Found retina pretrain checkpoint, resuming training from it.")
-    stage = checkpoint.get('stage', None)
-    epoch = checkpoint.get('epoch', 1)
-    elapsed_time = 0  # Reset elapsed time on resume
-    enc, pred = build_encoder_and_predictor(CONFIG)
-    enc.load_state_dict(checkpoint['enc'])
-    pred.load_state_dict(checkpoint['pred'])
-    if CONFIG['use_lora']:
-        freeze_lora_params(enc)
-        logger.info("Encoder LoRA-only trainable params enabled.")
-    else:
-        for p in enc.parameters():
-            p.requires_grad = True
-        logger.info("Encoder set to full-train mode (no LoRA).")
-else:
-    # No retina pretrain checkpoint, start from ImageNet checkpoint
-    imagenet_ckpt = os.path.expanduser('~/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN22K-vit.h.14-900e.pth.tar')
-    if os.path.isfile(imagenet_ckpt):
-        logger.info(f"No retina pretrain checkpoint found, initializing from ImageNet checkpoint: {imagenet_ckpt}")
-    else:
-        logger.info("No retina pretrain checkpoint or ImageNet checkpoint found, starting from scratch.")
-    stage = None
-    epoch = 1
-    elapsed_time = 0
-    enc, pred = build_encoder_and_predictor(CONFIG)
-    # Only load ImageNet checkpoint if it exists
-    if os.path.isfile(imagenet_ckpt):
-        # Use the same logic as load_pretrained_encoder but with explicit path
-        state = torch.load(imagenet_ckpt, map_location=DEVICE)
-        filtered = {k: v for k, v in state.items()
-                    if k.startswith('patch_embed.') or k.startswith('blocks.')
-                    or k in ('cls_token', 'pos_embed')}
-        w = filtered.get('patch_embed.proj.weight')
-        if w is not None and w.shape[1] == 3 and enc.patch_embed.proj.weight.shape[1] == 6:
-            filtered['patch_embed.proj.weight'] = w.repeat(1, 2, 1, 1)[:, :6]
-        enc.load_state_dict(filtered, strict=False)
-        logger.info("Pretrained ImageNet weights loaded into encoder")
-    if CONFIG['use_lora']:
-        freeze_lora_params(enc)
-        logger.info("Encoder initialized with LoRA-only trainable params.")
-    else:
-        for p in enc.parameters():
-            p.requires_grad = True
-        logger.info("Encoder initialized in full-train mode (no LoRA).")
-# Print data pipeline summary
-print(
-    f"Data pipeline: batch_size={CONFIG['batch_size']}, img_size={CONFIG['img_size']}, normalization=mean/std {CONFIG.get('mean', '[default]')}/{CONFIG.get('std', '[default]')}")
-# Always run masked pretraining in this script
-if stage is None or stage == 'pretrain':
-    # Define manifest-derived paths and transforms before splitting
-    man_df = pd.read_csv(CONFIG['manifest_csv'])
-    paths_all = man_df[['od_path', 'os_path']].values
-    stats_file = 'image_stats_pretrain.json'
-    if os.path.exists(stats_file):
-        with open(stats_file, 'r') as f:
-            stats = json.load(f)
-        mean, std = stats['mean'], stats['std']
-    else:
-        mean, std = compute_image_stats(paths_all, CONFIG)
-        with open(stats_file, 'w') as f:
-            json.dump({'mean': mean, 'std': std}, f)
-    trsf = build_transforms(mean, std)
-    tr_paths, val_paths = train_test_split(
-        paths_all, test_size=0.2, random_state=CONFIG['seed']
-    )
-    paths = {'train': tr_paths, 'val': val_paths}
-    loader_train, loader_val = build_masked_dataloaders(paths, trsf, CONFIG)
-    enc, pred = build_encoder_and_predictor(CONFIG)
-    load_pretrained_encoder(enc, CONFIG)
-    if checkpoint is not None and stage == 'pretrain':
-        enc.load_state_dict(checkpoint['enc'])
-        pred.load_state_dict(checkpoint['pred'])
-        elapsed_time = 0
-        # Build demographic maps and evaluation loader for PCA/AUC
-    demo_maps = build_demo_maps()
-    if demo_maps is not None and 'RegistrationCode' in man_df.columns:
-        cols = [c for c in ['od_path', 'os_path', 'RegistrationCode'] if c in man_df.columns]
-        eval_df = man_df[cols].dropna(subset=['RegistrationCode']).reset_index(drop=True)
-        # Sample up to 1000 for speed
-        if len(eval_df) > 1000:
-            eval_df = eval_df.sample(n=1000, random_state=42).reset_index(drop=True)
-        eval_loader = DataLoader(EvalDataset(eval_df, trsf), batch_size=CONFIG['batch_size'], shuffle=False,
-                                 num_workers=0)
-    else:
-        eval_loader = None
-    # Path for accumulating results
-    metrics_path = os.path.join(OUTPUT_ROOT, 'retina_pretrain_epoch_metrics.json')
-    try:
-        if not os.path.exists(metrics_path):
-            with open(metrics_path, 'w') as f:
-                json.dump([], f)
-    except Exception:
-        pass
-    # Diagnostics: overlap
-    try:
-        if eval_loader is not None and demo_maps is not None and 'sex_map' in demo_maps:
-            regs = set(eval_loader.dataset.df.get('RegistrationCode', pd.Series([], dtype=str)))
-            meta_regs = set(demo_maps['sex_map'].keys())
-            logger.info(f"[DEMO] RegistrationCode overlap: {len(regs & meta_regs)} / {len(regs)}")
-    except Exception:
-        pass
-    # BEFORE PCA and baseline AUC only if NOT resuming from retina checkpoint
-    do_before = not (checkpoint is not None and stage == 'pretrain')
-    if do_before:
-        create_pca_plots(enc, eval_loader, demo_maps, prefix='before')
-        # Baseline epoch-0 AUCs
-        if eval_loader is not None and demo_maps is not None:
-            try:
-                base = evaluate_demographics(enc, eval_loader, demo_maps)
-                if base:
-                    if os.path.exists(metrics_path):
-                        with open(metrics_path, 'r') as f:
-                            hist = json.load(f)
-                    else:
-                        hist = []
-                    base_entry = {'epoch': 0, 'train_mse': None, 'val_mse': None}
-                    base_entry.update(base)
-                    hist.append(base_entry)
-                    with open(metrics_path, 'w') as f:
-                        json.dump(hist, f, indent=2)
-                    logger.info("Saved baseline (epoch 0) demographic AUCs")
-            except Exception as e:
-                logger.info(f"Baseline demographics failed: {e}")
-    run_masked_pretrain(enc, pred, loader_train, loader_val, CONFIG, start_epoch=epoch, elapsed_time=elapsed_time,
-                        demo_eval=(eval_loader, demo_maps, metrics_path))
 
 if __name__ == '__main__':
-    main() 
+    main()
