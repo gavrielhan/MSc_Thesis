@@ -332,7 +332,7 @@ def build_supervised_loaders(config, transform):
 
 # ---------- Checkpoint Utilities ----------
 CHECKPOINT_PATH = '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_retina_finetune.pth'
-MAX_TRAIN_SECONDS = 11.5 * 3600  # 11.5 hours in seconds
+MAX_TRAIN_SECONDS = 11 * 3600  # 11.5 hours in seconds
 
 # Robust GradScaler instantiation for PyTorch 1.x and 2.x
 def get_grad_scaler():
@@ -1039,7 +1039,7 @@ def main():
     checkpoint = load_checkpoint()
     if checkpoint is not None:
         stage = checkpoint.get('stage', None)
-        epoch = checkpoint.get('epoch', 1)
+        epoch = checkpoint.get('epoch', 1) + 1
         elapsed_time = 0
         logger.info(f"Resuming from checkpoint at epoch {epoch}, elapsed_time {elapsed_time:.2f}s, stage {stage}")
         if 'enc' in checkpoint:
