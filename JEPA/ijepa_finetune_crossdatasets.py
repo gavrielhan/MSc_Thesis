@@ -21,6 +21,7 @@ import torch.nn.functional as F
 import time
 import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
 import glob
 import re
@@ -40,7 +41,7 @@ for d in OUTPUT_DIRS.values():
     os.makedirs(d, exist_ok=True)
 
 # ---------- Config ----------
-SEED = 42
+SEED = 20
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
@@ -469,7 +470,7 @@ STRATEGIES = [
     },
     {
         "name": "retina_feature_knn",
-        "ckpt": "/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_pretrain_newrun.pth",
+        "ckpt": "/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN22K-vit.h.14-900e.pth.tar",
         "eval_type": "knn"
     }
 ]
@@ -479,7 +480,7 @@ STRATEGIES = [
 # 1: imagenet_finetune
 # 2: retina_pretrain_finetune
 # 3: retina_feature_knn
-STRATEGY_INDEX = 2  # Change this to select different strategies
+STRATEGY_INDEX = 3  # Change this to select different strategies
 
 
 # ---------- Utility: Save/Load Results ----------
@@ -537,7 +538,7 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
     if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
         # Normal mode - initialize W&B with fixed config
         wandb.init(
-            project="retina-lora-finetuning_strat1",
+            project=f"retina-lora-finetuning_{strategy_name}",
             config={
                 "dataset": "messidor",
                 "strategy": strategy_name or "imagenet_finetune",
@@ -548,7 +549,7 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
                 "epochs": CONFIG['epochs'],
                 "weight_decay": CONFIG['weight_decay'],
             },
-            name=f"messidor_lora_r{CONFIG['lora_r']}_lr{CONFIG['lr']}"
+            name=f"idrid_knn_lora_r{CONFIG['lora_r']}_lr{CONFIG['lr']}"
         )
     else:
         # Sweep mode - don't use W&B at all
@@ -556,8 +557,8 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
         # Don't try to update wandb.config since W&B isn't initialized
 
     # User selects dataset for fine-tuning and testing
-    train_dataset = "messidor"  # Start with IDRID
-    test_dataset = "messidor"
+    train_dataset = "idrid"  # Start with IDRID
+    test_dataset = "idrid"
 
     if sweep_mode:
         print(f"? SWEEP MODE: Running {strategy_name} with config:")
@@ -1448,48 +1449,80 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
                 print(f"[KNN] Forward sanity check failed: {e}")
                 return
 
-            aucs, all_labels, all_probs = knn_evaluate(enc, train_loader, test_loader, n_classes, DEVICE, k=5)
-            results["aucs"] = aucs
-            results["all_labels"] = all_labels.tolist()
-            results["all_probs"] = all_probs.tolist()
-            # Print AUCs to console
-            print("[KNN] ROC AUC per class:")
-            for c, auc in enumerate(aucs):
-                print(f"  Class {c}: {auc:.4f}")
-            try:
-                print(f"  Mean ROC AUC: {np.nanmean(aucs):.4f}")
-            except Exception:
-                pass
-            # Save ROC AUC plot
+            # ===== 5-fold CV on the TRAIN set (gives mean ± std across folds) =====
+            X_tr, y_tr = extract_features(enc, train_loader, DEVICE)
+
+            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+            cv_aucs = []
+            for tr_idx, va_idx in skf.split(X_tr, y_tr):
+                knn = KNeighborsClassifier(n_neighbors=5)
+                knn.fit(X_tr[tr_idx], y_tr[tr_idx])
+
+                if n_classes == 2:
+                    y_true = (y_tr[va_idx] == 1).astype(int)
+                    y_score = knn.predict_proba(X_tr[va_idx])[:, 1]
+                    cv_aucs.append(roc_auc_score(y_true, y_score))
+                else:
+                    y_prob = knn.predict_proba(X_tr[va_idx])
+                    cv_aucs.append(roc_auc_score(y_tr[va_idx], y_prob, multi_class="ovr", average="macro"))
+
+            cv_mean = float(np.mean(cv_aucs))
+            cv_std = float(np.std(cv_aucs, ddof=1))
+            print(f"[KNN] 5-fold CV ROC AUC (train): {cv_mean:.4f} ± {cv_std:.4f}")
+
+            # ===== Final model on full TRAIN, evaluated on TEST (single test AUC) =====
+            X_te, y_te = extract_features(enc, test_loader, DEVICE)
+
+            knn_full = KNeighborsClassifier(n_neighbors=5)
+            knn_full.fit(X_tr, y_tr)
+            y_prob_te = knn_full.predict_proba(X_te)
+
+            # Per-class test AUCs (for plot) + macro test AUC
+            test_aucs = []
+            for c in range(n_classes):
+                y_true_c = (y_te == c).astype(int)
+                y_score_c = y_prob_te[:, c]
+                try:
+                    auc_c = roc_auc_score(y_true_c, y_score_c)
+                except ValueError:
+                    auc_c = float('nan')
+                test_aucs.append(auc_c)
+
+            # Macro (mean across classes) test AUC
+            test_macro_auc = float(np.nanmean(test_aucs))
+
+            print("[KNN] Test ROC AUC per class:")
+            for c, auc_c in enumerate(test_aucs):
+                print(f"  Class {c}: {auc_c:.4f}")
+            print(f"[KNN] Test Macro ROC AUC: {test_macro_auc:.4f}")
+
+            # Persist results
+            results["cv_mean_auc"] = cv_mean
+            results["cv_std_auc"] = cv_std
+            results["test_aucs"] = [float(a) for a in test_aucs]
+            results["test_macro_auc"] = test_macro_auc
+
+            # ===== Plot (TEST per-class AUCs) =====
             plt.figure(figsize=(6, 4))
-            bars = plt.bar([f'class_{c}' for c in range(n_classes)], aucs, color='blue', alpha=0.7)
+            bars = plt.bar([f'class_{c}' for c in range(n_classes)], test_aucs, color='blue', alpha=0.7)
             plt.ylim(0, 1)
             plt.ylabel('ROC AUC')
-            plt.title(f'KNN ROC AUC per Class ({strategy_select["name"]} Fold {fold})')
-            for bar, auc in zip(bars, aucs):
-                y = max(bar.get_height() + 0.05, 0.05)
-                plt.text(bar.get_x() + bar.get_width() / 2, y, f'{auc:.2f}', ha='center', va='bottom', fontsize=10,
+            plt.title(f'KNN ROC AUC per Class (TEST) ({strategy_select["name"]} Fold {fold})')
+            for bar, auc_c in zip(bars, test_aucs):
+                y = max((0 if np.isnan(auc_c) else auc_c) + 0.05, 0.05)
+                plt.text(bar.get_x() + bar.get_width() / 2, y, f'{auc_c:.2f}', ha='center', va='bottom', fontsize=10,
                          fontweight='bold')
             plt.tight_layout()
             plot_path = os.path.join(OUTPUT_DIRS['images'],
                                      f'roc_auc_{strategy_select["name"]}_{train_dataset}_fold{fold}.png')
             plt.savefig(plot_path)
             plt.close()
-            # Save results
+
+            # Save results JSON
             save_json(results, result_path)
             print(f"[KNN] Saved results to {result_path}")
             print(f"[KNN] Saved ROC plot to {plot_path}")
 
-            # Print image loading summary for KNN
-            print(f"\nImage Loading Summary (KNN):")
-            train_total, train_black = count_images_in_dataset(train_ds, "train")
-            test_total, test_black = count_images_in_dataset(test_ds, "test")
-            print(f"Train dataset - Total checked: {train_total}, Black images: {train_black}")
-            print(f"Test dataset - Total checked: {test_total}, Black images: {test_black}")
-
-            # Finish W&B run (only if not in sweep mode)
-            if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
-                wandb.finish()
         else:
             raise NotImplementedError(f"Unknown eval_type: {strategy_select['eval_type']}")
 

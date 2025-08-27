@@ -27,6 +27,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.decomposition import PCA
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
+from json import JSONDecodeError
 
 # Import IJepa and optional loader
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "ijepa")))
@@ -332,7 +333,7 @@ def build_supervised_loaders(config, transform):
 
 # ---------- Checkpoint Utilities ----------
 CHECKPOINT_PATH = '/net/mraid20/ifs/wisdom/segal_lab/genie/LabData/Analyses/gavrielh/checkpoint_retina_finetune.pth'
-MAX_TRAIN_SECONDS = 11 * 3600  # 11.5 hours in seconds
+MAX_TRAIN_SECONDS = 3 * 3600  # 11.5 hours in seconds
 
 # Robust GradScaler instantiation for PyTorch 1.x and 2.x
 def get_grad_scaler():
@@ -588,22 +589,45 @@ def evaluate_demographics_cv(encoder, loader, maps, n_splits=5, random_state=42)
     return out
 
 
-def append_epoch_metrics(entry, output_root):
-    """Append an entry (including baseline epoch 0) to the finetune metrics JSON."""
+def safe_append_metrics(entry, output_root, fname='retina_finetune_epoch_metrics.json'):
+    """Append a dict entry to a JSON list stored at outputs/fname, atomically."""
     os.makedirs(output_root, exist_ok=True)
-    metrics_path = os.path.join(output_root, 'retina_finetune_epoch_metrics.json')
-    if os.path.exists(metrics_path):
-        try:
-            with open(metrics_path, 'r') as f:
-                hist = json.load(f)
-        except Exception:
-            hist = []
-    else:
+    path = os.path.join(output_root, fname)
+
+    # Load existing or start a new list
+    try:
+        with open(path, 'r') as f:
+            hist = json.load(f)
+        if not isinstance(hist, list):
+            raise ValueError("metrics file is not a list")
+    except (FileNotFoundError, JSONDecodeError, ValueError):
         hist = []
+
     hist.append(entry)
-    with open(metrics_path, 'w') as f:
+
+    # Atomic replace
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
         json.dump(hist, f, indent=2)
-    logger.info(f"Appended metrics to {metrics_path}")
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+    logger.info(f"[metrics] wrote {len(hist)} entries to {path}")
+
+def count_trainable_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+def log_trainable_breakdown(model, prefix="enc"):
+    trainable = []
+    frozen = []
+    for n, p in model.named_parameters():
+        (trainable if p.requires_grad else frozen).append(n)
+    logger.info(f"[{prefix}] trainable params: {len(trainable)} tensors; frozen: {len(frozen)} tensors")
+    # print a few examples so you can eyeball they are LoRA layers:
+    head = [n for n in trainable if 'lora' in n.lower()][:8]
+    logger.info(f"[{prefix}] sample trainable: {head}")
 # ---------- End NEW helpers ----------
 
 
@@ -719,7 +743,7 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_
         if len(eval_df) > 1000:
             eval_df = eval_df.sample(n=1000, random_state=42).reset_index(drop=True)
         mean, std = (0.485,0.456,0.406), (0.229,0.224,0.225)
-        eval_trsf = build_transforms(mean, std)
+        eval_trsf = build_eval_transforms(mean, std)
         eval_loader = DataLoader(EvalDS(eval_df, eval_trsf), batch_size=config['batch_size'], shuffle=False, num_workers=0)
     except Exception as e:
         logger.info(f"Eval loader not built: {e}")
@@ -948,7 +972,7 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_
                         f"Train R2={train_r2[i]:.4f} Val R2={val_r2[i]:.4f}")
 
         # Demographic AUCs per epoch (same local probe as before)
-        demo = evaluate_demographics_local(enc, eval_loader, demo_maps)
+        demo = evaluate_demographics_cv(enc, eval_loader, demo_maps, n_splits=5, random_state=42)
         if demo:
             logger.info(f"  Demographics AUCs: sex={demo.get('sex_auc')}, "
                         f"bmi={demo.get('bmi_auc')}, age={demo.get('age_auc')}")
@@ -1016,6 +1040,7 @@ def run_supervised_finetune(enc, head, sup_loaders, config, n_features, feature_
     logger.info("Supervised fine-tuning complete.")
 
 
+
 IMAGENET_CKPT = os.path.expanduser('~/PycharmProjects/MSc_Thesis/JEPA/pretrained_IN/IN22K-vit.h.14-900e.pth.tar')
 
 def main():
@@ -1047,6 +1072,14 @@ def main():
             enc.load_state_dict(checkpoint['enc'])
             logger.info("Encoder weights loaded from checkpoint.")
             freeze_lora_params(enc)
+            T, Tr = count_trainable_params(enc)
+            logger.info(f"[enc] params: total={T:,} trainable={Tr:,}")
+            log_trainable_breakdown(enc, "enc")
+
+            # Sanity assertion: if nothing 'lora' is trainable, shout.
+            if Tr == 0:
+                raise RuntimeError(
+                    "No trainable params in encoder after freeze_lora_params. Check LoRA naming ('lora_').")
             logger.info("Encoder LoRA parameters unfrozen.")
         else:
             logger.info("No encoder checkpoint found. Building new encoder.")
@@ -1104,7 +1137,7 @@ def main():
                         'top5_features_by_val_mse': [],
                         **baseline,
                     }
-                    append_epoch_metrics(entry, OUTPUT_ROOT)
+                    safe_append_metrics(entry, OUTPUT_ROOT)
                 else:
                     logger.info("Baseline demographics AUCs not computed (missing maps or eval loader).")
             except Exception as e:
