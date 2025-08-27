@@ -22,6 +22,7 @@ import time
 import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
 from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 import glob
 import re
@@ -755,7 +756,24 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
         # Prepare train/test datasets for this fold
         if train_dataset == 'idrid':
             df_train, df_test = splits[0]  # Single split
-            train_ds = IDRIDDataset(df_train, img_dir, trsf, label_col=label_col)
+
+            # 20% validation split (stratified)
+            try:
+                df_tr, df_val = train_test_split(
+                    df_train,
+                    test_size=0.2,
+                    random_state=SEED,
+                    stratify=df_train[label_col] if label_col in df_train.columns else None,
+                )
+            except Exception as e:
+                print(f"Warning: Stratified split failed ({e}). Falling back to random split.")
+                df_tr, df_val = train_test_split(df_train, test_size=0.2, random_state=SEED, shuffle=True)
+
+            df_tr = df_tr.reset_index(drop=True)
+            df_val = df_val.reset_index(drop=True)
+
+            train_ds = IDRIDDataset(df_tr, img_dir, trsf, label_col=label_col)
+            val_ds = IDRIDDataset(df_val, img_dir, trsf, label_col=label_col)
             test_ds = IDRIDDataset(df_test, img_dir, trsf, label_col=label_col)
 
             # Check a few images to see if they're loading properly
@@ -765,6 +783,7 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
                 print(f"Sample {i}: Image shape {img.shape}, Label {label}")
 
             print(f"Train dataset: {len(train_ds)} images")
+            print(f"Validation dataset: {len(val_ds)} images")
             print(f"Test dataset: {len(test_ds)} images")
 
             n_classes = n_classes_idrid
@@ -772,7 +791,24 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
             train_xlsx, test_xlsx = splits[fold]  # Use specific fold
             df_train = pd.read_excel(train_xlsx)
             df_test = pd.read_excel(test_xlsx)
-            train_ds = PapilaDataset(df_train, img_dir, trsf)
+
+            # 20% validation split (stratified)
+            try:
+                df_tr, df_val = train_test_split(
+                    df_train,
+                    test_size=0.2,
+                    random_state=SEED,
+                    stratify=df_train['Diagnosis'] if 'Diagnosis' in df_train.columns else None,
+                )
+            except Exception as e:
+                print(f"Warning: Stratified split failed for PAPILA ({e}). Falling back to random split.")
+                df_tr, df_val = train_test_split(df_train, test_size=0.2, random_state=SEED, shuffle=True)
+
+            df_tr = df_tr.reset_index(drop=True)
+            df_val = df_val.reset_index(drop=True)
+
+            train_ds = PapilaDataset(df_tr, img_dir, trsf)
+            val_ds = PapilaDataset(df_val, img_dir, trsf)
             test_ds = PapilaDataset(df_test, img_dir, trsf)
             n_classes = n_classes_papila
         elif train_dataset == 'messidor':
@@ -780,7 +816,24 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
             label_col = 'adjudicated_dr_grade'
             df_train = df_all[df_all['image_id'].isin(train_imgs)].reset_index(drop=True)
             df_test = df_all[df_all['image_id'].isin(test_imgs)].reset_index(drop=True)
-            train_ds = MessidorDataset(df_train, img_dir, trsf, label_col=label_col)
+
+            # 20% validation split (stratified)
+            try:
+                df_tr, df_val = train_test_split(
+                    df_train,
+                    test_size=0.2,
+                    random_state=SEED,
+                    stratify=df_train[label_col] if label_col in df_train.columns else None,
+                )
+            except Exception as e:
+                print(f"Warning: Stratified split failed for Messidor ({e}). Falling back to random split.")
+                df_tr, df_val = train_test_split(df_train, test_size=0.2, random_state=SEED, shuffle=True)
+
+            df_tr = df_tr.reset_index(drop=True)
+            df_val = df_val.reset_index(drop=True)
+
+            train_ds = MessidorDataset(df_tr, img_dir, trsf, label_col=label_col)
+            val_ds = MessidorDataset(df_val, img_dir, trsf, label_col=label_col)
             test_ds = MessidorDataset(df_test, img_dir, trsf, label_col=label_col)
             n_classes = n_classes_messidor
         else:
@@ -789,8 +842,10 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
         # Check images at the beginning
         print(f"\nImage Loading Summary:")
         train_total, train_black = count_images_in_dataset(train_ds, "train")
+        val_total, val_black = count_images_in_dataset(val_ds, "val")
         test_total, test_black = count_images_in_dataset(test_ds, "test")
         print(f"Train dataset - Total checked: {train_total}, Black images: {train_black}")
+        print(f"Val dataset - Total checked: {val_total}, Black images: {val_black}")
         print(f"Test dataset - Total checked: {test_total}, Black images: {test_black}")
 
         # If all images are black, there's a serious problem
@@ -812,6 +867,8 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
 
         train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True,
                                   num_workers=CONFIG['num_workers'], pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0,
+                                pin_memory=True)
         # Use num_workers=0 for test_loader to ensure black image tracking works properly
         # (When using multiple workers, tracking attributes don't propagate back to main process)
         test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0,
@@ -838,6 +895,14 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
         test_class_counts = np.bincount(test_labels)
         print(f"Class distribution in test: {test_class_counts}")
 
+        # Debug: Validation distribution
+        val_labels_arr = []
+        for _, labels in val_loader:
+            val_labels_arr.extend(labels.numpy())
+        val_labels_arr = np.array(val_labels_arr)
+        val_class_counts = np.bincount(val_labels_arr)
+        print(f"Class distribution in val: {val_class_counts}")
+
         train_ratio = class_counts[1] / class_counts[0] if class_counts[0] > 0 else float('inf')
         test_ratio = test_class_counts[1] / test_class_counts[0] if test_class_counts[0] > 0 else float('inf')
         print(f"Train Class 1/Class 0 ratio: {train_ratio:.3f}")
@@ -847,6 +912,7 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
         # Debug: Sample a few images to check basic statistics
         print("\nComparing train vs test image statistics...")
         train_imgs_sample = []
+        val_imgs_sample = []
         test_imgs_sample = []
 
         # Sample from train loader
@@ -855,20 +921,30 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
             if i >= 5:  # Sample first few batches
                 break
 
+        # Sample from val loader
+        for i, (imgs, _) in enumerate(val_loader):
+            val_imgs_sample.append(imgs.cpu().numpy())
+            if i >= 5:
+                break
+
         # Sample from test loader
         for i, (imgs, _) in enumerate(test_loader):
             test_imgs_sample.append(imgs.cpu().numpy())
             if i >= 5:  # Sample first few batches
                 break
 
-        if train_imgs_sample and test_imgs_sample:
+        if train_imgs_sample and val_imgs_sample and test_imgs_sample:
             train_imgs = np.concatenate(train_imgs_sample, axis=0)
+            val_imgs = np.concatenate(val_imgs_sample, axis=0)
             test_imgs = np.concatenate(test_imgs_sample, axis=0)
 
             print(f"Train images: mean={np.mean(train_imgs):.4f}, std={np.std(train_imgs):.4f}")
+            print(f"Val images: mean={np.mean(val_imgs):.4f}, std={np.std(val_imgs):.4f}")
             print(f"Test images: mean={np.mean(test_imgs):.4f}, std={np.std(test_imgs):.4f}")
-            print(f"Mean difference: {abs(np.mean(train_imgs) - np.mean(test_imgs)):.4f}")
-            print(f"Std difference: {abs(np.std(train_imgs) - np.std(test_imgs)):.4f}")
+            print(f"Train-Test mean diff: {abs(np.mean(train_imgs) - np.mean(test_imgs)):.4f}")
+            print(f"Train-Test std diff: {abs(np.std(train_imgs) - np.std(test_imgs)):.4f}")
+            print(f"Train-Val mean diff: {abs(np.mean(train_imgs) - np.mean(val_imgs)):.4f}")
+            print(f"Train-Val std diff: {abs(np.std(train_imgs) - np.std(val_imgs)):.4f}")
 
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         results = {"fold": fold, "strategy": strategy_select['name'], "train_dataset": train_dataset,
@@ -980,6 +1056,15 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
                 last_time_ckpt = time.time()
 
             fold_start_time = time.time()
+            best_val_macro_auc = float('-inf')
+            best_val_epoch = -1
+            best_val_aucs = None
+            best_val_pr_aucs = None
+            best_val_f1s = None
+            best_test_aucs = None
+            best_test_pr_aucs = None
+            best_test_f1s = None
+            best_test_conf_mat = None
             for epoch in range(start_epoch, CONFIG['epochs'] + 1):
                 model.train()
                 train_loss = 0
@@ -1170,6 +1255,54 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
                 # Clean up memory after each epoch
                 cleanup_memory()
 
+                # Evaluate on validation set after each epoch
+                model.eval()
+                val_all_labels = []
+                val_all_probs = []
+                with torch.no_grad():
+                    for imgs, labels in val_loader:
+                        imgs = imgs.to(DEVICE)
+                        logits = model(imgs)
+                        probs = torch.softmax(logits, dim=1).cpu().numpy()
+                        val_all_probs.append(probs)
+                        val_all_labels.append(labels.numpy())
+                val_all_probs_np = np.concatenate(val_all_probs, axis=0)
+                val_all_labels_np = np.concatenate(val_all_labels, axis=0)
+
+                val_aucs = []
+                val_pr_aucs = []
+                val_f1s = []
+                for c in range(n_classes):
+                    y_true = (val_all_labels_np == c).astype(int)
+                    y_score = val_all_probs_np[:, c]
+                    try:
+                        auc = roc_auc_score(y_true, y_score)
+                    except ValueError:
+                        auc = float('nan')
+                    try:
+                        pr_auc = average_precision_score(y_true, y_score)
+                    except ValueError:
+                        pr_auc = float('nan')
+                    try:
+                        f1 = f1_score(y_true, np.argmax(val_all_probs_np, axis=1) == c)
+                    except ValueError:
+                        f1 = float('nan')
+                    val_aucs.append(auc)
+                    val_pr_aucs.append(pr_auc)
+                    val_f1s.append(f1)
+
+                val_macro_auc = float(np.nanmean(val_aucs))
+                print(f"  Val ROC AUC - Class 0: {val_aucs[0]:.4f}, Class 1: {val_aucs[1]:.4f}")
+                print(f"  Val PR AUC - Class 0: {val_pr_aucs[0]:.4f}, Class 1: {val_pr_aucs[1]:.4f}")
+                if not sweep_mode and not os.environ.get('WANDB_SWEEP_MODE'):
+                    wandb.log({
+                        "val_roc_auc_class_0": val_aucs[0],
+                        "val_roc_auc_class_1": val_aucs[1],
+                        "val_pr_auc_class_0": val_pr_aucs[0],
+                        "val_pr_auc_class_1": val_pr_aucs[1],
+                        "val_macro_auc": val_macro_auc,
+                    })
+
                 # Evaluate on test set after each epoch
                 model.eval()  # Set to evaluation mode
                 all_labels = []
@@ -1213,6 +1346,18 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
                 print(f"  Test ROC AUC - Class 0: {aucs[0]:.4f}, Class 1: {aucs[1]:.4f}")
                 print(f"  Test PR AUC - Class 0: {pr_aucs[0]:.4f}, Class 1: {pr_aucs[1]:.4f}")
                 print(f"  Test F1 - Class 0: {f1s[0]:.4f}, Class 1: {f1s[1]:.4f}")
+
+                # Track best validation and capture corresponding test metrics
+                if val_macro_auc > best_val_macro_auc:
+                    best_val_macro_auc = val_macro_auc
+                    best_val_epoch = epoch
+                    best_val_aucs = list(map(float, val_aucs))
+                    best_val_pr_aucs = list(map(float, val_pr_aucs))
+                    best_val_f1s = list(map(float, val_f1s))
+                    best_test_aucs = list(map(float, aucs))
+                    best_test_pr_aucs = list(map(float, pr_aucs))
+                    best_test_f1s = list(map(float, f1s))
+                    best_test_conf_mat = conf_mat.tolist()
 
                 # Compare train vs test performance
                 train_avg_auc = np.mean(train_aucs)
@@ -1364,6 +1509,19 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
                 results["confusion_matrix"] = conf_mat.tolist()
                 results["all_labels"] = all_labels_np.tolist()
                 results["all_probs"] = all_probs_np.tolist()
+                # Validation and best-selection summaries
+                results["val_last_aucs"] = list(map(float, val_aucs)) if 'val_aucs' in locals() else None
+                results["val_last_pr_aucs"] = list(map(float, val_pr_aucs)) if 'val_pr_aucs' in locals() else None
+                results["val_last_f1s"] = list(map(float, val_f1s)) if 'val_f1s' in locals() else None
+                results["best_val_macro_auc"] = best_val_macro_auc
+                results["best_val_epoch"] = best_val_epoch
+                results["best_val_aucs"] = best_val_aucs
+                results["best_val_pr_aucs"] = best_val_pr_aucs
+                results["best_val_f1s"] = best_val_f1s
+                results["best_test_aucs_at_best_val"] = best_test_aucs
+                results["best_test_pr_aucs_at_best_val"] = best_test_pr_aucs
+                results["best_test_f1s_at_best_val"] = best_test_f1s
+                results["best_test_confusion_matrix_at_best_val"] = best_test_conf_mat
             # Save ROC AUC plot
             plt.figure(figsize=(6, 4))
             bars = plt.bar([f'class_{c}' for c in range(n_classes)], aucs, color='orange', alpha=0.7)
