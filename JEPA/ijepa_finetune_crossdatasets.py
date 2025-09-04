@@ -15,6 +15,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.checkpoint import checkpoint
 from torchvision import transforms
 from PIL import Image
+from PIL import ImageOps
 from tqdm.auto import tqdm
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score, confusion_matrix, precision_recall_curve
 import torch.nn.functional as F
@@ -77,6 +78,12 @@ CONFIG = {
     'weight_decay': 1e-2,  # Increased weight decay to prevent overfitting
     'epochs': 30,  # Increased epochs for better convergence
     'external_root': '/home/gavrielh/PycharmProjects/MSc_Thesis/JEPA/external_datasets',
+    # Preprocessing toggles
+    'preprocess_crop_black': True,
+    'preprocess_autocontrast': False,
+    'preprocess_equalize': False,
+    'preprocess_crop_threshold': 10,  # grayscale threshold [0-255]
+    'preprocess_crop_margin': 0.02,   # fraction of max(H,W)
 }
 
 logging.basicConfig(
@@ -189,6 +196,7 @@ class PapilaDataset(Dataset):
         img_path = os.path.join(self.img_dir, img_name)
         try:
             img = Image.open(img_path).convert('RGB')
+            img = preprocess_image(img)
             # Check if image is mostly black
             img_array = np.array(img)
             self.total_images_checked += 1
@@ -231,6 +239,7 @@ class IDRIDDataset(torch.utils.data.Dataset):
         img_path = os.path.join(self.img_dir, img_name)
         try:
             img = Image.open(img_path).convert('RGB')
+            img = preprocess_image(img)
             # Check if image is mostly black
             img_array = np.array(img)
             self.total_images_checked += 1
@@ -287,6 +296,7 @@ class MessidorDataset(Dataset):
 
         try:
             img = Image.open(img_path).convert('RGB')
+            img = preprocess_image(img)
             # Check if image is mostly black
             img_array = np.array(img)
             self.total_images_checked += 1
@@ -425,6 +435,41 @@ def build_transforms():
     ])
 
 
+# ---------- Preprocessing Utilities ----------
+def preprocess_image(img: Image.Image) -> Image.Image:
+    """Crop black borders and optionally autocontrast/equalize.
+
+    Uses a grayscale threshold and bbox with a small margin. Safe fallbacks on errors.
+    """
+    try:
+        if CONFIG.get('preprocess_crop_black', True):
+            gray = np.array(img.convert('L'))
+            threshold = int(CONFIG.get('preprocess_crop_threshold', 10))
+            mask = gray > threshold
+            if mask.any():
+                rows = np.where(mask.any(axis=1))[0]
+                cols = np.where(mask.any(axis=0))[0]
+                top, bottom = int(rows[0]), int(rows[-1])
+                left, right = int(cols[0]), int(cols[-1])
+                h, w = gray.shape
+                margin = int(CONFIG.get('preprocess_crop_margin', 0.02) * max(h, w))
+                top = max(0, top - margin)
+                left = max(0, left - margin)
+                bottom = min(h - 1, bottom + margin)
+                right = min(w - 1, right + margin)
+                if right > left and bottom > top:
+                    img = img.crop((left, top, right + 1, bottom + 1))
+
+        if CONFIG.get('preprocess_autocontrast', False):
+            img = ImageOps.autocontrast(img)
+        if CONFIG.get('preprocess_equalize', False):
+            img = ImageOps.equalize(img)
+    except Exception as e:
+        print(f"Preprocess warning: {e}")
+        return img
+    return img
+
+
 # ---------- Evaluation Utilities ----------
 def evaluate_and_plot_rocauc(all_labels, all_probs, n_classes, dataset_name):
     auc_values = []
@@ -481,7 +526,7 @@ STRATEGIES = [
 # 1: imagenet_finetune
 # 2: retina_pretrain_finetune
 # 3: retina_feature_knn
-STRATEGY_INDEX = 3  # Change this to select different strategies
+STRATEGY_INDEX = 0  # Change this to select different strategies
 
 
 # ---------- Utility: Save/Load Results ----------
@@ -550,7 +595,7 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
                 "epochs": CONFIG['epochs'],
                 "weight_decay": CONFIG['weight_decay'],
             },
-            name=f"idrid_knn_lora_r{CONFIG['lora_r']}_lr{CONFIG['lr']}"
+            name=f"messidor_lora_r{CONFIG['lora_r']}_lr{CONFIG['lr']}"
         )
     else:
         # Sweep mode - don't use W&B at all
@@ -558,8 +603,8 @@ def main(strategy_name=None, fold=0, sweep_mode=False):
         # Don't try to update wandb.config since W&B isn't initialized
 
     # User selects dataset for fine-tuning and testing
-    train_dataset = "idrid"  # Start with IDRID
-    test_dataset = "idrid"
+    train_dataset = "messidor"  # Start with IDRID
+    test_dataset = "messidor"
 
     if sweep_mode:
         print(f"? SWEEP MODE: Running {strategy_name} with config:")
