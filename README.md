@@ -39,11 +39,3 @@ Overall, the project demonstrates both the promise and limitations of applying a
   - `mk_graphs.py`: helper for patient/sleep/diagnosis integration  
   - `model.py`, `train.py`, `eval.py`, `link_prediction_head.py`: heterogeneous GNN encoder and predictive heads  
 
----
-
-## Environment Setup
-
-1. Create environment (conda recommended):
-```bash
-conda create -n retina-jepa python=3.10 -y
-conda activate retina-jepa
